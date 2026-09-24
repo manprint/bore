@@ -951,6 +951,74 @@ describe("web-transfer receiver", () => {
     );
   });
 
+  it("a_second_ack_for_a_running_transfer_never_replaces_it", async () => {
+    // Two clicks inside the gap before the first ack (the button disables
+    // only once the row exists) send two requests, and the server answers
+    // both with the SAME transfer ID. The second used to be installed over
+    // the transfer already running on its relay leg, whose frames were then
+    // dropped as stale. Red-check: drop the `transfers.has` guard.
+    const h = harness();
+    const bytes = new Uint8Array(10);
+    const { manifest, transferId } = await startFlow(h, bytes);
+    const running = h.receiver.transfers().get(transferId);
+    assert.equal(running.attemptId, ATTEMPT);
+    const again = await h.receiver.startDownload({
+      offerId: OFFER,
+      manifest,
+      macHex: macOf(manifest),
+      sourcePeerId: SOURCE_PEER,
+    });
+    assert.deepEqual(again, { pending: true });
+    const second = h.control.filter((m) => m.type === "transfer.request").pop();
+    assert.equal(
+      h.receiver.handleControl({
+        type: "ack",
+        requestId: second.requestId,
+        body: { result: { transferId } },
+      }),
+      true,
+    );
+    assert.equal(h.receiver.transfers().get(transferId), running, "the running transfer stays");
+    assert.equal(running.attemptId, ATTEMPT);
+    assert.equal(h.receiver.transfers().size, 1);
+    assert.deepEqual(h.events.errors, []);
+  });
+
+  it("relay_busy_notice_ends_the_row_and_releases_the_server_record", async () => {
+    // `admit_relay` answers a full pool with an anonymous `RELAY_BUSY` naming
+    // the transfer, and leaves the record live. Routed nowhere, it left the
+    // row spinning and the record holding both peers' budget. Red-check:
+    // drop the branch and `handleControl` returns false.
+    const h = harness();
+    const bytes = new Uint8Array(10);
+    const { transferId } = await startFlow(h, bytes);
+    const before = h.control.length;
+    assert.equal(
+      h.receiver.handleControl({
+        type: "error",
+        body: { code: "RELAY_BUSY", message: transferId },
+      }),
+      true,
+    );
+    assert.deepEqual(h.events.errors, [[transferId, "RELAY_BUSY"]]);
+    assert.equal(h.receiver.transfers().size, 0);
+    // Unlike DIRECT_FAILED the server still holds the transfer: the page
+    // must release it, or it counts against the budget until a peer leaves.
+    const sent = h.control.slice(before);
+    assert.deepEqual(
+      sent.map((m) => [m.type, m.body?.transferId]),
+      [["transfer.cancel", transferId]],
+    );
+    // A notice for an unknown transfer is not consumed.
+    assert.equal(
+      h.receiver.handleControl({
+        type: "error",
+        body: { code: "RELAY_BUSY", message: "ff".repeat(16) },
+      }),
+      false,
+    );
+  });
+
   it("cancel_aborts_before_control_send", async () => {
     const h = harness();
     const bytes = new Uint8Array(10);

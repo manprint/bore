@@ -268,6 +268,13 @@ function setConnection(connection, statusText) {
 }
 
 function teardownUnavailable(statusText) {
+  // A terminal close can arrive WITHOUT the `room.closed` that purges
+  // everything (a reconnect refused because the room is gone): the transfer
+  // actors must stop here too, or the page keeps peer connections and relay
+  // legs running under a room that no longer exists. Storage is left alone —
+  // only the server's own `room.closed` is authoritative enough to purge.
+  abortLiveActors("room-gone");
+  applyTransferEvent({ kind: "transfers.interrupted", code: "ROOM_UNAVAILABLE" });
   if (session !== null) {
     session.stop();
     session = null;
@@ -334,11 +341,33 @@ function dropUnauthenticOffer(event) {
 }
 
 /**
+ * Selections whose click is still being prepared (quota, resume rehash) and
+ * not yet on the wire. The button disables only once the transfer's row
+ * exists, and a resume rehashes the whole partial before it asks for
+ * anything — seconds, on a large file — so a second click there started a
+ * second rehash of the SAME staged parts and a second request.
+ */
+const preparingDownloads = new Set();
+
+/**
  * Starts one download from a click. Resolves the offer in the live catalog,
  * refuses our own, and hands the rest to the receiver — which owns the only
  * `transfer.request` construction site in the app.
  */
 async function startDownload(offerId, mode = "raw", options = {}) {
+  const selection = `${offerId}\u0000${mode}\u0000${options.entryId ?? ""}`;
+  if (preparingDownloads.has(selection)) {
+    return { pending: true };
+  }
+  preparingDownloads.add(selection);
+  try {
+    return await prepareDownload(offerId, mode, options);
+  } finally {
+    preparingDownloads.delete(selection);
+  }
+}
+
+async function prepareDownload(offerId, mode, options) {
   const offer = state.offers.get(offerId);
   if (offer === undefined || receiver === null) {
     view.announce(errorText("OFFER_NOT_FOUND"));
@@ -434,11 +463,56 @@ function installDiagnosticsHook() {
   }
 }
 
-/** Closes every live attempt (room death, page teardown). */
-function closeAllDirect() {
+/** Closes every live attempt (room death, page teardown, new identity). */
+function closeAllDirect(cause = "room-gone") {
   for (const transferId of [...directAttempts.keys()]) {
-    closeDirect(transferId, "room-gone");
+    closeDirect(transferId, cause);
   }
+}
+
+/**
+ * Stops every live transfer actor: direct attempts, then the recipient and
+ * source actors (their relay legs and timers). Verified bytes on disk are not
+ * touched, so whatever was running stays resumable.
+ */
+function abortLiveActors(cause) {
+  closeAllDirect(cause);
+  for (const transferId of [...(receiver?.transfers().keys() ?? [])]) {
+    receiver.abortTransfer(transferId);
+  }
+  for (const transferId of [...(sender?.transfers().keys() ?? [])]) {
+    sender.abortTransfer(transferId);
+  }
+}
+
+/**
+ * Ends every transfer this page is still running, after a reconnect gave it
+ * a NEW peer ID.
+ *
+ * The server removed the old peer and, with it, cancelled every transfer it
+ * took part in (`remove_peer`) — and told only the OTHER party, because the
+ * peer that left has no session left to tell. So this page is the one
+ * participant never informed. What it kept running was a transfer that no
+ * longer existed: its direct channels died when the counterpart dropped them,
+ * the notice it sent about that was refused (the new identity is a stranger
+ * to the transfer), and the row sat at `Trasferimento in corso · in
+ * connessione` for ever — with no cancel button, because that button is
+ * keyed to the peer ID the reconnect had just replaced.
+ *
+ * The partial is NOT touched: everything verified stays on disk and the
+ * offer reads "Riprendi". A reconnect still resumes nothing by itself; only
+ * a click does.
+ */
+function interruptLiveTransfers() {
+  abortLiveActors("reconnected");
+  const before = state.transfers;
+  applyTransferEvent({ kind: "transfers.interrupted", code: "INTERRUPTED" });
+  // Said only when a row actually ended: a reconnect with nothing in flight
+  // is not news.
+  if (state.transfers !== before) {
+    view.announce(errorText("INTERRUPTED"));
+  }
+  refreshResumable();
 }
 
 /** Test-only recorder: the direct attempt's lifecycle, never its SDP. */
@@ -1087,7 +1161,11 @@ function startSession() {
           message?.type === "welcome" &&
           typeof message?.body?.peerId === "string"
         ) {
+          const previousPeerId = selfPeerId;
           selfPeerId = message.body.peerId;
+          if (previousPeerId !== null && previousPeerId !== selfPeerId) {
+            interruptLiveTransfers();
+          }
           try {
             hook.selfPeerId = selfPeerId;
           } catch {

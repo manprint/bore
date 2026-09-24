@@ -723,6 +723,95 @@ test.describe.serial("direct", () => {
     }
   });
 
+  // T-WEB-RECONNECT-INTERRUPT. A control reconnect makes the recipient a NEW
+  // peer, and the server cancels what the old one was doing — telling only
+  // the source, because the peer that left has no session to tell. The page
+  // used to keep the row running: its direct channels died when the source
+  // dropped them, the notice it sent about that was refused (the new
+  // identity is a stranger to the transfer), and the row sat at
+  // `Trasferimento in corso` for ever with its cancel button gone. It must
+  // end the row, keep the partial, and let ONE click resume it.
+  test("T-WEB-RECONNECT-INTERRUPT a reconnect ends the live row and one click resumes it", async () => {
+    test.setTimeout(180_000);
+    // Paced past its first MiB (see `paceSendAfter`): the reconnect must land
+    // genuinely mid-transfer, not after a loopback wire already finished.
+    const a = await openPeer(env.roomUrl, { init: paceSendAfter(1024 * 1024, 25) });
+    const b = await openPeer(env.roomUrl);
+    await expectConnected(a.page);
+    await expectConnected(b.page);
+    expect(await opfsWorks(b.page)).toBe(true);
+
+    await a.page.locator("#file-input").setInputFiles([join(roomDir, "fallback.bin")]);
+    const offer = await poll(a.page, () => {
+      const catalog = window.__BORE_TEST__.getCatalogSnapshot();
+      return catalog.length === 1 ? catalog[0] : null;
+    });
+    const button = b.page.locator(`button[data-download="${offer.offerId}"]`);
+    await expect(button).toHaveText("Scarica");
+    await button.click();
+    // Verified bytes on the committed direct path, most of the file to come.
+    await expect(b.page.locator(".transfer-path")).toHaveAttribute("data-path", "direct", {
+      timeout: 60_000,
+    });
+    await poll(
+      b.page,
+      () => {
+        const bar = document.querySelector(".transfer-row progress");
+        return bar !== null && bar.value >= 15 ? bar.value : null;
+      },
+      60_000,
+    );
+    expect(await b.page.evaluate(() => window.__BORE_TEST__.receiverState().length)).toBe(1);
+
+    // The control socket drops and redials, exactly as a network change does.
+    const before = await b.page.evaluate(() => window.__BORE_TEST__.selfPeerId);
+    await b.page.evaluate(() => window.dispatchEvent(new Event("offline")));
+    await expect
+      .poll(() => b.page.evaluate(() => window.__BORE_TEST__.selfPeerId), { timeout: 20_000 })
+      .not.toBe(before);
+    await expectConnected(b.page);
+
+    // The row ENDS — it does not keep spinning — and nothing is left running.
+    await expect(b.page.locator(".transfer-row .transfer-state")).toHaveAttribute(
+      "data-state",
+      "failed",
+      { timeout: 15_000 },
+    );
+    expect(await b.page.evaluate(() => window.__BORE_TEST__.receiverState().length)).toBe(0);
+    // The source was told by the server, and its row ends too.
+    await expect(a.page.locator(".transfer-row .transfer-state")).toHaveAttribute(
+      "data-state",
+      /^(cancelled|failed)$/,
+      { timeout: 15_000 },
+    );
+    // Nothing the new identity sent was refused as a stranger's: the notice
+    // that used to go out for the dead attempt is gone with the actor.
+    const refused = await b.page.evaluate(() =>
+      [...window.__BORE_TEST__.controlErrors].map((e) => e.code),
+    );
+    expect(refused.filter((code) => code === "NOT_PARTICIPANT" || code === "TRANSFER_NOT_FOUND"))
+      .toEqual([]);
+
+    // The partial stayed: one click resumes it and the bytes are exact.
+    await expect(button).toHaveText("Riprendi", { timeout: 15_000 });
+    await button.click();
+    await expect(b.page.locator("#save-file")).toBeVisible({ timeout: 120_000 });
+    const resumed = await hookCounters(b.page);
+    const ranges = resumed.resumeRequests.at(-1);
+    expect(Array.isArray(ranges) && ranges.length > 0 && ranges[0][1] > 0).toBe(true);
+    const download = await Promise.all([
+      b.page.waitForEvent("download", { timeout: 60_000 }),
+      b.page.locator("#save-file").click(),
+    ]).then(([event]) => event);
+    const saved = readFileSync(await download.path());
+    expect(saved.length).toBe(bigBytes.length);
+    expect(createHash("sha256").update(saved).digest("hex")).toBe(bigHashHex);
+
+    for (const peer of [a, b]) {
+      await peer.cleanup();
+    }
+  });
+
   // T-WEB-DIRECT-DIAG (V003-C3). The page can now say WHICH kind of path an
   // attempt used and what ended it, and the same evidence must be safe to
   // hand to a stranger: the report is produced on a real engine and searched
@@ -968,6 +1057,117 @@ test.describe.serial("direct", () => {
     ]).then(([event]) => event);
     const saved = readFileSync(await download.path());
     expect(createHash("sha256").update(saved).digest("hex")).toBe(fileHashHex);
+
+    for (const peer of [a, b]) {
+      await peer.cleanup();
+    }
+  });
+});
+
+/**
+ * Init script for the RECIPIENT: WebRTC is absent until the test restores it.
+ * The first negotiation therefore answers `unsupported` and the transfer goes
+ * to the relay at once — a real relay, carrying real bytes — and the server's
+ * upgrade grid later offers the direct path again, to an engine that now has
+ * it. Nothing is faked: the same constructor comes back.
+ * NO BACKTICK in here: template literal.
+ */
+function webRtcAbsentUntilRestored() {
+  return `(() => {
+    const Real = window.RTCPeerConnection;
+    if (typeof Real !== "function") { return; }
+    window.RTCPeerConnection = undefined;
+    window.__BORE_RESTORE_RTC__ = () => { window.RTCPeerConnection = Real; };
+  })();`;
+}
+
+// T-WEB-UPGRADE (7.5). A transfer that started on the relay moves onto the
+// direct path when the server's upgrade grid offers it again, WITHOUT a
+// second click and without resending what the relay delivered. Nothing
+// gated the switch end to end, and the source broke on it: the relay leg the
+// upgrade had let go of was then closed by the server, its `onclose` did not
+// ask whose leg it was, read "the relay died before FINAL", reported
+// `FAILED` and forgot the transfer — tearing down the direct channels it had
+// just moved onto.
+test.describe.serial("upgrade", () => {
+  let slow = null;
+
+  test.beforeAll(async () => {
+    // Throttled so the relay is still carrying when the 20 s grid fires.
+    slow = await spawnRoomEnv({ relayRate: 192 * 1024 });
+  }, 60_000);
+
+  test.afterAll(async () => {
+    slow?.cleanup();
+  });
+
+  test("T-WEB-UPGRADE a relaying transfer moves onto the direct path and finishes there", async () => {
+    test.setTimeout(180_000);
+    const a = await openPeer(slow.roomUrl);
+    const b = await openPeer(slow.roomUrl, { init: webRtcAbsentUntilRestored() });
+    await expectConnected(a.page);
+    await expectConnected(b.page);
+    expect(await opfsWorks(b.page)).toBe(true);
+
+    await a.page.locator("#file-input").setInputFiles([join(roomDir, "fallback.bin")]);
+    const offer = await poll(a.page, () => {
+      const catalog = window.__BORE_TEST__.getCatalogSnapshot();
+      return catalog.length === 1 ? catalog[0] : null;
+    });
+    const button = b.page.locator(`button[data-download="${offer.offerId}"]`);
+    await button.click();
+    // On the relay, carrying verified bytes.
+    await expect(b.page.locator(".transfer-path")).toHaveAttribute("data-path", "relay", {
+      timeout: 60_000,
+    });
+    await b.page.evaluate(() => window.__BORE_RESTORE_RTC__());
+
+    // The grid offers the direct path; the transfer finishes ON it.
+    await expect(b.page.locator(".transfer-path")).toHaveAttribute("data-path", "direct", {
+      timeout: 90_000,
+    });
+    await expect(b.page.locator("#save-file")).toBeVisible({ timeout: 90_000 });
+
+    // The source did not call the switch a failure, and neither side refused
+    // a message as malformed.
+    expect(await a.page.evaluate(() => [...window.__BORE_TEST__.senderErrors])).toEqual([]);
+    for (const [who, peer] of [["source", a], ["recipient", b]]) {
+      const errs = await peer.page.evaluate(() =>
+        [...window.__BORE_TEST__.controlErrors].map((e) => `${e.code}:${e.sent ?? "?"}`),
+      );
+      expect({ who, errs: errs.filter((e) => !e.startsWith("STALE_ATTEMPT:")) }).toEqual({
+        who,
+        errs: [],
+      });
+    }
+    // Same transfer, relay then direct, and the direct commit skips what
+    // the relay had already delivered.
+    for (const peer of [a, b]) {
+      const commits = await peer.page.evaluate(() => [...window.__BORE_TEST__.pathCommits]);
+      expect(commits.map((c) => c.path)).toEqual(["relay", "direct"]);
+      expect(commits[0].transferId).toBe(commits[1].transferId);
+      expect(commits[0].attemptId).not.toBe(commits[1].attemptId);
+      expect(Array.isArray(commits[1].resumeRanges)).toBe(true);
+      expect(commits[1].resumeRanges.length).toBeGreaterThan(0);
+      expect(await peer.page.evaluate(() => window.__BORE_TEST__.transferRows())).toBe(1);
+    }
+    // One click, one request: the upgrade asked the user for nothing.
+    const counters = await hookCounters(b.page);
+    expect(counters.outboundTypes.filter((t) => t === "transfer.request").length).toBe(1);
+
+    const download = await Promise.all([
+      b.page.waitForEvent("download", { timeout: 60_000 }),
+      b.page.locator("#save-file").click(),
+    ]).then(([event]) => event);
+    const saved = readFileSync(await download.path());
+    expect(saved.length).toBe(bigBytes.length);
+    expect(createHash("sha256").update(saved).digest("hex")).toBe(bigHashHex);
+    // And the source's row says so too.
+    await expect(a.page.locator(".transfer-row .transfer-state")).toHaveAttribute(
+      "data-state",
+      "done",
+      { timeout: 15_000 },
+    );
 
     for (const peer of [a, b]) {
       await peer.cleanup();

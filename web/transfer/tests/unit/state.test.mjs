@@ -447,6 +447,38 @@ describe("room state", () => {
     );
   });
 
+  it("a_reconnect_interrupts_every_live_row_and_keeps_the_rest", () => {
+    // The reconnect gives this page a NEW peer ID and the server has already
+    // cancelled what the old one was doing, telling only the other party.
+    // Every live row ends; a finished or verified row does not move.
+    const VERIFIED_ID = "ee".repeat(16);
+    let state = startedRow(catalogState());
+    state = reduce(state, {
+      kind: "transfer.progress",
+      transferId: TRANSFER_ID,
+      doneBytes: 250,
+      totalBytes: 1000,
+      bytesPerSecond: 1024,
+    });
+    state = startedRow(state, { transferId: VERIFIED_ID, offerId: "ab".repeat(16) });
+    state = reduce(state, {
+      kind: "transfer.state",
+      transferId: VERIFIED_ID,
+      state: TRANSFER.VERIFIED,
+    });
+    const next = reduce(state, { kind: "transfers.interrupted", code: "INTERRUPTED" });
+    const live = next.transfers.get(TRANSFER_ID);
+    assert.equal(live.state, TRANSFER.FAILED);
+    assert.equal(live.code, "INTERRUPTED");
+    // The verified bytes stay counted: the partial is what "Riprendi" resumes.
+    assert.equal(live.doneBytes, 250);
+    assert.equal(next.transfers.get(VERIFIED_ID).state, TRANSFER.VERIFIED);
+    // Once nothing is live the event is a no-op, down to object identity:
+    // `main.js` announces the interruption only when a row actually ended.
+    assert.equal(reduce(next, { kind: "transfers.interrupted" }), next);
+    assert.notEqual(errorText("INTERRUPTED"), errorText("FAILED"));
+  });
+
   it("only_participants_see_cancel", () => {
     const row = {
       state: TRANSFER.TRANSFERRING,

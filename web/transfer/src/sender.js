@@ -742,7 +742,14 @@ export function createSender({
     };
     socket.onclose = () => {
       const known = transfers.get(transfer.transferId);
-      if (known === undefined) {
+      // Only the leg the transfer still CARRIES on may decide anything. An
+      // upgrade commit moves the transfer onto the direct probe and lets go
+      // of this leg, and the server then closes it — while the source is
+      // already sending on the probe. Without this test that close read as
+      // "the relay died before FINAL", reported `FAILED` and forgot the
+      // transfer, tearing down the direct channels the upgrade had just
+      // moved onto.
+      if (known === undefined || known.socket !== socket) {
         return;
       }
       // Anything before FINAL is a failure the server already reported (or
@@ -893,10 +900,20 @@ export function createSender({
           // and leaves the record in place.
           transfer.attemptAbort.abort();
           transfer.attemptId = body.attemptId;
+          const relayLeg = transfer.socket;
           transfer.sink = staged.sink;
           transfer.direct = true;
           transfer.socket = null;
           transfer.ticket = null;
+          // The leg is released HERE rather than left for the server to
+          // reap: detached first, so its own `onclose` knows it no longer
+          // speaks for this transfer, and closed by the side that stopped
+          // writing to it — which the pump reads as the orderly end it is.
+          try {
+            relayLeg?.close();
+          } catch {
+            /* already gone */
+          }
           transfer.state = "committed";
           // A fresh key and a fresh nonce sequence, from the new attempt ID —
           // `beginSend` derives both, exactly as it does for a relay attempt

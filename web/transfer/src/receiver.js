@@ -2070,6 +2070,21 @@ export function createReceiver({
           return true;
         }
       }
+      // Same anonymous shape, one difference that decides the last argument.
+      // `RELAY_BUSY` leaves the transfer LIVE on the server (retryable, no
+      // relay slot), and this notice was routed nowhere: the row sat at
+      // `in connessione` for ever while the record kept holding a slot of
+      // both peers' transfer budget. The page gives the attempt up — the
+      // verified partial stays, so `Riprendi` resumes it — and SAYS so, or
+      // the server would keep the record until one of the peers left.
+      if (message.type === "error" && body.code === "RELAY_BUSY") {
+        const named =
+          typeof body.message === "string" ? body.message : body.transferId;
+        if (typeof named === "string" && transfers.has(named)) {
+          failTransfer(named, "RELAY_BUSY");
+          return true;
+        }
+      }
       if (message.type === "ack" || message.type === "error") {
         if (message.requestId !== undefined) {
           const completing = pendingCompletes.get(message.requestId);
@@ -2103,6 +2118,17 @@ export function createReceiver({
         }
         const transferId = body?.result?.transferId ?? body?.transferId;
         if (typeof transferId !== "string") {
+          return true;
+        }
+        if (transfers.has(transferId)) {
+          // The server dedupes a live selection and answers a second request
+          // with the SAME transfer ID — which is what a second click inside
+          // the gap before the first ack produces (the button is disabled
+          // only once the row exists, and a resume rehashes the partial
+          // first). Installing this request over the transfer already
+          // running orphaned it: its attempt, key and plan went, frames for
+          // it were dropped as stale and the row sat `in connessione` for
+          // ever. The transfer that runs is kept; the duplicate is dropped.
           return true;
         }
         pending.transferId = transferId;

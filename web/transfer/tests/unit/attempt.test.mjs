@@ -1554,4 +1554,45 @@ describe("web-transfer relay to direct upgrade (7.5)", () => {
     );
     assert.deepEqual(src.events.errors, [], "switching path is not a failure");
   });
+
+  it("the_relay_leg_the_upgrade_left_behind_closing_never_fails_the_direct_send", async () => {
+    // The recipient closes its relay leg on the commit, the server's pump
+    // reads that as the pair's end and closes the SOURCE leg too — while the
+    // source is already sending on the probe. That close used to reach the
+    // relay leg's `onclose`, which did not ask whose attempt it belonged to:
+    // `committed`, FINAL not yet out, so it reported `FAILED` and forgot the
+    // transfer, tearing down the direct channels the upgrade had just moved
+    // onto. Red-check: drop the attempt test in `openRelay`'s `onclose`.
+    const bytes = payload(CHUNK * 2);
+    const src = await sourceHarness(bytes);
+    src.sender.handleControl({
+      type: "transfer.relay_ticket",
+      body: { transferId: TRANSFER_ID, attemptId: ATTEMPT_A, ticket: "ab".repeat(16) },
+    });
+    await tick(20);
+    const leg = src.sockets[0];
+    src.sender.handleControl({
+      type: "transfer.path_commit",
+      body: { transferId: TRANSFER_ID, attemptId: ATTEMPT_A, path: "relay" },
+    });
+    await waitFor(() => leg.sent.length > 1, "the relay pipeline to start");
+    const sink = fakeSink();
+    assert.equal(src.sender.attachUpgrade(TRANSFER_ID, ATTEMPT_B, sink), true);
+    src.sender.handleControl({
+      type: "transfer.path_commit",
+      body: {
+        transferId: TRANSFER_ID,
+        attemptId: ATTEMPT_B,
+        path: "direct",
+        resumeRanges: [[0, 1]],
+      },
+    });
+    // The server tears the abandoned leg down before FINAL is out.
+    leg.onclose?.();
+    const fragments = Math.ceil(CHUNK / FRAGMENT);
+    await waitFor(() => sink.frames.length === fragments + 1, "the upgraded source to finish");
+    assert.deepEqual(src.events.errors, [], "the old leg's close is not the new attempt's");
+    assert.equal(src.sender.transfers().get(TRANSFER_ID)?.direct, true);
+    assert.equal(sink.closed, false, "the probe's channel is still the live transport");
+  });
 });

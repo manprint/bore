@@ -249,6 +249,28 @@ export function reduce(state, event) {
       });
       return { ...state, transfers };
     }
+    case "transfers.interrupted": {
+      // A reconnect is a NEW peer, and the server cancelled every transfer
+      // the old one took part in — telling only the OTHER party, because the
+      // peer that left has no session left to tell. Every row still live
+      // here therefore names a transfer that no longer exists, and it ends
+      // now instead of spinning for ever with its cancel button gone (the
+      // button is keyed to the peer ID the reconnect just replaced).
+      // Verified rows stay: their bytes are staged here and need no server.
+      let transfers = null;
+      for (const [id, row] of state.transfers) {
+        if (TRANSFER_TERMINAL.has(row.state)) {
+          continue;
+        }
+        transfers ??= new Map(state.transfers);
+        transfers.set(id, {
+          ...row,
+          state: TRANSFER.FAILED,
+          code: event.code ?? "INTERRUPTED",
+        });
+      }
+      return transfers === null ? state : { ...state, transfers };
+    }
     case "transfer.removed": {
       if (!state.transfers.has(event.transferId)) {
         return state;
@@ -452,6 +474,7 @@ const ERROR_TEXT = new Map([
   ["RELAY_BUSY", "Relay occupato: riprova tra poco"],
   ["STORAGE_QUOTA", "Spazio su disco insufficiente"],
   ["CANCELLED", "Trasferimento annullato"],
+  ["INTERRUPTED", "Connessione persa: trasferimento interrotto, riprendi con un clic"],
   ["INTERNAL", "Errore del server"],
   // Answered to signalling about an attempt that is over or already
   // committed — the ordinary trickle-ICE race. It reaches no user-facing

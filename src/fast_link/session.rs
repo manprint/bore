@@ -846,6 +846,22 @@ impl FastLink {
         let t0 = std::time::Instant::now();
         let peer = handoff.peer;
 
+        // Announced at claim time, before the head and the replay go out:
+        // against a slow downloader the replay alone (up to the whole 4 MiB
+        // window) can take minutes, and the uploader must not sit on a
+        // silent "waiting" line meanwhile. A drop during the replay is then
+        // reported by the re-arm line that follows.
+        let started = timeout(self.stall_timeout, async {
+            uploader.write_all(&chunk(b"# download started\n")).await?;
+            uploader.flush().await
+        })
+        .await;
+        if !matches!(started, Ok(Ok(()))) {
+            self.fail(&mut uploader, "upload connection closed unexpectedly")
+                .await;
+            return (uploader, pump_state, StreamOutcome::Done);
+        }
+
         // Bounded like the pump's own writes: the replay can be the whole
         // 4 MiB window, and a downloader that connects and never reads must
         // not park the uploader past the stall timeout (nor past its expiry).
@@ -893,17 +909,6 @@ impl FastLink {
             );
             let outcome = self.rearm_or_fail(&mut uploader, slot, &pump_state).await;
             return (uploader, pump_state, outcome);
-        }
-
-        let started = timeout(self.stall_timeout, async {
-            uploader.write_all(&chunk(b"# download started\n")).await?;
-            uploader.flush().await
-        })
-        .await;
-        if !matches!(started, Ok(Ok(()))) {
-            self.fail(&mut uploader, "upload connection closed unexpectedly")
-                .await;
-            return (uploader, pump_state, StreamOutcome::Done);
         }
 
         let counters = PumpCounters {
@@ -2074,8 +2079,16 @@ mod tests {
             .unwrap();
         dserve_task2.await.unwrap();
         leftover.extend_from_slice(&read_to_end_bounded(&mut ul_read, 10).await);
-        let (_decoded, terminated) = decode_chunked(&leftover);
+        let (decoded, terminated) = decode_chunked(&leftover);
         assert!(terminated);
+        // The start is announced at claim time, so the stalled first download
+        // shows up as "started" then "interrupted", never as silence.
+        let text = String::from_utf8_lossy(&decoded);
+        let started = text.find("# download started").expect("start announced");
+        let interrupted = text
+            .find("# download interrupted")
+            .expect("re-arm announced");
+        assert!(started < interrupted, "{text}");
         assert_eq!(link.metrics_view().completed_total, 1);
         assert_no_leftover_slots(&link);
     }

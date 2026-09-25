@@ -57,6 +57,7 @@ frills attached.
   - [Public download link (`bore transfer link`)](#public-download-link-bore-transfer-link)
   - [Guida italiana completa](docs/transfer/TRANSFER_LINK.md)
   - [Browser-to-browser transfer (`bore transfer web`)](#browser-to-browser-transfer-bore-transfer-web)
+- [Fast link transfer (`curl -T` → one-shot link)](#fast-link-transfer-curl--t--one-shot-link)
 - [Diagnosing UDP / NAT (`bore test-udp`)](#diagnosing-udp--nat-bore-test-udp)
 - [VPN — point-to-point L3 tunnel (`bore vpn`)](#vpn--point-to-point-l3-tunnel)
 - [Vhost — subdomain reverse proxy (`bore vhost`)](#vhost--subdomain-reverse-proxy)
@@ -2978,6 +2979,138 @@ INFO web-transfer direct attempt failed transfer=<id> attempt=<id> reason=ice-fa
 It carries the same fixed reason and the server's own opaque IDs, and nothing about the
 peers. Read the two together: the server says *that* a path was abandoned and when, the
 browser trace says *why*.
+
+## Fast link transfer (`curl -T` → one-shot link)
+
+Fast link transfer turns the server itself into a one-shot upload/download relay reachable
+with nothing but `curl`, `wget` or a browser — no `bore` binary, no client-side setup. An
+upload is streamed straight through to RAM buffers as it arrives; nothing is ever written
+to disk. As soon as the request head is in, the server prints one download link back to the
+uploader and waits. The moment (and only the moment) a single downloader connects, the
+bytes are streamed from the uploader to that one downloader; the link stops working after
+that transfer finishes. It is always relayed (uploader → server → downloader: with no
+client software there is nothing to hole-punch), over one TLS hop per side and no
+multiplexing layer.
+
+The service is server-side only and disabled by default. It reuses the vhost frontend's
+existing wildcard certificate and DNS, so it needs a dedicated subdomain label under the
+vhost base domain (for example `fast.bore.example.com`) and requires HTTPS to already be
+reachable there — either via the vhost frontend's own certificate or via the control port's
+`--cert-file`/`--key-file` in the single-port topology. Enable it with:
+
+| Flag | Environment | Default | Meaning |
+| --- | --- | --- | --- |
+| `--fast-link-transfer` | `BORE_FAST_LINK_TRANSFER_ENABLED` | off | Enable the service. |
+| `--fast-link-transfer-vhost HOST` | `BORE_FAST_LINK_TRANSFER_VHOST` | none (required) | The dedicated subdomain, e.g. `fast.bore.example.com`. |
+| `--fast-link-transfer-auth USER:PASS` | `BORE_FAST_LINK_TRANSFER_AUTH` | none (required) | Upload-only HTTP Basic credential; never logged, never published by the admin API, and its environment value is not echoed by `--help`. |
+| `--fast-link-transfer-wait-timeout SECS` | `BORE_FAST_LINK_TRANSFER_WAIT_TIMEOUT` | `3600` (1 through 604800) | How long an upload waits for a downloader before the link expires. |
+| `--fast-link-transfer-max-active N` | `BORE_FAST_LINK_TRANSFER_MAX_ACTIVE` | `32` (1 through 4096) | Maximum uploads waiting or streaming at once; beyond it a new upload gets `503`. |
+
+```shell
+docker run --pull always -d --network host \
+  -e BORE_VHOST_BASE_DOMAIN=bore.example.com \
+  -e BORE_VHOST_CERT_FILE=/etc/bore/wildcard-bore.example.com.pem \
+  -e BORE_VHOST_KEY_FILE=/etc/bore/wildcard-bore.example.com.key \
+  -e BORE_FAST_LINK_TRANSFER_ENABLED=true \
+  -e BORE_FAST_LINK_TRANSFER_VHOST=fast.bore.example.com \
+  -e BORE_FAST_LINK_TRANSFER_AUTH=uploader:a-strong-password \
+  -v /etc/bore:/etc/bore:ro \
+  ghcr.io/manprint/bore server --control-port 7835 \
+  --cert-file /etc/bore/control-cert.pem --key-file /etc/bore/control-key.pem
+```
+
+The label of the fast host (`fast` above) is reserved the moment the service starts:
+neither a native `bore vhost` client nor an SSH gateway `-R vhost/fast:...` forward can
+register it (the SSH client is told why on its session channel).
+
+### Uploading
+
+```shell
+curl -u uploader:a-strong-password -T myfile.tar https://fast.bore.example.com
+```
+
+`curl -T -` reads the upload from stdin, which is exactly what a live pipe (like `tar`)
+needs. Because `curl` buffers its stdout when it is not a terminal, run it with `-N`
+(`--no-buffer`) whenever the printed link is piped, redirected or run under a supervisor —
+without it, the link only appears once the whole transfer has already finished, which
+defeats the point of getting it immediately:
+
+```shell
+sudo tar -cpf - myfolder | curl -N -u uploader:a-strong-password \
+  -T - https://fast.bore.example.com/myfolder.tar
+```
+
+The path segment after the host (`myfolder.tar` above) becomes both the download link's
+path and the filename offered to the downloader (`Content-Disposition`); with `-T -` and no
+path at all it defaults to `upload.bin`. The response streamed back to the uploader is a
+sequence of plain-text status lines as they happen: the download link itself, a "waiting for
+the download" notice with the expiry, a "download started" line once a downloader claims it,
+and a final `# done: N bytes in S s (R MiB/s)` line on success. A failure (the downloader
+disconnects too early to retry, the wait deadline elapses, or an internal error) is reported
+with a `# failed: ...` line and the connection is closed WITHOUT the normal completion
+marker, so a script watching for that marker can tell a truncated run from a real one.
+`curl`'s own exit code follows: `0` on a fully successful transfer, `18` when the transfer
+was cut short (including an expired or failed link) — a script only needs to check that one
+code to know whether to retry.
+
+### Downloading
+
+```shell
+curl -fO https://fast.bore.example.com/<id>/myfolder.tar
+wget https://fast.bore.example.com/<id>/myfolder.tar
+```
+
+Or just open the link in a browser. The link is single-use: once a real download claims it
+and the transfer finishes, the same URL answers `404` on any later request. A `HEAD`
+request never consumes the link (it exists purely so a client can preflight the filename/
+size without spending the one download), and neither does a request whose `User-Agent`
+identifies a known link-preview bot (Slack, Discord, WhatsApp, and similar chat/social
+unfurlers) — a link pasted into a chat is previewed safely without being burned; a `Range`
+request other than `bytes=0-` is answered `416` for the same reason. If the DOWNLOADER
+drops out before the upload has moved past its first 4 MiB, the same link re-arms
+automatically (the uploader sees `# download interrupted before the first 4 MiB; the link
+is still valid, waiting again`), because those bytes are still held in memory and are
+replayed to the next downloader; past that point a dropped download is a final failure and
+the upload must be restarted. If the UPLOADER drops out mid-stream, the downloader's
+transfer ends without its completion marker (`curl` exits `18`). If nobody downloads before
+`--fast-link-transfer-wait-timeout` elapses, the link expires and the uploader is told so.
+
+A plain (non-TLS) request to the fast host is never served directly: a `GET`/`HEAD` gets a
+`308` redirect to the `https://` URL (on the port that actually serves HTTPS), and any other
+method (an upload attempt) gets `403` — the payload is never accepted in the clear.
+
+### Restoring a piped archive
+
+The download side is the mirror image of the streaming-stdin upload above — pipe the
+printed link straight into `tar`, no credential needed (Basic auth is only checked on the
+upload; see "Limits and security" below):
+
+```shell
+curl -fsS https://fast.bore.example.com/<id>/myfolder.tar \
+  | sudo tar --numeric-owner --same-owner -xpf - -C /restore
+```
+
+### Limits and security
+
+The download link is the only credential a downloader needs, so treat it like one: anyone
+who has the URL can claim the one pending download. The upload side is gated by the
+`USER:PASS` Basic credential, checked before anything else (before the `100 Continue`, before
+a slot is even created), and is meant to keep uploads restricted to people you trust, not to
+protect the payload's confidentiality end to end — HTTPS termination happens at the server,
+same as ordinary vhost traffic. Nothing is ever written to disk on the server, and its logs
+never carry the credential, the filename or the full link id (only the id's first four
+characters, enough to correlate an upload with its download).
+
+### Admin metrics
+
+With `--admin-token` set, `/admin/api/v1/config` publishes a `fast_link` object (`host`,
+`wait_timeout_seconds`, `max_active`, `replay_window_bytes`) and `/admin/api/v1/metrics`
+publishes a `fast_link` object with live counters (`waiting`, `streaming`, `uploads_total`,
+`completed_total`, `failed_total`, `expired_total`, `rearmed_total`,
+`previews_blocked_total`, `auth_failures_total`, `rejected_busy_total`, `bytes_total`) —
+`null` in both when the service is disabled, and neither ever includes the upload
+credential. The admin dashboard's Metrics panel shows the same counters as a "Fast Link"
+card whenever the service is enabled.
 
 ## Diagnosing UDP / NAT (`bore test-udp`)
 

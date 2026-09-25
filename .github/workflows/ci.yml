@@ -78,6 +78,8 @@ jobs:
           done
           cargo test --all-features --lib --bins --examples "${targets[@]}" -- --skip t_ssh_ --skip t_dmx_
           cargo test --all-features --doc
+      - name: Admin UI unit tests
+        run: npm test
       - run: cargo test --all-features --test ssh_gateway_test --test ssh_gateway_spike_test -- --test-threads=1
 
   transfer-link:

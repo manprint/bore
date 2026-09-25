@@ -18,6 +18,7 @@ use anyhow::{ensure, Context, Result};
 use bore_cli::vhost::{Reservation, VhostConfig, VhostModeCfg};
 use bore_cli::{
     client::{Client, ProviderMeta},
+    fast_link,
     secret::Proxy,
     server::Server,
     shared::CONTROL_PORT,
@@ -443,6 +444,57 @@ async fn start_gateway_server_vhost(
     server.set_admin_token(Some(TOKEN.to_string()));
     server.set_bind_tunnels("127.0.0.1".parse()?);
     server.set_vhost(cfg)?;
+    server.set_ssh_gateway(config)?;
+    tokio::spawn(server.listen());
+    wait_port(CONTROL_PORT, true).await;
+    wait_port(gw_port, true).await;
+    wait_port(http_port, true).await;
+    Ok(gw_port)
+}
+
+/// Like [`start_gateway_server_vhost`], but also enables fast link transfer
+/// on `fast.<cfg.base_domain>` (D16/D20: this reserves the `fast` label
+/// against both native and SSH `vhost/<label>` registrations). The control
+/// port carries a throwaway TLS cert purely to satisfy `set_fast_link`'s
+/// HTTPS requirement — this test never makes a live HTTPS request.
+async fn start_gateway_server_vhost_fast_link(
+    host_key_file: PathBuf,
+    authorized_keys_dir: PathBuf,
+    cfg: VhostConfig,
+) -> Result<u16> {
+    let http_port = cfg.http_port;
+    let base_domain = cfg.base_domain.clone();
+    let gw_port = free_port().await?;
+    let config = SshGatewayConfig {
+        port: Some(gw_port),
+        host_key_file,
+        authorized_keys_dir: Some(authorized_keys_dir),
+        passwords_file: None,
+        banner: None,
+        window_size: bore_cli::sshgw::SSH_DEFAULT_WINDOW_SIZE,
+        advertise_address: None,
+        advertise_port: None,
+    };
+    let (cert_pem, key_pem) = self_signed_cert()?;
+    let acceptor = transport::server_tls_from_pem(cert_pem.as_bytes(), key_pem.as_bytes())?;
+
+    let mut server = Server::new(1024..=65535, None);
+    server.set_admin_token(Some(TOKEN.to_string()));
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_tls(acceptor);
+    server.set_vhost(cfg)?;
+
+    let args = fast_link::FastLinkServerArgs {
+        enabled: true,
+        vhost: Some(format!("fast.{base_domain}")),
+        auth: Some("u:p".to_string()),
+        wait_timeout_secs: fast_link::DEFAULT_WAIT_TIMEOUT_SECS,
+        max_active: fast_link::DEFAULT_MAX_ACTIVE,
+    };
+    let resolution =
+        fast_link::resolve_server_config(&args, server.vhost_base_domain().as_deref())?;
+    server.set_fast_link(resolution.config.expect("fast link transfer enabled"))?;
+
     server.set_ssh_gateway(config)?;
     tokio::spawn(server.listen());
     wait_port(CONTROL_PORT, true).await;
@@ -2060,6 +2112,105 @@ async fn t_ssh_vh2_basic_auth_enforced() -> Result<()> {
     );
 
     child.kill().await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T-SSH-FAST-LINK (plan 004, sub-phase 1.3, T-FL-I8) — the fast link
+// transfer host's vhost label is reserved against SSH registration exactly
+// like native registration (D16/D20): `-R vhost/fast:...` is rejected with
+// the reservation reason and never reaches the vhost registry, while an
+// unrelated label registers normally.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_fast_link_label_is_reserved() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let host_key = gen_keypair(dir.path(), "host_key").await?;
+    let client_priv = gen_keypair(dir.path(), "client").await?;
+    write_authorized_keys(dir.path(), &client_priv, None)?;
+
+    let http_port = free_port().await?;
+    let cfg = vhost_config("bore.fastlinktest", http_port, vec![]);
+    let gw_port =
+        start_gateway_server_vhost_fast_link(host_key, dir.path().to_path_buf(), cfg).await?;
+
+    let svc_fast = spawn_http_stub("should never be reachable").await?;
+    let raw_forward = format!("vhost/fast:0:127.0.0.1:{svc_fast}");
+
+    // `ExitOnForwardFailure=no` and no `-N`, so the client keeps its session
+    // channel open after the rejected global request and the reason is
+    // visible on stdout. A real OpenSSH client may open that channel BEFORE
+    // the server handles `tcpip-forward`; the rejection is then written to
+    // the live channel (`GatewayHandler::reject_line`) instead of a queue
+    // whose one-shot drain already ran — the first version of this test
+    // observed exactly that loss 3/3.
+    let args: Vec<String> = ssh_args_raw_no_n(gw_port, &client_priv, &[raw_forward])
+        .into_iter()
+        .map(|a| {
+            if a == "ExitOnForwardFailure=yes" {
+                "ExitOnForwardFailure=no".to_string()
+            } else {
+                a
+            }
+        })
+        .collect();
+    let mut cap = spawn_ssh_capturing(&args, "spawn ssh -R vhost/fast (T-SSH-FAST-LINK)")?;
+    let seen = wait_buf_contains(
+        &cap.buf,
+        "reserved for the fast link transfer service",
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        seen.contains(
+            "bore ssh-gateway: subdomain 'fast' is reserved for the fast link transfer service"
+        ),
+        "the client must be told why vhost/fast was refused, got: {seen:?}"
+    );
+
+    // The label never reached the registry: the fast host still answers as
+    // the fast link service, never with the SSH-forwarded stub's body.
+    let resp = send_http(http_port, "fast.bore.fastlinktest", "/").await?;
+    assert!(
+        resp.starts_with("HTTP/1.1 308"),
+        "the fast host must still answer as the fast link service, got: {resp}"
+    );
+    assert!(
+        !resp.contains("should never be reachable"),
+        "the 'fast' label must never be registered by SSH, got: {resp}"
+    );
+    cap.child.kill().await.ok();
+
+    // An unrelated label still registers normally.
+    let svc_other = spawn_http_stub("hello from other").await?;
+    let raw_forward_other = format!("vhost/otherlabel:0:127.0.0.1:{svc_other}");
+    let mut child_other = Command::new("ssh")
+        .args(ssh_args_raw(
+            gw_port,
+            &client_priv,
+            &[raw_forward_other],
+            None,
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh -R vhost/other (T-SSH-FAST-LINK)")?;
+
+    wait_admin_data_contains("otherlabel").await?;
+    let resp = send_http(http_port, "otherlabel.bore.fastlinktest", "/").await?;
+    assert!(
+        resp.contains("hello from other"),
+        "an unrelated label must still register normally, got: {resp}"
+    );
+
+    child_other.kill().await.ok();
     Ok(())
 }
 

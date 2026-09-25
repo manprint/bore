@@ -294,6 +294,53 @@ export default {
             container.appendChild(webSection);
         }
 
+        // Fast Link. Same rule as Web Transfer above: the section appears
+        // only when `data.fast_link` is a non-null object (D6: `null` means
+        // the service is off), and every row inside it is tested `!= null`,
+        // never truthiness, so a live gauge reading 0 (no upload waiting,
+        // for instance) still renders (P-11).
+        if (data.fast_link !== undefined && data.fast_link !== null) {
+            const fast = data.fast_link;
+            const fastSection = document.createElement('div');
+            fastSection.className = 'metrics-counts';
+            const fastCard = document.createElement('div');
+            fastCard.className = 'card';
+            const fastTitle = document.createElement('div');
+            fastTitle.className = 'count-label';
+            fastTitle.textContent = 'Fast Link';
+            fastCard.appendChild(fastTitle);
+            const fastList = document.createElement('div');
+            fastList.className = 'counts-list';
+
+            const fastRow = (label, value, format) => {
+                if (value === undefined || value === null) return;
+                const row = document.createElement('div');
+                row.className = 'count-row';
+                const shown = format ? format(value) : String(value);
+                row.innerHTML = `
+                    <span class="count-label">${escapeHtml(label)}</span>
+                    <span class="count-value">${escapeHtml(shown)}</span>
+                `;
+                fastList.appendChild(row);
+            };
+
+            fastRow('Waiting', fast.waiting);
+            fastRow('Streaming', fast.streaming);
+            fastRow('Uploads', fast.uploads_total);
+            fastRow('Completed', fast.completed_total);
+            fastRow('Failed', fast.failed_total);
+            fastRow('Expired', fast.expired_total);
+            fastRow('Re-armed', fast.rearmed_total);
+            fastRow('Previews Blocked', fast.previews_blocked_total);
+            fastRow('Auth Failures', fast.auth_failures_total);
+            fastRow('Rejected (Busy)', fast.rejected_busy_total);
+            fastRow('Bytes', fast.bytes_total, fmtBytes);
+
+            fastCard.appendChild(fastList);
+            fastSection.appendChild(fastCard);
+            container.appendChild(fastSection);
+        }
+
         el.appendChild(container);
     }
 };

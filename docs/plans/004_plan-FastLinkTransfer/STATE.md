@@ -25,12 +25,12 @@ State writer: agent-1:opus coordinator session; ownership: active.
 - Scope result: RUNNING
 - Type: phase closure
 - ID / attempt: P2 / 1
-- Status: OPEN
+- Status: OPEN (G-FINAL)
 - Intent: chiusura finale (gate locali, review, push su dev, CI remota verde)
 - Assigned: agent-1:opus
 - File / unit heading: phase_03.md § Phase gates and closure
 - Current step: S1
-- Next action: fmt/clippy, commit P2, `git push origin dev`, seguire tutti i workflow del commit
+- Next action: `git push origin dev`, seguire tutti i workflow del commit fino al verde
 - Next eligible plan unit: G-FINAL
 - Unit base: commit unit:2.4:1; branch: dev; owned changes: none
 - Repo state: HEAD = commit 1.3; non tracciati scripts/fast_link_e2e.sh, scripts/fast_link_perf.sh (unità 2.1/2.2, scritti da agent-1:opus in parallelo a 1.3)
@@ -77,6 +77,7 @@ Required supervisor reviews cannot be silently replaced by weaker self-review.
 | Type | ID / attempt | Plan revision | Agent | Changes | Evidence/review | Commit |
 |------|--------------|---------------|-------|---------|-----------------|--------|
 | plan | 004 / 1 | 1 | agent-1:opus | docs/plans/004_plan-FastLinkTransfer/* | recon + R1 probe locale + R2–R5 | unit:0.1:1 (incluso) |
+| phase closure | P2 / 1 | 5 | agent-1:opus | STATE.md | gate locali: fmt ok, clippy 0, G-FULL + G-NODEF del P1 validi (nessun cambiamento a `src`/`tests` dopo fd98aa7: `git diff --stat fd98aa7 HEAD -- src tests Cargo.toml` vuoto), G-E2E 13/13, G-PERF 3/3, G-PW 1/1; scenario di riferimento: E1 (file), E2 (tar streaming + wget), T-FL-PW (browser); review finale agent-1:opus | unit:P2:1 |
 | sub-phase | 2.4 / 1 | 5 | agent-1:opus | docs/transfer/FAST_LINK.md NEW, README.md (troubleshooting + rimando), docs/README.md (indice), CLAUDE.md (Key invariants) | verifica contro il codice: 11 nomi di test citati esistono (`grep fn`), 5 flag presenti in `bore server --help`, testi delle risposte e limiti letti da `session.rs`/`request.rs`/`mod.rs`, UA list copiata da `BOT_UA_MARKERS`, numeri T-FL-PERF dai tre run di §7 | unit:2.4:1 |
 | sub-phase | 2.3 / 1 | 5 | agent-1:opus | web/transfer/tests/e2e/fast-link.spec.mjs NEW | G-PW: `npm run build --prefix web/transfer` (dist invariato, `git diff --exit-code -- web/transfer/dist` pulito), `cargo build --all-features --bin bore --example web_transfer_e2e_owner`, `npx playwright test --project=chromium fast-link` → 1 passed (415 ms): nome suggerito `payload.bin`, SHA-256 identico, uploader exit 0, secondo GET 404; firefox/webkit → 2 skipped con motivo; `page.request` NON usato per il 404 (è un client Node e non vede `--host-resolver-rules`) → seconda navigazione | unit:2.3:1 |
 | sub-phase | 2.2 / 1 | 5 | agent-1:opus | scripts/fast_link_perf.sh NEW, ci.yml (passo perf nel job `fast-link`) | G-PERF 3 run su release, tutti PASS (rapporto 1.403 / 1.231 / 1.376; CPU server per GiB inferiore sul fast); T-FL-TRANSIT write 0 in tutti e tre; review validità: bracci interleaved, stessa sorgente tmpfs (/dev/shm), origin senza hash, stesso `BORE_PROXY_BUFFER_SIZE`, byte ricevuti verificati (fallimento rumoroso), `# done: SIZE` verificato, `LC_ALL=C`, campioni grezzi sempre stampati, pid del server = bore (process substitution); rev 5 sulla soglia RSS | unit:2.2:1 |
@@ -168,7 +169,7 @@ README obligation per phase: 0 → nessuna sezione cambia (verifica a P0); 1 →
 |----|------|--------------|--------|---------------------------|
 | 0 | phase_01.md | P0 | DONE | review agent-1:opus; unit:P0:1 |
 | 1 | phase_02.md | P1 | DONE | review agent-1:opus; unit:P1:1 |
-| 2 | phase_03.md | P2 | IN_PROGRESS | — |
+| 2 | phase_03.md | P2 | DONE | review agent-1:opus; unit:P2:1 |
 
 Statuses: TODO, IN_PROGRESS, IN_REVIEW, DONE, SKIPPED, BLOCKED.
 

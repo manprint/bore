@@ -22,18 +22,12 @@ State writer: agent-1:opus coordinator session; ownership: active.
 ## 1. Current unit and scope
 
 - Active scope: plan 004 (tutte le fasi, fino a G-FINAL)
-- Scope result: RUNNING
-- Type: phase closure
-- ID / attempt: P2 / 1
-- Status: OPEN (G-FINAL)
-- Intent: chiusura finale (gate locali, review, push su dev, CI remota verde)
-- Assigned: agent-1:opus
-- File / unit heading: phase_03.md § Phase gates and closure
-- Current step: S1
-- Next action: `git push origin dev`, seguire tutti i workflow del commit fino al verde
-- Next eligible plan unit: G-FINAL
-- Unit base: commit unit:2.4:1; branch: dev; owned changes: none
-- Repo state: HEAD = commit 1.3; non tracciati scripts/fast_link_e2e.sh, scripts/fast_link_perf.sh (unità 2.1/2.2, scritti da agent-1:opus in parallelo a 1.3)
+- Scope result: COMPLETE (2026-09-25)
+- Type: —
+- ID / attempt: —
+- Status: nessuna unità aperta
+- Next action: nessuna; follow-up proposti all'utente (vedi §9)
+- Repo state: `dev` pushato a e2642df (tutti i workflow verdi); questo aggiornamento di STATE è un commit locale successivo, non pushato
 
 ## 2. Feature context and readiness
 
@@ -77,6 +71,7 @@ Required supervisor reviews cannot be silently replaced by weaker self-review.
 | Type | ID / attempt | Plan revision | Agent | Changes | Evidence/review | Commit |
 |------|--------------|---------------|-------|---------|-----------------|--------|
 | plan | 004 / 1 | 1 | agent-1:opus | docs/plans/004_plan-FastLinkTransfer/* | recon + R1 probe locale + R2–R5 | unit:0.1:1 (incluso) |
+| final | G-FINAL / 1 | 5 | agent-1:opus | push `8d2032d..e2642df` su `dev` | run 36080635625 (CI), E2E (netns), Mean Bean CI, Mean Bean Deploy, Docker (GHCR): tutti `success`. Primo tentativo CI: 2 job falliti FUORI dal fast link, rilanciati con `gh run rerun --failed` e verdi: (a) `Transfer link` T-LINK-PERF relay 0.615 < 0.75 — A/B locale interleaved sullo stesso script: binario BASE 8d2032d 0.738 (FAIL) e 0.985, HEAD 0.861 e 0.930 → rumore del gate preesistente, non regressione; rerun 0.950; (b) `Web transfer e2e (firefox)` T-WEB-PATH-UI (percorso diretto WebRTC, famiglia di flake nota; lo spec fast link è skip su firefox), 52 passed; rerun verde. Job `fast-link` su CI al primo colpo: E 13/13, T-FL-PERF ratio 1.519 (raw vhost 1319.7,865.4,815.2 fast 1382.8,717.9,1314.4), T-FL-TRANSIT write 0 / RSS +36.7 MB ≤ 96 MiB | — |
 | phase closure | P2 / 1 | 5 | agent-1:opus | STATE.md | gate locali: fmt ok, clippy 0, G-FULL + G-NODEF del P1 validi (nessun cambiamento a `src`/`tests` dopo fd98aa7: `git diff --stat fd98aa7 HEAD -- src tests Cargo.toml` vuoto), G-E2E 13/13, G-PERF 3/3, G-PW 1/1; scenario di riferimento: E1 (file), E2 (tar streaming + wget), T-FL-PW (browser); review finale agent-1:opus | unit:P2:1 |
 | sub-phase | 2.4 / 1 | 5 | agent-1:opus | docs/transfer/FAST_LINK.md NEW, README.md (troubleshooting + rimando), docs/README.md (indice), CLAUDE.md (Key invariants) | verifica contro il codice: 11 nomi di test citati esistono (`grep fn`), 5 flag presenti in `bore server --help`, testi delle risposte e limiti letti da `session.rs`/`request.rs`/`mod.rs`, UA list copiata da `BOT_UA_MARKERS`, numeri T-FL-PERF dai tre run di §7 | unit:2.4:1 |
 | sub-phase | 2.3 / 1 | 5 | agent-1:opus | web/transfer/tests/e2e/fast-link.spec.mjs NEW | G-PW: `npm run build --prefix web/transfer` (dist invariato, `git diff --exit-code -- web/transfer/dist` pulito), `cargo build --all-features --bin bore --example web_transfer_e2e_owner`, `npx playwright test --project=chromium fast-link` → 1 passed (415 ms): nome suggerito `payload.bin`, SHA-256 identico, uploader exit 0, secondo GET 404; firefox/webkit → 2 skipped con motivo; `page.request` NON usato per il 404 (è un client Node e non vede `--host-resolver-rules`) → seconda navigazione | unit:2.3:1 |
@@ -114,6 +109,7 @@ none
 | R1 probe | server Python + curl 8.5.0 (overview R1) | pass | 5 casi A–I | n/a | 2026-09-25 |
 | G-PERF run 1 | `bash scripts/fast_link_perf.sh` (release) | pass | raw vhost=1335.9,1389.4,1435.1 fast=1949.1,1887.4,1960.2 MiB/s; ratio 1.403; cpu s/GiB vhost 0.70,0.67,0.64 fast 0.56,0.59,0.57; transit write 0, RSS +21766144 (soglia allora 48 MiB) | b872eaf + script | 2026-09-25 |
 | G-PERF run 2 | idem | pass | raw vhost=1258.0,1530.7,1488.4 fast=1439.0,1831.8,2101.4; ratio 1.231; transit write 0, RSS +45932544 (→ rev 5) | idem | 2026-09-25 |
+| G-FINAL CI | `gh run list --commit e2642df` | pass | 5/5 workflow success (CI dopo rerun di 2 job non fast-link) | e2642df | 2026-09-25 |
 | G-PERF run 3 | idem, soglia rev 5 | pass | raw vhost=1539.3,1684.7,1189.5 fast=2117.7,2240.0,1838.7; ratio 1.376; cpu vhost 0.59,0.53,0.77 fast 0.50,0.50,0.57; transit write 0, RSS +26480640 ≤ 100971520 | idem | 2026-09-25 |
 
 | Review | Reviewer | Plan revision / reviewed change | Invariants/assertions checked | Verdict |
@@ -136,7 +132,10 @@ none
 
 ## 9. Blockers
 
-none
+none. Follow-up (non bloccanti, da proporre all'utente):
+- SSH gateway: i rifiuti precoci dei forward secret/public/jump usano ancora `queue_message` (ora consegnato dal drain corretto se il canale non è ancora aperto; se il canale è già aperto resta in coda — solo vhost usa `reject_line`).
+- T-LINK-PERF relay (`scripts/transfer_link_perf.sh`) è instabile vicino alla soglia 0.75 anche sul binario di base: va reso più robusto (più campioni) o rivisto — preesistente, non toccato.
+- T-FL-PERF su CI: un campione fast (717.9) è sceso sotto la mediana vhost; la mediana tiene (1.519) ma il gate può diventare rumoroso sui runner condivisi.
 
 ## 10. Do-not-repeat
 

@@ -5,8 +5,13 @@
 # One server, one host, one tmpfs payload. Two arms, interleaved so a drift
 # of the machine lands on both:
 #   VHOST  the existing relay baseline: a local HTTP origin behind `bore
-#          vhost` (TCP relay, no --udp), downloaded over the vhost HTTPS
-#          frontend.
+#          vhost` (TCP relay, no --udp) whose control connection is TLS, as
+#          in production (`--to https://...`) and as in the existing
+#          transfer-link baseline, downloaded over the vhost HTTPS frontend.
+#          A plaintext provider leg would skip a whole TLS pass the fast arm
+#          pays (the uploader's `curl -T` is TLS): measured on a CI runner,
+#          that alone put fast at 0.79x with a HIGHER server CPU/GiB — the
+#          baseline, not the fast path, was out of line.
 #   FAST   `curl -T` into the fast host, the printed link downloaded by a
 #          second curl.
 # The measure is the DOWNLOADER's speed in both arms. Raw samples are always
@@ -123,12 +128,12 @@ prompt = no
 [dn]
 CN = bore fast link perf server
 [req_ext]
-subjectAltName = DNS:bore.local,DNS:*.bore.local
+subjectAltName = DNS:localhost,DNS:bore.local,DNS:*.bore.local
 [leaf_ext]
 basicConstraints = critical,CA:FALSE
 keyUsage = critical,digitalSignature,keyEncipherment
 extendedKeyUsage = serverAuth
-subjectAltName = DNS:bore.local,DNS:*.bore.local
+subjectAltName = DNS:localhost,DNS:bore.local,DNS:*.bore.local
 authorityKeyIdentifier = keyid,issuer
 subjectKeyIdentifier = hash
 EOF
@@ -175,7 +180,8 @@ pids+=($!)
 BORE_FAST_LINK_TRANSFER_ENABLED=true BORE_FAST_LINK_TRANSFER_VHOST=fast.bore.local \
     BORE_FAST_LINK_TRANSFER_AUTH="u:$PASS" \
     "$BORE" server --bind-addr 127.0.0.1 --bind-tunnels 127.0.0.1 \
-    --control-port "$CP" --vhost-base-domain bore.local --vhost-mode both \
+    --control-port "$CP" --cert-file "$tmp/leaf.pem" --key-file "$tmp/leaf.key" \
+    --vhost-base-domain bore.local --vhost-mode both \
     --vhost-http-port "$HP" --vhost-https-port "$SP" \
     --vhost-cert-file "$tmp/leaf.pem" --vhost-key-file "$tmp/leaf.key" \
     > >(cat >"$tmp/server.log") 2>&1 &
@@ -184,8 +190,8 @@ pids+=("$server_pid")
 wait_tcp "$SP" || die "server did not open its HTTPS port"
 wait_tcp "$OP" || die "origin did not start"
 
-"$BORE" vhost "127.0.0.1:$OP" --subdomain perf --id perf --to "http://127.0.0.1:$CP" \
-    >"$tmp/provider.log" 2>&1 &
+"$BORE" vhost "127.0.0.1:$OP" --subdomain perf --id perf --to "https://localhost:$CP" \
+    --insecure >"$tmp/provider.log" 2>&1 &
 pids+=($!)
 deadline=$((SECONDS + 20))
 until curl -fsS -o /dev/null --cacert "$tmp/ca.pem" --resolve "perf.bore.local:$SP:127.0.0.1" \

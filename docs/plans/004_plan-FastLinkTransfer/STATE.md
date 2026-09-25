@@ -1,7 +1,7 @@
 # Fast Link Transfer — Implementation state
 
 Read first at every session. Updated 2026-09-25 by agent-1:opus (planning).
-Plan ID: 004_plan-FastLinkTransfer. Revision: 5. Repo root: /mnt/fabio/dati/Git/Github-manprint/bore-forked.
+Plan ID: 004_plan-FastLinkTransfer. Revision: 6. Repo root: /mnt/fabio/dati/Git/Github-manprint/bore-forked.
 Plan baseline: 8d2032d4 (`dev`, "chore: bump release to v1.2.1-rc.1"); pre-existing changes: none (clean tree).
 Roster: agent-1:opus, agent-2:sonnet, agent-3:haiku. Active execution style: delegated (coordinator = agent-1:opus session; workers = agent-2:sonnet via Agent tool).
 State writer: agent-1:opus coordinator session; ownership: active.
@@ -109,6 +109,8 @@ none
 | R1 probe | server Python + curl 8.5.0 (overview R1) | pass | 5 casi A–I | n/a | 2026-09-25 |
 | G-PERF run 1 | `bash scripts/fast_link_perf.sh` (release) | pass | raw vhost=1335.9,1389.4,1435.1 fast=1949.1,1887.4,1960.2 MiB/s; ratio 1.403; cpu s/GiB vhost 0.70,0.67,0.64 fast 0.56,0.59,0.57; transit write 0, RSS +21766144 (soglia allora 48 MiB) | b872eaf + script | 2026-09-25 |
 | G-PERF run 2 | idem | pass | raw vhost=1258.0,1530.7,1488.4 fast=1439.0,1831.8,2101.4; ratio 1.231; transit write 0, RSS +45932544 (→ rev 5) | idem | 2026-09-25 |
+| G-PERF rev 6 | `taskset -c 0 / 0-1 / tutti` + script con baseline TLS | pass | 1 core raw vhost=678.3,687.4,685.2 fast=942.1,930.5,941.4 (1.374); 2 core vhost=843.8,832.3,837.4 fast=1106.6,1132.8,1119.8 (1.337); tutti vhost=1157.7,1165.1,1174.2 fast=2227.1,2157.1,2053.0 (1.851); transit write 0 in tutti | script rev 6 | 2026-09-25 |
+| Release gate rc.2 | run 36094741955 job `Fast link transfer` | FAIL | T-FL-PERF raw vhost=639.6,684.2,670.2 fast=564.1,531.8,510.8; ratio 0.794; cpu vhost 1.40,1.29,1.34 fast 1.71,1.63,1.56 → rev 6 | 00024a3 | 2026-09-25 |
 | G-FINAL CI | `gh run list --commit e2642df` | pass | 5/5 workflow success (CI dopo rerun di 2 job non fast-link) | e2642df | 2026-09-25 |
 | G-PERF run 3 | idem, soglia rev 5 | pass | raw vhost=1539.3,1684.7,1189.5 fast=2117.7,2240.0,1838.7; ratio 1.376; cpu vhost 0.59,0.53,0.77 fast 0.50,0.50,0.57; transit write 0, RSS +26480640 ≤ 100971520 | idem | 2026-09-25 |
 
@@ -124,6 +126,7 @@ none
 
 | Revision | Previous decision/step | Approved replacement and reason | Supervisor | Dependents/revalidation |
 |----------|------------------------|---------------------------------|------------|------------------------|
+| 6 | 2.2 braccio VHOST: provider `bore vhost --to http://` (control port in chiaro) | provider su control port TLS (`--cert-file`/`--key-file` sul server, `--to https://localhost:<cp> --insecure`), come la baseline esistente `transfer_link_perf.sh` che il contratto diceva di copiare e come la produzione: il braccio in chiaro saltava un intero passaggio TLS che il braccio fast paga (curl -T è TLS). Scoperto dal gate del Release v1.2.1-rc.2 (runner lento, AES 1.3–1.7 s/GiB): fast 0.794× con CPU server/GiB PIÙ alta (1.63 vs 1.34), tutti i campioni fast sotto tutti i vhost. Dopo: 1 core 1.374, 2 core 1.337, 16 thread 1.851, CPU server/GiB fast < vhost in ogni configurazione. Soglia 1.0× invariata | agent-1:opus | solo 2.2 (docs FAST_LINK.md §14 aggiornato) |
 | 5 | 2.2 T-FL-TRANSIT: crescita RSS ≤ 48 MiB fissi | soglia = formula di I-2 (finestra replay 4 MiB + (PUMP_DEPTH 4 + 1 buffer d'attesa) × `proxy_buffer_size()` + 16 MiB di margine) = 96 MiB con il 16M imposto dallo stesso gate: 48 MiB stava SOTTO la formula (run passato a 45.9 MiB → flaky per costruzione); resta ≪ payload 1 GiB, che è ciò che dimostra il transito | agent-1:opus | solo 2.2 |
 | 4 | D9: redirect 308 verso `https://<authority><target>` con authority dall'header Host | redirect verso `config.host` + porta HTTPS configurata (omessa se 443): l'header Host di una richiesta in chiaro porta la porta HTTP, mai quella HTTPS (smoke test reale) | agent-1:opus | 0.4 (già chiusa, test S11 esteso), 1.1 (`set_fast_link` imposta la porta) |
 | 3 | 0.3 R: una read = un messaggio | R coalesce le read pronte (`now_or_never`) nello stesso buffer prima di inviarlo a W: tokio-rustls rende ~1 record (≤16 KiB) per read → senza coalescenza ~64k messaggi/wakeup/flush al s a 1 GB/s (review 0.3); nuovo test `pump_coalesces_small_reads` red-checked | agent-1:opus | solo 0.3 |

@@ -235,18 +235,25 @@ job and the existing browser job).
 ## 14. Measured bandwidth
 
 `scripts/fast_link_perf.sh`, 2026-09-25, one workstation (Intel Core 7 240H, 16 threads,
-Linux 7.0), release build, loopback, 1 GiB from tmpfs, `BORE_PROXY_BUFFER_SIZE=16M` for both
-arms, interleaved `VHOST FAST FAST VHOST VHOST FAST`, downloader speed in MiB/s:
+Linux 7.0), release build, loopback, tmpfs payload, `BORE_PROXY_BUFFER_SIZE=16M` for both
+arms, interleaved `VHOST FAST FAST VHOST VHOST FAST`, downloader speed in MiB/s. The vhost
+baseline's provider reaches the server over a TLS control connection, as in production:
 
-| Run | vhost relay (raw) | fast link (raw) | median ratio | server CPU s/GiB vhost → fast |
-|-----|-------------------|-----------------|--------------|-------------------------------|
-| 1 | 1335.9, 1389.4, 1435.1 | 1949.1, 1887.4, 1960.2 | 1.403 | 0.67 → 0.57 |
-| 2 | 1258.0, 1530.7, 1488.4 | 1439.0, 1831.8, 2101.4 | 1.231 | 0.62 → 0.59 |
-| 3 | 1539.3, 1684.7, 1189.5 | 2117.7, 2240.0, 1838.7 | 1.376 | 0.59 → 0.50 |
+| CPU | payload | vhost relay (raw) | fast link (raw) | median ratio | server CPU s/GiB vhost → fast |
+|-----|---------|-------------------|-----------------|--------------|-------------------------------|
+| all 16 threads | 1 GiB | 1157.7, 1165.1, 1174.2 | 2227.1, 2157.1, 2053.0 | 1.851 | 0.82 → 0.48 |
+| 2 cores (`taskset -c 0-1`) | 512 MiB | 843.8, 832.3, 837.4 | 1106.6, 1132.8, 1119.8 | 1.337 | 0.74 → 0.64 |
+| 1 core (`taskset -c 0`) | 512 MiB | 678.3, 687.4, 685.2 | 942.1, 930.5, 941.4 | 1.374 | — |
 
-T-FL-TRANSIT on every run: server `write_bytes` delta **0**, RSS growth 20.8 / 43.8 /
-25.3 MiB against the I-2 bound of 96 MiB for a 16 MB buffer (the payload is 1 GiB).
+T-FL-TRANSIT on every run: server `write_bytes` delta **0**, RSS growth ≤ 35 MB against the
+I-2 bound of 96 MiB for a 16 MB buffer.
 
-These are loopback numbers: they compare the two paths' own cost on one machine (the
-fast link needs about 15 % less server CPU per GiB and moves 1.2–1.4× the bytes), not a
+**Baseline fairness.** The first version of the gate let the vhost provider talk to the
+server in plain TCP. That skips a whole TLS pass the fast arm pays (the uploader's
+`curl -T` is TLS), so on a slow CI runner fast read 0.79x with a HIGHER server CPU per GiB
+(1.63 vs 1.34 s) — while the fast path itself was unchanged. With the provider leg on TLS,
+the relay does decrypt + yamux + encrypt and the fast link decrypt + encrypt, which is the
+comparison the design claims (one hop and one multiplexing layer fewer).
+
+These are loopback numbers: they compare the two paths' own cost on one machine, not a
 network's capacity. A real link will usually be the limit first.

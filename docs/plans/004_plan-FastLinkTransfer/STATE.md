@@ -24,15 +24,15 @@ State writer: agent-1:opus coordinator session; ownership: active.
 - Active scope: plan 004 (tutte le fasi, fino a G-FINAL)
 - Scope result: RUNNING
 - Type: sub-phase
-- ID / attempt: 2.1 / 1
+- ID / attempt: 2.2 / 1
 - Status: OPEN
-- Intent: `scripts/fast_link_e2e.sh` (curl/wget reali) + job CI `fast-link`
-- Assigned: agent-1:opus (script scritto dal supervisore in parallelo a 1.3)
-- File / unit heading: phase_03.md § 2.1
-- Current step: S2
-- Next action: chiudere 2.1 (G-E2E già verde), poi 2.2 (run perf)
-- Next eligible plan unit: 2.1 (phase_03.md)
-- Unit base: commit unit:P1:1; branch: dev; owned changes: none
+- Intent: `scripts/fast_link_perf.sh` (T-FL-PERF contro baseline vhost, T-FL-TRANSIT) + passo CI
+- Assigned: agent-1:opus (script scritto dal supervisore)
+- File / unit heading: phase_03.md § 2.2
+- Current step: S1 (run locale su release)
+- Next action: eseguire la misura, registrare i campioni grezzi in §7, review validità
+- Next eligible plan unit: 2.2 (phase_03.md)
+- Unit base: commit unit:2.1:1; branch: dev; owned changes: none
 - Repo state: HEAD = commit 1.3; non tracciati scripts/fast_link_e2e.sh, scripts/fast_link_perf.sh (unità 2.1/2.2, scritti da agent-1:opus in parallelo a 1.3)
 
 ## 2. Feature context and readiness
@@ -77,6 +77,7 @@ Required supervisor reviews cannot be silently replaced by weaker self-review.
 | Type | ID / attempt | Plan revision | Agent | Changes | Evidence/review | Commit |
 |------|--------------|---------------|-------|---------|-----------------|--------|
 | plan | 004 / 1 | 1 | agent-1:opus | docs/plans/004_plan-FastLinkTransfer/* | recon + R1 probe locale + R2–R5 | unit:0.1:1 (incluso) |
+| sub-phase | 2.1 / 1 | 4 | agent-1:opus | scripts/fast_link_e2e.sh NEW, .github/workflows/ci.yml (job `fast-link`, passo e2e) | G-E2E: 13/13 PASS su release (E1–E12 del contratto + E13 file binario piccolo senza `Expect`). Difetti dello script trovati e corretti in corsa: `$!` di una funzione in background = subshell (kill non raggiungeva curl, E6); `bore | cat &` registrava il pid di cat → bore sopravviveva e `wait` sul job bloccava il cleanup per sempre (timeout 900 s). Difetti del server trovati dall'e2e: E11 (502 su PUT in chiaro → Host dalla sola head, commit fix(vhost)) ed E7 (annuncio dopo il replay → commit fix(fast-link)). Red-check E13 NEGATIVO (passa anche senza il fix: su TLS curl scrive head e body in record separati) → commento e FAST_LINK.md dichiarano che il discriminante è E11 + unit test | unit:2.1:1 |
 | phase closure | P1 / 1 | 4 | agent-1:opus | STATE.md | G-FULL completo sul HEAD fd98aa7 (+ solo doc/CI/spec non tracciati, nessun codice): fmt 0, clippy 0, build 0, passo parallelo 0 (lib 928 + tutti i binari di test), doc 0, ssh_gateway 43 + spike 5, web_transfer_test seriale 0, npm 125/0, nodef 0; G-I1 7/7 + 1/1; review I-1 (hook solo con `fast_link` Some, sulla head già letta), I-SSH1 (loop di accept intatto, `git diff`), I-9 (308/403, D20 esteso), I-10 (nativo + SSH con messaggio esatto), D20; README verificato contro `bore server --help` | unit:P1:1 |
 | sub-phase | 1.3 / 1 | 4 | agent-2:sonnet (worker), review agent-1:opus | tests/fast_link_test.rs NEW (T-FL-I1..I7), tests/ssh_gateway_test.rs (T-FL-I8), src/admin_ui/panels/metrics.js, test/admin_ui/metrics-fast-link.test.js NEW, .github/workflows/ci.yml (passo `npm test`), README.md (sezione) | fast_link_test 7/0 (loop 4x), t_ssh_fast_link 1/0, ssh_gateway_test 43/0 + spike 5/0, npm 125/0, vhost_test 53/0, lib 929/0, clippy/fmt ok. Review: il worker aveva tolto l'asserzione del messaggio SSH segnalando un bug; diagnosi del supervisore con strumentazione temporanea: NON un problema d'ordine ma lo svuotamento in `channel_open_session` scriveva con `session.data` prima della conferma del canale (accodata da `accept()`) → righe perse → fix nel commit `fix(ssh-gateway)` + helper `reject_line`, asserzione esatta ripristinata e red-checked; README: 4 inesattezze corrette (esempio di ripristino senza `<id>` e con `-u`, re-arm attribuito all'uploader, `hide_env_values` ≠ process list, id nei log = 4 caratteri) + tag docker neutro. Fix trovati dall'e2e (commit separati): Host dalla sola head (vhost, 502 su corpo binario nella stessa lettura, red-checked), annuncio `# download started` prima del replay (red-checked) | unit:1.3:1 |
 | fix | smoke 1 / 1 | 4 | agent-1:opus | src/fast_link/session.rs, src/server.rs | primo run reale curl/wget (vhost HTTPS dedicato, 50 MB CL + tar in streaming chunked, SHA/`cmp` identici, exit 0): (a) il replay scritto fuori dalla pompa non era contato → `# done:` diceva 45805696 invece di 50000000, `bytes_total` e TX server sottostimati fino a 4 MiB → contato in `stream_handoff`, test `a_body_delivered_from_the_replay_is_counted` red-checked, asserzione esatta `# done: 10485760 bytes` in S1; (b) il 308 in chiaro usava la porta dell'header Host (porta HTTP) → `FastLink::set_https_port` impostata da `set_fast_link` (frontend vhost HTTPS se serve, altrimenti control port), caso 8443 nel test S11; verificati entrambi sul binario reale; lib 928/0 | commit senza trailer di unità (fix del supervisore) |
@@ -148,8 +149,8 @@ none
 | 1.1 | phase_02.md | P0 | DONE | 1 | G-U1 verdi, red-check modo vhost, review ok |
 | 1.2 | phase_02.md | 1.1 | DONE | 1 | G-U1, vhost_test 53/0, I-SSH1 diff ok |
 | 1.3 | phase_02.md | 1.1, 1.2 | DONE | 1 | G-I1 8/8, G-NPM 125/0, review ok |
-| 2.1 | phase_03.md | P1 | IN_PROGRESS | 1 | — |
-| 2.2 | phase_03.md | 2.1 | TODO | 1 | — |
+| 2.1 | phase_03.md | P1 | DONE | 1 | G-E2E 13/13 su release |
+| 2.2 | phase_03.md | 2.1 | IN_PROGRESS | 1 | — |
 | 2.3 | phase_03.md | P1 | TODO | 1 | — |
 | 2.4 | phase_03.md | 2.1, 2.2, 2.3 | TODO | 1 | — |
 
@@ -174,7 +175,7 @@ Statuses: TODO, IN_PROGRESS, IN_REVIEW, DONE, SKIPPED, BLOCKED.
 | reserved_label_reason_*, set_fast_link_*, config_and_metrics_publish_fast_link_*, server_fast_link_flags_* | 1.1 | G-U1 | PASS | 4/4 |
 | conn_security_is_static_per_type | 1.2 | G-U1 | PASS | 1/1 |
 | T-FL-I1..I7, t_ssh_fast_link_label_is_reserved, metrics-fast-link.test.js | 1.3 | G-I1, G-NPM | PASS | 7/7 + 1/1 + 5/5 |
-| T-FL-E1..E12 | 2.1 | G-E2E | TODO | — |
+| T-FL-E1..E13 | 2.1 | G-E2E | PASS | 13/13 (release) |
 | T-FL-PERF, T-FL-TRANSIT | 2.2 | G-PERF | TODO | — |
 | T-FL-PW | 2.3 | G-PW | TODO | — |
 

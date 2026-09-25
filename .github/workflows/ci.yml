@@ -120,6 +120,21 @@ jobs:
       - name: Docker transfer-link acceptance
         run: bash scripts/transfer_link_container_test.sh
 
+  fast-link:
+    name: Fast link transfer (curl/wget e2e + bandwidth)
+    if: inputs.only != 'web-transfer'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Fast link end-to-end (real curl and wget)
+        run: bash scripts/fast_link_e2e.sh
+
   transfer-paths:
     name: Transfer path edges (${{ matrix.os }})
     if: inputs.only != 'web-transfer'

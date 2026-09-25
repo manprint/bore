@@ -24,15 +24,15 @@ State writer: agent-1:opus coordinator session; ownership: active.
 - Active scope: plan 004 (tutte le fasi, fino a G-FINAL)
 - Scope result: RUNNING
 - Type: sub-phase
-- ID / attempt: 2.3 / 1
+- ID / attempt: 2.4 / 1
 - Status: OPEN
-- Intent: Playwright Chromium: un browser scarica un fast link una volta
+- Intent: documentazione finale (FAST_LINK.md, README, indice docs, CLAUDE.md)
 - Assigned: agent-1:opus
-- File / unit heading: phase_03.md § 2.3
-- Current step: S2 (spec scritto, da eseguire)
-- Next action: G-PW
-- Next eligible plan unit: 2.3 (phase_03.md)
-- Unit base: commit unit:2.2:1; branch: dev; owned changes: none
+- File / unit heading: phase_03.md § 2.4
+- Current step: S3
+- Next action: commit 2.4, poi P2 e G-FINAL
+- Next eligible plan unit: 2.4 (phase_03.md)
+- Unit base: commit unit:2.3:1; branch: dev; owned changes: none
 - Repo state: HEAD = commit 1.3; non tracciati scripts/fast_link_e2e.sh, scripts/fast_link_perf.sh (unità 2.1/2.2, scritti da agent-1:opus in parallelo a 1.3)
 
 ## 2. Feature context and readiness
@@ -77,6 +77,7 @@ Required supervisor reviews cannot be silently replaced by weaker self-review.
 | Type | ID / attempt | Plan revision | Agent | Changes | Evidence/review | Commit |
 |------|--------------|---------------|-------|---------|-----------------|--------|
 | plan | 004 / 1 | 1 | agent-1:opus | docs/plans/004_plan-FastLinkTransfer/* | recon + R1 probe locale + R2–R5 | unit:0.1:1 (incluso) |
+| sub-phase | 2.3 / 1 | 5 | agent-1:opus | web/transfer/tests/e2e/fast-link.spec.mjs NEW | G-PW: `npm run build --prefix web/transfer` (dist invariato, `git diff --exit-code -- web/transfer/dist` pulito), `cargo build --all-features --bin bore --example web_transfer_e2e_owner`, `npx playwright test --project=chromium fast-link` → 1 passed (415 ms): nome suggerito `payload.bin`, SHA-256 identico, uploader exit 0, secondo GET 404; firefox/webkit → 2 skipped con motivo; `page.request` NON usato per il 404 (è un client Node e non vede `--host-resolver-rules`) → seconda navigazione | unit:2.3:1 |
 | sub-phase | 2.2 / 1 | 5 | agent-1:opus | scripts/fast_link_perf.sh NEW, ci.yml (passo perf nel job `fast-link`) | G-PERF 3 run su release, tutti PASS (rapporto 1.403 / 1.231 / 1.376; CPU server per GiB inferiore sul fast); T-FL-TRANSIT write 0 in tutti e tre; review validità: bracci interleaved, stessa sorgente tmpfs (/dev/shm), origin senza hash, stesso `BORE_PROXY_BUFFER_SIZE`, byte ricevuti verificati (fallimento rumoroso), `# done: SIZE` verificato, `LC_ALL=C`, campioni grezzi sempre stampati, pid del server = bore (process substitution); rev 5 sulla soglia RSS | unit:2.2:1 |
 | sub-phase | 2.1 / 1 | 4 | agent-1:opus | scripts/fast_link_e2e.sh NEW, .github/workflows/ci.yml (job `fast-link`, passo e2e) | G-E2E: 13/13 PASS su release (E1–E12 del contratto + E13 file binario piccolo senza `Expect`). Difetti dello script trovati e corretti in corsa: `$!` di una funzione in background = subshell (kill non raggiungeva curl, E6); `bore | cat &` registrava il pid di cat → bore sopravviveva e `wait` sul job bloccava il cleanup per sempre (timeout 900 s). Difetti del server trovati dall'e2e: E11 (502 su PUT in chiaro → Host dalla sola head, commit fix(vhost)) ed E7 (annuncio dopo il replay → commit fix(fast-link)). Red-check E13 NEGATIVO (passa anche senza il fix: su TLS curl scrive head e body in record separati) → commento e FAST_LINK.md dichiarano che il discriminante è E11 + unit test | unit:2.1:1 |
 | phase closure | P1 / 1 | 4 | agent-1:opus | STATE.md | G-FULL completo sul HEAD fd98aa7 (+ solo doc/CI/spec non tracciati, nessun codice): fmt 0, clippy 0, build 0, passo parallelo 0 (lib 928 + tutti i binari di test), doc 0, ssh_gateway 43 + spike 5, web_transfer_test seriale 0, npm 125/0, nodef 0; G-I1 7/7 + 1/1; review I-1 (hook solo con `fast_link` Some, sulla head già letta), I-SSH1 (loop di accept intatto, `git diff`), I-9 (308/403, D20 esteso), I-10 (nativo + SSH con messaggio esatto), D20; README verificato contro `bore server --help` | unit:P1:1 |
@@ -156,8 +157,8 @@ none
 | 1.3 | phase_02.md | 1.1, 1.2 | DONE | 1 | G-I1 8/8, G-NPM 125/0, review ok |
 | 2.1 | phase_03.md | P1 | DONE | 1 | G-E2E 13/13 su release |
 | 2.2 | phase_03.md | 2.1 | DONE | 1 | G-PERF 3/3 PASS, ratio 1.23–1.40 |
-| 2.3 | phase_03.md | P1 | IN_PROGRESS | 1 | — |
-| 2.4 | phase_03.md | 2.1, 2.2, 2.3 | TODO | 1 | — |
+| 2.3 | phase_03.md | P1 | DONE | 1 | G-PW 1 passed, 2 skipped motivati |
+| 2.4 | phase_03.md | 2.1, 2.2, 2.3 | IN_PROGRESS | 1 | — |
 
 README obligation per phase: 0 → nessuna sezione cambia (verifica a P0); 1 → 1.3 S5 crea "Fast link transfer"; 2 → 2.4 S2 completa.
 
@@ -182,7 +183,7 @@ Statuses: TODO, IN_PROGRESS, IN_REVIEW, DONE, SKIPPED, BLOCKED.
 | T-FL-I1..I7, t_ssh_fast_link_label_is_reserved, metrics-fast-link.test.js | 1.3 | G-I1, G-NPM | PASS | 7/7 + 1/1 + 5/5 |
 | T-FL-E1..E13 | 2.1 | G-E2E | PASS | 13/13 (release) |
 | T-FL-PERF, T-FL-TRANSIT | 2.2 | G-PERF | PASS | 3/3 run, §7 |
-| T-FL-PW | 2.3 | G-PW | TODO | — |
+| T-FL-PW | 2.3 | G-PW | PASS | chromium 1/1, firefox/webkit skip |
 
 ### Documentation
 | Document/sections | Owning unit | Status | Evidence |

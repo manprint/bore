@@ -890,6 +890,21 @@ pub struct GatewayHandler {
 }
 
 impl GatewayHandler {
+    /// Report an early `tcpip-forward` rejection to the client. A real
+    /// OpenSSH client may open its session channel (and have its one-shot
+    /// `channel_open_session` drain run empty) BEFORE the server rejects the
+    /// forward, so a line only queued then is never shown. Handler methods
+    /// run one at a time on the session loop, so checking for the channel
+    /// and writing to it cannot race that drain.
+    fn reject_line(&self, session: &mut Session, line: String) {
+        match self.state.session_channel() {
+            Some(id) => {
+                let _ = session.data(id, format!("{line}\r\n").into_bytes());
+            }
+            None => self.state.queue_message(line),
+        }
+    }
+
     /// Identity granted by a successful auth, if any (authorized-keys
     /// comment/fingerprint, or the matched password label).
     pub fn identity(&self) -> Option<&str> {
@@ -1146,7 +1161,8 @@ impl GatewayHandler {
         session: &mut Session,
     ) -> Result<bool, russh::Error> {
         let Some(cfg) = self.gateway.vhost_config.clone() else {
-            self.state.queue_message(
+            self.reject_line(
+                session,
                 "bore ssh-gateway: server has no vhost.yml configured; \
                  vhost/<label> forwards are unavailable"
                     .to_string(),
@@ -1154,16 +1170,16 @@ impl GatewayHandler {
             return Ok(false);
         };
         if !permit_allows(&grant, "vhost/", &label) {
-            self.state.queue_message(format!(
-                "bore ssh-gateway: this key's permit= list does not allow vhost/{label}"
-            ));
+            self.reject_line(
+                session,
+                format!("bore ssh-gateway: this key's permit= list does not allow vhost/{label}"),
+            );
             return Ok(false);
         }
         if let Some(reason) =
             crate::vhost::reserved_label_reason(&label, &self.gateway.reserved_vhost_label)
         {
-            self.state
-                .queue_message(format!("bore ssh-gateway: {reason}"));
+            self.reject_line(session, format!("bore ssh-gateway: {reason}"));
             return Ok(false);
         }
         if matches!(
@@ -1175,9 +1191,10 @@ impl GatewayHandler {
             ),
             TakeoverDecision::Reject
         ) {
-            self.state.queue_message(format!(
-                "bore ssh-gateway: subdomain '{label}' already in use"
-            ));
+            self.reject_line(
+                session,
+                format!("bore ssh-gateway: subdomain '{label}' already in use"),
+            );
             return Ok(false);
         }
 
@@ -1989,8 +2006,18 @@ impl Handler for GatewayHandler {
         // drain (queued-before-set) or pushes directly via `Handle::data`
         // (set-before-its-check) — never silently lost in between.
         self.state.set_session_channel(channel_id);
+        // Through the session's own message queue, never `session.data`
+        // here: `accept()` only ENQUEUES the channel-open confirmation, which
+        // the session loop sends after this handler returns, so data written
+        // directly now would precede the confirmation and be lost (every line
+        // queued before the channel opened — a rejected forward's reason
+        // included — silently vanished). The handle shares that queue, so
+        // these lines follow the confirmation in order.
+        let handle = session.handle();
         for line in self.state.drain_messages() {
-            session.data(channel_id, format!("{line}\r\n").into_bytes())?;
+            let _ = handle
+                .data(channel_id, format!("{line}\r\n").into_bytes())
+                .await;
         }
         Ok(())
     }

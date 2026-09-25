@@ -42,6 +42,10 @@ pub struct FastLink {
     wait_timeout: Duration,
     stall_timeout: Duration,
     replay_window: usize,
+    /// The port a plain-HTTP request is redirected to (D9). The `Host` header
+    /// of a plain request names the HTTP port, never the HTTPS one, so the
+    /// redirect cannot be derived from it.
+    https_port: u16,
 }
 
 /// Read-only snapshot of the fixed configuration, safe to publish (never
@@ -202,7 +206,14 @@ impl FastLink {
             wait_timeout,
             stall_timeout: STALL_TIMEOUT,
             replay_window: REPLAY_WINDOW_BYTES,
+            https_port: 443,
         }
+    }
+
+    /// Set the HTTPS port plain-HTTP requests are redirected to (default
+    /// 443, which the redirect omits).
+    pub fn set_https_port(&mut self, port: u16) {
+        self.https_port = port;
     }
 
     /// The configured vhost host name.
@@ -322,7 +333,11 @@ impl FastLink {
 
         if !secure {
             if method == "GET" || method == "HEAD" {
-                let location = format!("https://{authority}{target}");
+                let host = &self.config.host;
+                let location = match self.https_port {
+                    443 => format!("https://{host}{target}"),
+                    port => format!("https://{host}:{port}{target}"),
+                };
                 let resp = simple_response(308, "text/plain", b"", &[("Location", &location)]);
                 let _ = stream.write_all(&resp).await;
             } else {
@@ -853,6 +868,22 @@ impl FastLink {
             Err(_) => false,
         };
 
+        // The replay reached the downloader outside the pump, so the pump's
+        // own counters never see it: account for it here, or `# done:`, the
+        // admin `bytes_total` and the server TX total would all miss up to
+        // the whole replay window.
+        let replayed = if down_ok {
+            pump_state.replay.as_ref().map_or(0, |r| r.len() as u64)
+        } else {
+            0
+        };
+        if replayed > 0 {
+            self.total_tx.fetch_add(replayed, Ordering::Relaxed);
+            self.metrics
+                .bytes_total
+                .fetch_add(replayed, Ordering::Relaxed);
+        }
+
         if !down_ok {
             drop(handoff.permit);
             debug!(
@@ -898,7 +929,7 @@ impl FastLink {
 
         let mut uploader = result.uploader;
         let pump_state = result.state;
-        let written = result.written;
+        let written = replayed + result.written;
 
         match result.end {
             PumpEnd::Completed => {
@@ -1443,11 +1474,64 @@ mod tests {
             terminated,
             "the uploader must end with the chunked terminator"
         );
-        assert!(String::from_utf8_lossy(&decoded).contains("# done:"));
+        assert!(String::from_utf8_lossy(&decoded).contains("# done: 10485760 bytes"));
 
         let m = link.metrics_view();
         assert_eq!(m.completed_total, 1);
         assert_eq!(m.bytes_total, 10 * 1024 * 1024);
+        assert_no_leftover_slots(&link);
+    }
+
+    /// Review 0.4 follow-up (found by the first real `curl` run): a body that
+    /// sits in the replay window when the download starts reaches the
+    /// downloader outside the pump, and must still be counted — in the
+    /// `# done:` line, in `bytes_total` and in the server TX total.
+    /// Red-check: without the accounting all three read 0 here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_body_delivered_from_the_replay_is_counted() {
+        let link = default_link();
+        let payload = random_bytes(0xC0DE, 64 * 1024);
+        let head = put_head_cl("/f.bin", payload.len() as u64, Some(AUTH), false);
+        let (upload_client, upload_server) = tokio::io::duplex(DUPLEX_CAP);
+        let (mut ul_read, mut ul_write) = tokio::io::split(upload_client);
+        let link_clone = Arc::clone(&link);
+        let serve_task = tokio::spawn(async move {
+            link_clone
+                .serve(upload_server, head, None, true, None)
+                .await;
+        });
+        let (url, mut leftover) = timeout(Duration::from_secs(10), read_link(&mut ul_read))
+            .await
+            .unwrap();
+        let id = extract_id(&url);
+        ul_write.write_all(&payload).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let dreq = get_head(&format!("/{id}/f.bin"), &[]);
+        let (mut dl_client, dl_server) = tokio::io::duplex(DUPLEX_CAP);
+        let link_clone2 = Arc::clone(&link);
+        let dserve_task = tokio::spawn(async move {
+            link_clone2.serve(dl_server, dreq, None, true, None).await;
+        });
+        let downloaded = read_to_end_bounded(&mut dl_client, 10).await;
+        let (_h, body) = split_response(&downloaded);
+        assert_eq!(body, payload);
+        timeout(Duration::from_secs(10), serve_task)
+            .await
+            .unwrap()
+            .unwrap();
+        dserve_task.await.unwrap();
+
+        leftover.extend_from_slice(&read_to_end_bounded(&mut ul_read, 10).await);
+        let (decoded, terminated) = decode_chunked(&leftover);
+        assert!(terminated);
+        assert!(
+            String::from_utf8_lossy(&decoded).contains("# done: 65536 bytes"),
+            "{}",
+            String::from_utf8_lossy(&decoded)
+        );
+        assert_eq!(link.metrics_view().bytes_total, 64 * 1024);
+        assert_eq!(link.total_tx.load(Ordering::Relaxed), 64 * 1024);
         assert_no_leftover_slots(&link);
     }
 
@@ -2146,6 +2230,32 @@ mod tests {
         assert!(resp.starts_with(b"HTTP/1.1 308"));
         assert!(String::from_utf8_lossy(&resp)
             .contains(&format!("Location: https://{HOST}/some/target")));
+
+        // A non-standard HTTPS port is named; the plain request's own port
+        // (its HTTP port) never leaks into the redirect.
+        let mut odd = FastLink::new(
+            FastLinkConfig {
+                host: HOST.to_string(),
+                label: "fast".to_string(),
+                auth: BasicAuth::parse(AUTH).unwrap(),
+                wait_timeout: Duration::from_secs(3600),
+                max_active: 32,
+            },
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        odd.set_https_port(8443);
+        let odd = Arc::new(odd);
+        let head = format!("GET /x HTTP/1.1\r\nHost: {HOST}:8080\r\n\r\n").into_bytes();
+        let (mut c, s) = tokio::io::duplex(DUPLEX_CAP);
+        Arc::clone(&odd).serve(s, head, None, false, None).await;
+        let resp = read_to_end_bounded(&mut c, 5).await;
+        assert!(
+            String::from_utf8_lossy(&resp)
+                .contains(&format!("Location: https://{HOST}:8443/x\r\n")),
+            "{}",
+            String::from_utf8_lossy(&resp)
+        );
 
         assert_no_leftover_slots(&link);
     }

@@ -1010,11 +1010,20 @@ impl Server {
             .set(config.label.clone())
             .map_err(|_| anyhow::anyhow!("fast link transfer is already configured"))?;
 
-        self.fast_link = Some(Arc::new(crate::fast_link::FastLink::new(
+        let mut fast = crate::fast_link::FastLink::new(
             config,
             Arc::clone(&self.total_rx_bytes),
             Arc::clone(&self.total_tx_bytes),
-        )));
+        );
+        // Plain-HTTP requests are redirected to the listener that actually
+        // terminates TLS for the fast host: the dedicated vhost HTTPS
+        // frontend when it serves, the control port otherwise.
+        let https_port = match &self.vhost_config {
+            Some(cfg) if vhost_https => cfg.read().unwrap().https_port,
+            _ => self.control_port,
+        };
+        fast.set_https_port(https_port);
+        self.fast_link = Some(Arc::new(fast));
         Ok(())
     }
 

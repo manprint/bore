@@ -2095,9 +2095,23 @@ pub(crate) async fn send_service_unavailable<S: AsyncWrite + Unpin>(mut stream: 
 }
 
 /// Extract the Host header value from a raw HTTP request head.
+///
+/// `head` is whatever the head reader returned, which routinely carries the
+/// first body bytes read together with the headers; only the bytes before
+/// the blank line are parsed. Decoding the whole buffer made any binary body
+/// in the same read (a small `curl -T`, a multipart upload) fail UTF-8 and
+/// the request 502 as "no routable subdomain"; scanning past the blank line
+/// would also let a body line pose as a `Host` header.
 pub(crate) fn extract_host_from_head(head: &[u8]) -> Option<&str> {
-    let text = std::str::from_utf8(head).ok()?;
+    let end = head
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(head.len());
+    let text = std::str::from_utf8(&head[..end]).ok()?;
     for line in text.lines().skip(1) {
+        if line.is_empty() {
+            break;
+        }
         if let Some((name, value)) = line.split_once(':') {
             if name.trim().eq_ignore_ascii_case("host") {
                 return Some(value.trim());
@@ -2263,6 +2277,25 @@ mod tests {
             extract_subdomain("MySub.Bore.Example.Com", "bore.example.com"),
             Some("mysub".to_string())
         );
+    }
+
+    // ── extract_host_from_head ─────────────────────────────────────────────
+
+    #[test]
+    fn extract_host_ignores_the_body_read_with_the_head() {
+        // A binary body prefix read together with the head (not UTF-8).
+        let mut req =
+            b"PUT /f.bin HTTP/1.1\r\nHost: fast.bore.tld\r\nContent-Length: 4\r\n\r\n".to_vec();
+        req.extend_from_slice(&[0xff, 0xfe, 0x00, 0x80]);
+        assert_eq!(extract_host_from_head(&req), Some("fast.bore.tld"));
+
+        // A body line never poses as the Host header.
+        let req = b"POST / HTTP/1.1\r\nContent-Length: 20\r\n\r\nHost: evil.bore.tld\r\n";
+        assert_eq!(extract_host_from_head(req), None);
+
+        // A head still arriving (no blank line yet) parses what is there.
+        let req = b"GET / HTTP/1.1\r\nHost: app.bore.tld\r\n";
+        assert_eq!(extract_host_from_head(req), Some("app.bore.tld"));
     }
 
     // ── reserved_label_reason ──────────────────────────────────────────────

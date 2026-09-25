@@ -135,6 +135,9 @@ jobs:
       - name: Fast link end-to-end (real curl and wget)
         run: bash scripts/fast_link_e2e.sh
 
+      - name: Fast link bandwidth vs vhost relay + transit proof
+        run: bash scripts/fast_link_perf.sh
+
   transfer-paths:
     name: Transfer path edges (${{ matrix.os }})
     if: inputs.only != 'web-transfer'

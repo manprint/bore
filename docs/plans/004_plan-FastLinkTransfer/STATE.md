@@ -23,16 +23,16 @@ State writer: agent-1:opus coordinator session; ownership: active.
 
 - Active scope: plan 004 (tutte le fasi, fino a G-FINAL)
 - Scope result: RUNNING
-- Type: sub-phase
-- ID / attempt: 2.4 / 1
+- Type: phase closure
+- ID / attempt: P2 / 1
 - Status: OPEN
-- Intent: documentazione finale (FAST_LINK.md, README, indice docs, CLAUDE.md)
+- Intent: chiusura finale (gate locali, review, push su dev, CI remota verde)
 - Assigned: agent-1:opus
-- File / unit heading: phase_03.md § 2.4
-- Current step: S3
-- Next action: commit 2.4, poi P2 e G-FINAL
-- Next eligible plan unit: 2.4 (phase_03.md)
-- Unit base: commit unit:2.3:1; branch: dev; owned changes: none
+- File / unit heading: phase_03.md § Phase gates and closure
+- Current step: S1
+- Next action: fmt/clippy, commit P2, `git push origin dev`, seguire tutti i workflow del commit
+- Next eligible plan unit: G-FINAL
+- Unit base: commit unit:2.4:1; branch: dev; owned changes: none
 - Repo state: HEAD = commit 1.3; non tracciati scripts/fast_link_e2e.sh, scripts/fast_link_perf.sh (unità 2.1/2.2, scritti da agent-1:opus in parallelo a 1.3)
 
 ## 2. Feature context and readiness
@@ -77,6 +77,7 @@ Required supervisor reviews cannot be silently replaced by weaker self-review.
 | Type | ID / attempt | Plan revision | Agent | Changes | Evidence/review | Commit |
 |------|--------------|---------------|-------|---------|-----------------|--------|
 | plan | 004 / 1 | 1 | agent-1:opus | docs/plans/004_plan-FastLinkTransfer/* | recon + R1 probe locale + R2–R5 | unit:0.1:1 (incluso) |
+| sub-phase | 2.4 / 1 | 5 | agent-1:opus | docs/transfer/FAST_LINK.md NEW, README.md (troubleshooting + rimando), docs/README.md (indice), CLAUDE.md (Key invariants) | verifica contro il codice: 11 nomi di test citati esistono (`grep fn`), 5 flag presenti in `bore server --help`, testi delle risposte e limiti letti da `session.rs`/`request.rs`/`mod.rs`, UA list copiata da `BOT_UA_MARKERS`, numeri T-FL-PERF dai tre run di §7 | unit:2.4:1 |
 | sub-phase | 2.3 / 1 | 5 | agent-1:opus | web/transfer/tests/e2e/fast-link.spec.mjs NEW | G-PW: `npm run build --prefix web/transfer` (dist invariato, `git diff --exit-code -- web/transfer/dist` pulito), `cargo build --all-features --bin bore --example web_transfer_e2e_owner`, `npx playwright test --project=chromium fast-link` → 1 passed (415 ms): nome suggerito `payload.bin`, SHA-256 identico, uploader exit 0, secondo GET 404; firefox/webkit → 2 skipped con motivo; `page.request` NON usato per il 404 (è un client Node e non vede `--host-resolver-rules`) → seconda navigazione | unit:2.3:1 |
 | sub-phase | 2.2 / 1 | 5 | agent-1:opus | scripts/fast_link_perf.sh NEW, ci.yml (passo perf nel job `fast-link`) | G-PERF 3 run su release, tutti PASS (rapporto 1.403 / 1.231 / 1.376; CPU server per GiB inferiore sul fast); T-FL-TRANSIT write 0 in tutti e tre; review validità: bracci interleaved, stessa sorgente tmpfs (/dev/shm), origin senza hash, stesso `BORE_PROXY_BUFFER_SIZE`, byte ricevuti verificati (fallimento rumoroso), `# done: SIZE` verificato, `LC_ALL=C`, campioni grezzi sempre stampati, pid del server = bore (process substitution); rev 5 sulla soglia RSS | unit:2.2:1 |
 | sub-phase | 2.1 / 1 | 4 | agent-1:opus | scripts/fast_link_e2e.sh NEW, .github/workflows/ci.yml (job `fast-link`, passo e2e) | G-E2E: 13/13 PASS su release (E1–E12 del contratto + E13 file binario piccolo senza `Expect`). Difetti dello script trovati e corretti in corsa: `$!` di una funzione in background = subshell (kill non raggiungeva curl, E6); `bore | cat &` registrava il pid di cat → bore sopravviveva e `wait` sul job bloccava il cleanup per sempre (timeout 900 s). Difetti del server trovati dall'e2e: E11 (502 su PUT in chiaro → Host dalla sola head, commit fix(vhost)) ed E7 (annuncio dopo il replay → commit fix(fast-link)). Red-check E13 NEGATIVO (passa anche senza il fix: su TLS curl scrive head e body in record separati) → commento e FAST_LINK.md dichiarano che il discriminante è E11 + unit test | unit:2.1:1 |
@@ -158,7 +159,7 @@ none
 | 2.1 | phase_03.md | P1 | DONE | 1 | G-E2E 13/13 su release |
 | 2.2 | phase_03.md | 2.1 | DONE | 1 | G-PERF 3/3 PASS, ratio 1.23–1.40 |
 | 2.3 | phase_03.md | P1 | DONE | 1 | G-PW 1 passed, 2 skipped motivati |
-| 2.4 | phase_03.md | 2.1, 2.2, 2.3 | IN_PROGRESS | 1 | — |
+| 2.4 | phase_03.md | 2.1, 2.2, 2.3 | DONE | 1 | doc verificati contro codice e script |
 
 README obligation per phase: 0 → nessuna sezione cambia (verifica a P0); 1 → 1.3 S5 crea "Fast link transfer"; 2 → 2.4 S2 completa.
 
@@ -188,10 +189,10 @@ Statuses: TODO, IN_PROGRESS, IN_REVIEW, DONE, SKIPPED, BLOCKED.
 ### Documentation
 | Document/sections | Owning unit | Status | Evidence |
 |-------------------|-------------|--------|----------|
-| README "Fast link transfer" | 1.3 (crea), 2.4 (completa) | IN_PROGRESS | sezione creata in 1.3, corretta in review |
-| docs/transfer/FAST_LINK.md | 2.4 | TODO | — |
-| docs/README.md indice | 2.4 | TODO | — |
-| CLAUDE.md Key invariants | 2.4 | TODO | — |
+| README "Fast link transfer" | 1.3 (crea), 2.4 (completa) | DONE | sezione + troubleshooting + rimando a FAST_LINK.md |
+| docs/transfer/FAST_LINK.md | 2.4 | DONE | 14 sezioni, numeri misurati |
+| docs/README.md indice | 2.4 | DONE | voce in `transfer/` |
+| CLAUDE.md Key invariants | 2.4 | DONE | bullet "Fast link transfer" |
 
 ### Audits
 | Report | Verdict | Current unresolved findings | Evidence |

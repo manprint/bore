@@ -3112,6 +3112,26 @@ publishes a `fast_link` object with live counters (`waiting`, `streaming`, `uplo
 credential. The admin dashboard's Metrics panel shows the same counters as a "Fast Link"
 card whenever the service is enabled.
 
+### Troubleshooting
+
+| Symptom | Meaning |
+| --- | --- |
+| the link appears only when the transfer is over | `curl`'s stdout is not a terminal: add `-N` |
+| `401` on upload | missing or wrong `-u USER:PASS` |
+| `403` on upload | plain `http://`: uploads are HTTPS only |
+| `404` on download | unknown id, already downloaded, expired, or the upload failed |
+| `409` on download | another download of the same link is in progress |
+| `416` on download | a `Range` request (resume is not supported: download from the start) |
+| `503` on upload | the server's `--fast-link-transfer-max-active` uploads are all busy; retry later |
+| uploader `curl` exits `18` | the transfer did not complete (`# failed:` / `# expired:` says why) |
+| downloader `curl` exits `18` | the uploader went away mid-stream: the file is truncated |
+
+Engineering reference (flow, state machine, limits, invariants and their tests):
+[`docs/transfer/FAST_LINK.md`](docs/transfer/FAST_LINK.md). The acceptance scripts
+`scripts/fast_link_e2e.sh` (real `curl`/`wget`, every case above) and
+`scripts/fast_link_perf.sh` (bandwidth against the vhost relay, plus proof that nothing
+touches the disk) run in CI.
+
 ## Diagnosing UDP / NAT (`bore test-udp`)
 
 Before blaming the tunnel, find out what *your* network allows. `bore test-udp` opens no

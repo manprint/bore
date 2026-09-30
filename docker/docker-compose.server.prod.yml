@@ -77,6 +77,15 @@ services:
       - BORE_CERT_FILE=/certs/cert.pem
       - BORE_KEY_FILE=/certs/key.pem
       - BORE_UDP=true
+      # Kill switch for the server-side ADAPTIVE traversal plan (NAT-profile based
+      # ordering/spray roles brokered to both peers). Unset = plan enabled. Client
+      # connectivity-check rounds stay active either way.
+      # - BORE_NO_UDP_ADAPTIVE_PLAN=true
+      # UDP port of the ALTERNATE STUN socket (RFC 5780 behaviour discovery; lets
+      # clients tell an address-dependent NAT filter from an address+port-dependent
+      # one). Unset/0 = ephemeral port, correct unless the server's EGRESS firewall
+      # allow-lists source ports. If set, publish it as UDP in `ports:` too.
+      # - BORE_STUN_ALT_PORT=7836
       # ------------------------------------------------------------------
       # HOST PREREQUISITE for BORE_UDP -- the UDP socket buffer (P-13).
       # ------------------------------------------------------------------
@@ -215,6 +224,8 @@ services:
       - BORE_VPN=true
       - BORE_VPN_POOL=10.99.0.0/16
       - BORE_VPN_MAX_LINKS=32
+      # Overlay subnet prefix allocated per hub from the pool. Default 24.
+      # - BORE_VPN_HUB_PREFIX=24
       - BORE_WEBSERVER_LOG=/logs
       - BORE_WEBSERVER_LOG_MAX_FILES=5
       - BORE_WEBSERVER_LOG_MAX_FILE_SIZE=50
@@ -271,6 +282,8 @@ services:
       # - BORE_WEB_TRANSFER_MAX_RELAYS=256
       # - BORE_WEB_TRANSFER_RELAY_RATE=104857600
       # - BORE_WEB_TRANSFER_OWNER_GRACE=60
+      # Parallel WebRTC connections one direct web transfer uses (1..=8). Default 8.
+      # - BORE_WEB_TRANSFER_DIRECT_CARRIERS=8
       #
       # NO VOLUME IS NEEDED, and none should be added. The server holds no
       # payload: relayed frames are opaque ciphertext passed between two
@@ -286,6 +299,38 @@ services:
       # - BORE_SSH_HOST_KEY_FILE=/etc/bore/ssh/host_key.pem
       # - BORE_SSH_AUTHORIZED_KEYS_DIR=/etc/bore/ssh/authorized_keys.d
       # - BORE_SSH_PASSWORDS_FILE=/etc/bore/ssh/passwords
+      # - BORE_SSH_PORT=2222
+      # Gateway extras (all need BORE_SSH_GATEWAY=true):
+      # Banner text sent to SSH clients before authentication.
+      # - BORE_SSH_BANNER=Authorized use only
+      # Public endpoint printed in the tunnel info banners (a front proxy rewrites
+      # the port and SSH carries no Host/SNI, so the server cannot derive it).
+      # Independent of each other; an unset one keeps its placeholder.
+      # - BORE_SSH_ADVERTISE_ADDRESS=bore.mydomain.com
+      # - BORE_SSH_ADVERTISE_PORT=443
+      # Per-channel SSH flow-control window in bytes. Default 16777216 (16 MiB);
+      # raise it to lift single-connection throughput on high-RTT legs (memory cost
+      # per active connection).
+      # - BORE_SSH_WINDOW_SIZE=16777216
+      # Base domain for namespaced ProxyJump targets (<alias>.<base>), e.g.
+      # `ssh.bore.mydomain.com`. Needs a wildcard DNS record for it.
+      # - BORE_SSH_JUMP_BASE_DOMAIN=ssh.bore.mydomain.com
+      #
+      # --- Fast link transfer (`curl -T file https://fast.<base>/name` -> one-shot link) ---
+      # Streamed uploader -> server -> downloader, never stored, always relayed. HTTPS
+      # only: the server needs a TLS listener for the host below (a vhost wildcard
+      # cert with a mode that serves HTTPS). Disabled unless ENABLED is true.
+      # Needs a build that ships the feature (v1.2.1-rc.2 or newer; `:latest` tracks only the last stable
+      # release). See docs/transfer/FAST_LINK.md.
+      # - BORE_FAST_LINK_TRANSFER_ENABLED=true
+      # Full reserved host the service answers on.
+      # - BORE_FAST_LINK_TRANSFER_VHOST=fast.bore.mydomain.com
+      # Upload-only HTTP Basic credential USER:PASS (downloads stay open by link).
+      # - BORE_FAST_LINK_TRANSFER_AUTH=alice:change-me
+      # Seconds an upload waits for a downloader (default 3600) and max concurrent
+      # uploads (default 32).
+      # - BORE_FAST_LINK_TRANSFER_WAIT_TIMEOUT=3600
+      # - BORE_FAST_LINK_TRANSFER_MAX_ACTIVE=32
 
     volumes:
       - ./certs:/certs:ro

@@ -5,7 +5,7 @@
 # The image defaults to $BORE_IMAGE (see the justfile `repo`); override with
 #   BORE_IMAGE=youruser/bore:latest docker compose ... up -d
 #
-# Performance / UDP notes: see ../SERVER_UDP_OPTIMIZATION.md.
+# Performance / UDP notes: see ../docs/server/SERVER_UDP_OPTIMIZATION.md.
 
 networks:
   bore:
@@ -13,7 +13,7 @@ networks:
 
 services:
   bore-server:
-    image: ${BORE_IMAGE:-yourusername/bore:latest}
+    image: ${BORE_IMAGE:-ghcr.io/manprint/bore:latest}
     # To build locally instead of pulling, comment `image:` and uncomment:
     # build:
     #   context: ..
@@ -318,6 +318,15 @@ services:
       # If you switch to host networking, read step 4 of the host-networking
       # note above FIRST: this image runs as UID 1000 and cannot bind a port
       # below 1024 in the host network namespace.
+      # Kill switch for the server-side ADAPTIVE traversal plan (NAT-profile based
+      # ordering/spray roles brokered to both peers). Unset = plan enabled. Client
+      # connectivity-check rounds stay active either way.
+      # - BORE_NO_UDP_ADAPTIVE_PLAN=true
+      # UDP port of the ALTERNATE STUN socket (RFC 5780 behaviour discovery; lets
+      # clients tell an address-dependent NAT filter from an address+port-dependent
+      # one). Unset/0 = ephemeral port, correct unless the server's EGRESS firewall
+      # allow-lists source ports. If set, publish it as UDP in `ports:` too.
+      # - BORE_STUN_ALT_PORT=7836
       # Public domain advertised to clients (enables http(s):// addressing):
       # - BORE_BIND_DOMAIN=bore.tld
       # Enable the read-only admin status page at /admin/status on the control
@@ -412,6 +421,8 @@ services:
       # - BORE_WEB_TRANSFER_MAX_RELAYS=256
       # - BORE_WEB_TRANSFER_RELAY_RATE=104857600
       # - BORE_WEB_TRANSFER_OWNER_GRACE=60
+      # Parallel WebRTC connections one direct web transfer uses (1..=8). Default 8.
+      # - BORE_WEB_TRANSFER_DIRECT_CARRIERS=8
       #
       # NO VOLUME IS NEEDED, and none should be added. The server holds no
       # payload: relayed frames are opaque ciphertext passed between two
@@ -433,9 +444,63 @@ services:
       # - BORE_SSH_AUTHORIZED_KEYS_DIR=/etc/bore/ssh/authorized_keys.d
       # - BORE_SSH_PASSWORDS_FILE=/etc/bore/ssh/passwords
       # - BORE_SSH_PORT=2222
+      # Gateway extras (all need BORE_SSH_GATEWAY=true):
+      # Banner text sent to SSH clients before authentication.
+      # - BORE_SSH_BANNER=Authorized use only
+      # Public endpoint printed in the tunnel info banners (a front proxy rewrites
+      # the port and SSH carries no Host/SNI, so the server cannot derive it).
+      # Independent of each other; an unset one keeps its placeholder.
+      # - BORE_SSH_ADVERTISE_ADDRESS=bore.mydomain.com
+      # - BORE_SSH_ADVERTISE_PORT=443
+      # Per-channel SSH flow-control window in bytes. Default 16777216 (16 MiB);
+      # raise it to lift single-connection throughput on high-RTT legs (memory cost
+      # per active connection).
+      # - BORE_SSH_WINDOW_SIZE=16777216
+      # Base domain for namespaced ProxyJump targets (<alias>.<base>), e.g.
+      # `ssh.bore.mydomain.com`. Needs a wildcard DNS record for it.
+      # - BORE_SSH_JUMP_BASE_DOMAIN=ssh.bore.mydomain.com
+      #
+      # --- VPN link brokering (`bore vpn listen|connect`) ---
+      # The server only BROKERS links (control + relay + UDP offers); it creates no
+      # TUN device, so this container needs no NET_ADMIN and no /dev/net/tun. Clients
+      # need the `vpn` feature and root/CAP_NET_ADMIN on their own host.
+      # - BORE_VPN=true
+      # Overlay address pool (CIDR). Required when clients use pool-mode addressing
+      # and for hub mode (`--max-clients N>1`).
+      # - BORE_VPN_POOL=10.99.0.0/16
+      # Max concurrent VPN links. Default 32.
+      # - BORE_VPN_MAX_LINKS=32
+      # Overlay subnet prefix allocated per hub from the pool. Default 24.
+      # - BORE_VPN_HUB_PREFIX=24
+      #
+      # --- Access logs (vhost + public tunnels, nginx-style) ---
+      # Setting the directory enables logging; mount it read-write (see `volumes:`).
+      # - BORE_WEBSERVER_LOG=/logs
+      # Rotated files kept per tunnel (default 4) and size in MiB before rotation
+      # (default 100).
+      # - BORE_WEBSERVER_LOG_MAX_FILES=4
+      # - BORE_WEBSERVER_LOG_MAX_FILE_SIZE=100
+      #
+      # --- Fast link transfer (`curl -T file https://fast.<base>/name` -> one-shot link) ---
+      # Streamed uploader -> server -> downloader, never stored, always relayed. HTTPS
+      # only: the server needs a TLS listener for the host below (a vhost wildcard
+      # cert with a mode that serves HTTPS). Disabled unless ENABLED is true.
+      # Needs a build that ships the feature (v1.2.1-rc.2 or newer; `:latest` tracks only the last stable
+      # release). See docs/transfer/FAST_LINK.md.
+      # - BORE_FAST_LINK_TRANSFER_ENABLED=true
+      # Full reserved host the service answers on.
+      # - BORE_FAST_LINK_TRANSFER_VHOST=fast.bore.mydomain.com
+      # Upload-only HTTP Basic credential USER:PASS (downloads stay open by link).
+      # - BORE_FAST_LINK_TRANSFER_AUTH=alice:change-me
+      # Seconds an upload waits for a downloader (default 3600) and max concurrent
+      # uploads (default 32).
+      # - BORE_FAST_LINK_TRANSFER_WAIT_TIMEOUT=3600
+      # - BORE_FAST_LINK_TRANSFER_MAX_ACTIVE=32
     # volumes:
     #   - ./certs:/certs:ro
     #   - ./vhost:/vhost:ro
     #   # NOT :ro — the host key is generated here on first run if it doesn't
     #   # exist yet; a read-only mount would make that fail.
     #   - ./ssh:/etc/bore/ssh
+    #   # BORE_WEBSERVER_LOG access logs (read-write):
+    #   - ./logs:/logs:rw

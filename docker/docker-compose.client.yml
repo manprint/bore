@@ -7,7 +7,7 @@
 
 services:
   bore-client:
-    image: ${BORE_IMAGE:-yourusername/bore:latest}
+    image: ${BORE_IMAGE:-ghcr.io/manprint/bore:latest}
     # With --udp / BORE_PREFER_UDP use the ROOT image and grant NET_ADMIN:
     #   image: ghcr.io/manprint/bore:client
     #   privileged: true            # or: cap_add: [NET_ADMIN]
@@ -33,6 +33,8 @@ services:
     # command: ["vhost", "127.0.0.1:8080", "--subdomain", "app", "--id", "my-client", "--udp"]
     restart: unless-stopped
     network_mode: host
+    # volumes:
+    #   - ./logs:/logs:rw   # BORE_WEBSERVER_LOG
     environment:
       - BORE_SERVER=bore.tld          # --to; may be http(s)://bore.tld[:port]
       - BORE_LOCAL_PORT=8080          # local service port to expose
@@ -78,6 +80,22 @@ services:
       # Bind the UDP hole-punch socket to a fixed port (0=random). Open it for
       # egress in a strict firewall, same value on both peers, for the direct path:
       # - BORE_NAT_UDP_PORT=41641
+      # Hole-punch helpers for the direct UDP path (all opt-in, relay is never
+      # affected):
+      # Try UPnP-IGD/PCP to map a port on the local router (no effect behind CGNAT).
+      # - BORE_UPNP=true
+      # Also advertise predicted symmetric-NAT ports as candidates. Best-effort; may
+      # look like a port scan to a strict firewall.
+      # - BORE_TRY_PORT_PREDICTION=true
+      # Manual candidate(s) IP:PORT: your own PUBLIC endpoint (static port-forward,
+      # public IP). Comma-separated, advertised first.
+      # - BORE_UDP_CANDIDATES=203.0.113.7:41641
+      # Skip STUN entirely and rely on manual/local/mapped candidates only (with no
+      # BORE_UDP_CANDIDATES this almost certainly stays on the relay).
+      # - BORE_UDP_NO_STUN=true
+      # Seconds to keep using ephemeral ports after the NAT remapped the preferred
+      # port (BORE_NAT_UDP_PORT), so the old mapping can expire. Default 600; 0 = off.
+      # - BORE_NAT_UDP_RELEASE_TIMEOUT=600
       # Terminate TLS on the tunnel port (the server must have a certificate):
       # - BORE_HTTPS=true
       # Redirect plain HTTP on the tunnel port to https:// (requires BORE_HTTPS):
@@ -156,3 +174,15 @@ services:
       # - BORE_PROXY_BUFFER_SIZE=1MiB
       # Accept a self-signed server certificate for an https:// control address:
       # - BORE_INSECURE=true
+      # Max concurrently proxied connections per client. Default 1024.
+      # - BORE_MAX_CONNS=1024
+      # Nginx-style access logs for this tunnel (public and vhost); mount the
+      # directory read-write. Rotated files per tunnel (default 4) and MiB per file
+      # before rotation (default 100).
+      # - BORE_WEBSERVER_LOG=/logs
+      # - BORE_WEBSERVER_LOG_MAX_FILES=4
+      # - BORE_WEBSERVER_LOG_MAX_FILE_SIZE=100
+      # `bore vhost` only: the local backend is itself HTTPS (self-signed accepted,
+      # certificate verification skipped). SNI sent to it defaults to `localhost`.
+      # - BORE_BACKEND_TLS=true
+      # - BORE_BACKEND_TLS_SNI=localhost

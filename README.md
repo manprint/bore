@@ -174,7 +174,23 @@ Ready-to-run compose files live in [`docker/`](docker/):
 | `docker-compose.server.prod.yml` | Full production server: TLS + secret + admin + SSH gateway, every env var documented (optional ones commented) |
 | `docker-compose.client.yml` | `bore local` client example |
 | `docker-compose.secret-proxy.yml` | `bore proxy` (secret consumer) example |
-| `docker-compose-full-yml.yml` | All-in-one server example |
+| `docker-compose-full-yml.yml` | All-in-one server example (TLS, vhost, UDP, VPN broker, SSH gateway, access logs, web transfer, fast link) |
+
+Every compose file documents **every** `BORE_*` environment variable of the subcommand it
+runs (`server`, `local`, `proxy`): active where the example needs it, commented with its
+default otherwise. Optional features that are off by default — SSH gateway (`BORE_SSH_*`),
+VPN broker (`BORE_VPN*`), access logs (`BORE_WEBSERVER_LOG*`), web transfer
+(`BORE_WEB_TRANSFER_*`), fast link (`BORE_FAST_LINK_TRANSFER_*`: needs `ENABLED`, `VHOST`
+and a TLS listener) and the UDP hole-punch helpers (`BORE_UPNP`, `BORE_UDP_CANDIDATES`,
+`BORE_UDP_NO_STUN`, `BORE_TRY_PORT_PREDICTION`, `BORE_NAT_UDP_RELEASE_TIMEOUT`) — are enabled
+by uncommenting their lines. `tests/compose_env_coverage_test.rs` fails if a flag gains an env
+var that the examples do not mention, or an example names a variable the binary no longer
+reads.
+
+The default image is `ghcr.io/manprint/bore:latest` (override with `BORE_IMAGE`); `latest`
+follows the last **stable** release, so features that only exist in a release candidate (for
+example fast link, `v1.2.1-rc.2`+) need an explicit tag such as `ghcr.io/manprint/bore:dev` or
+`ghcr.io/manprint/bore:v1.2.1-rc.3`. `docker-compose.server.prod.yml` deliberately pins `:dev`.
 
 ```shell
 docker compose -f docker/docker-compose.server.yml up -d

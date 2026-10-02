@@ -26,10 +26,10 @@ Read this first in every session. Updated 2026-10-02 by claude-opus-5-5.
 - Active scope: plan (all phases) — user: "implementa il piano, testa tutto, committa su Dev e segui la ci".
 - Scope result: RUNNING.
 - Type / ID / attempt: none.
-- Next action: open 1.7 (persistent transfer listener re-registers on transport loss).
-- Next eligible plan unit: 1.7.
+- Next action: P1 closure (G-P1 gates + self-review).
+- Next eligible plan unit: P1.
 - Unit base: f7b0745; branch: dev.
-- Repo state: plan commits on dev after f7b0745 (latest: the 1.4 commit, matched by `PEV-Unit: 1.6`).
+- Repo state: plan commits on dev after f7b0745 (latest: the 1.4 commit, matched by `PEV-Unit: 1.7`).
 
 ## 2. Feature context and readiness
 
@@ -134,7 +134,7 @@ None. Environment note: ports 19000/19001 are held by a foreign node process on 
 | 1.4 | phase_02.md | 1.1 | DONE | 1 | G-U12 16/0 (6 new); red-checks: Proxy liveness arm off → trip test times out; per-carrier watch off → dead-carrier test FAIL; watch + terminate_all off → carrier-close test FAIL; no beats → heartbeat test FAIL; trip-regardless-of-path → direct-survival test FAIL; linger off → provider direct test FAIL; full `cargo test` 1100+ passed, only failure = env `vhost_entry_redirect_overrides_both` (foreign port 19000) |
 | 1.5 | phase_02.md | 1.1 | DONE | 1 | G-U12 19/0 (3 new) + `sticky_preferred_port_table`; red-checks: server ignores `preferred_port` → `public_port_zero_reconnect_gets_the_same_port` FAIL; no fallback on a taken preferred port → `preferred_port_taken_falls_back_to_random` FAIL. The `bore local` closure wiring (store after connect) is gated end-to-end by T-OUT-IPCHANGE0 (4.1) |
 | 1.6 | phase_02.md | 1.2–1.5 | DONE | 1 | README "Connection liveness and outage recovery" checked claim by claim against the code (attempt bounds = `NETWORK_TIMEOUT` 3 s per step; server heartbeat = control connections only, carriers are not beaten). Revision 1e gate added: `declared_silent_native_provider_is_transport_reaped` (ssh_jump_test) — red-checked by replacing the `reap_if_due` call with `None` (a `.filter` after the call is NOT a mutation: `reap_if_due` terminates before returning) |
-| 1.7 | phase_02.md (rev 1e) | 1.3 | TODO | 1 | — |
+| 1.7 | phase_02.md (rev 1e) | 1.3 | DONE | 1 | G-U12 21/0 (2 new: persistent + one-shot-waiting listener register again after a 3 s blackhole); red-check: old `bail!`/`return Err` on a finished provider task → both FAIL; transfer_test 43/0, transfer_stdin_cli_test 14/0, transfer_link_test 22/0. Scope: re-registration applies to BOTH modes while waiting (a one-shot listener that has not received its sender has not done its job); a transfer in progress keeps failing as before (resume state kept). README transfer flags + liveness section updated |
 | 2.1 | phase_03.md | P1 | TODO | 1 | — |
 | 2.2 | phase_03.md | 2.1 | TODO | 1 | — |
 | 2.3 | phase_03.md | 2.1 | TODO | 1 | — |
@@ -163,7 +163,7 @@ None. Environment note: ports 19000/19001 are held by a foreign node process on 
 | liveness tables | 0.2 | G-U02 | PASS | 6 tests incl. LivenessTicker |
 | backoff cap | 0.3 | G-U03 | PASS | 8 passed |
 | serde defaults | 1.1/2.1/3.1 | G-U11 | PASS (1.1) | 7 new in shared::tests |
-| outage_liveness_test | 1.2–1.5 | G-U12 | PARTIAL (1.5: 19/0) | server reapers vhost/public/secret provider/consumer + I-5; client trips public/vhost/secret provider+consumer, flick survival, carrier termination, consumer direct survival, provider linger, sticky public port |
+| outage_liveness_test | 1.2–1.5 | G-U12 | PASS (1.7: 21/0) | server reapers vhost/public/secret provider/consumer + I-5; client trips public/vhost/secret provider+consumer, flick survival, carrier termination, consumer direct survival, provider linger, sticky public port |
 | vpn liveness/teardown | 2.2–2.4 | G-U2 | TODO | — |
 | owner + sshgw | 3.1/3.2 | G-U3 | TODO | — |
 | T-OUT-* | 4.1 | G-NETNS-OUT | TODO | — |

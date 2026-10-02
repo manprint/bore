@@ -28,6 +28,10 @@ use bore_cli::{
     secret::Proxy,
     server::Server,
     shared::{ClientMessage, Delimited, ServerMessage, TunnelOptions},
+    transfer::{
+        run_listener, run_sender, CollisionPolicy, DeviceMode, ListenerOptions, SenderOptions,
+        SymlinkMode, TransferOutcome,
+    },
     vhost::{VhostConfig, VhostModeCfg},
 };
 use lazy_static::lazy_static;
@@ -1168,5 +1172,175 @@ async fn preferred_port_taken_falls_back_to_random() -> Result<()> {
     );
     assert!((18780..=18789).contains(&other.remote_port()));
     drop(holder);
+    Ok(())
+}
+
+// ─── Transfer listener (1.7) ─────────────────────────────────────────────────
+
+fn transfer_listener_options(
+    to: &str,
+    id: &str,
+    dest: &std::path::Path,
+    persistent: bool,
+) -> ListenerOptions {
+    ListenerOptions {
+        to: to.to_string(),
+        secret: None,
+        insecure: false,
+        transfer_id: Some(id.to_string()),
+        dest_path: dest.to_path_buf(),
+        relay_only: true,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+        nat_udp_preferred_port: 0,
+        nat_udp_release_timeout: 0,
+        carriers: 1,
+        collision: CollisionPolicy::Rename,
+        persistent,
+        ask_confirm: false,
+        confirm_timeout: 120,
+        stall_timeout: 0,
+        no_fsync: true,
+    }
+}
+
+/// One relay-only transfer of `source` to the listener registered as `id`.
+async fn send_file(control: u16, id: &str, source: &std::path::Path) -> Result<TransferOutcome> {
+    run_sender(SenderOptions {
+        to: format!("127.0.0.1:{control}"),
+        secret: None,
+        insecure: false,
+        transfer_id: Some(id.to_string()),
+        sources: vec![source.to_path_buf()],
+        source_files: vec![],
+        ask_confirm: false,
+        output: None,
+        relay_only: true,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+        nat_udp_preferred_port: 0,
+        nat_udp_release_timeout: 0,
+        carriers: 1,
+        parallel: 1,
+        symlinks: SymlinkMode::Exclude,
+        devices: DeviceMode::Exclude,
+        stall_timeout: 0,
+    })
+    .await
+}
+
+/// Retry a transfer until the listener's (new) registration takes it.
+async fn send_eventually(
+    control: u16,
+    id: &str,
+    source: &std::path::Path,
+) -> Option<TransferOutcome> {
+    eventually(Duration::from_secs(20), || async {
+        send_file(control, id, source).await.ok()
+    })
+    .await
+    .map(|(_, outcome)| outcome)
+}
+
+/// A persistent `bore transfer listener` that loses the relay server — here
+/// the path goes dark, which its provider notices within its silence
+/// deadline — registers again and keeps serving senders, instead of exiting.
+///
+/// RED-CHECK: restoring the old `bail!`/`return Err` on a finished provider
+/// task makes the listener exit and the second transfer never lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_transfer_listener_registers_again_after_an_outage() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let _env = LivenessEnv::set(200, 1500);
+    const CONTROL: u16 = 18791;
+    spawn_server(CONTROL, 18792..=18792, Duration::from_secs(1), None).await?;
+    let proxy = BlackholeProxy::start(control_addr(CONTROL)).await?;
+    let dir = tempfile::tempdir()?;
+    let (dest, source) = (dir.path().join("inbox"), dir.path().join("payload.bin"));
+    tokio::fs::write(&source, b"payload before and after the outage").await?;
+
+    let listener = tokio::spawn(run_listener(transfer_listener_options(
+        &proxy.to(),
+        "outage-persist",
+        &dest,
+        true,
+    )));
+    assert!(
+        send_eventually(CONTROL, "outage-persist", &source)
+            .await
+            .is_some(),
+        "the healthy listener never took a transfer"
+    );
+
+    // A dead path, long enough for both ends to give up on the connection.
+    proxy.set_blackhole(true);
+    time::sleep(Duration::from_secs(3)).await;
+    proxy.set_blackhole(false);
+    assert!(
+        !listener.is_finished(),
+        "the persistent listener exited on a lost relay connection: {:?}",
+        listener.await
+    );
+    assert!(
+        send_eventually(CONTROL, "outage-persist", &source)
+            .await
+            .is_some(),
+        "the listener never registered again after the outage"
+    );
+    assert!(!listener.is_finished(), "the listener stopped serving");
+    listener.abort();
+    Ok(())
+}
+
+/// A one-shot listener that is still WAITING for its sender when the relay
+/// connection dies has not done its job yet: it registers again too, and the
+/// sender that arrives after the outage completes the transfer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_shot_transfer_listener_registers_again_while_waiting() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let _env = LivenessEnv::set(200, 1500);
+    const CONTROL: u16 = 18793;
+    let admin = spawn_server(CONTROL, 18794..=18794, Duration::from_secs(1), None).await?;
+    let proxy = BlackholeProxy::start(control_addr(CONTROL)).await?;
+    let dir = tempfile::tempdir()?;
+    let (dest, source) = (dir.path().join("inbox"), dir.path().join("payload.bin"));
+    tokio::fs::write(&source, b"payload sent after the outage").await?;
+
+    let listener = tokio::spawn(run_listener(transfer_listener_options(
+        &proxy.to(),
+        "outage-once",
+        &dest,
+        false,
+    )));
+    assert!(
+        eventually(Duration::from_secs(5), || async {
+            (count_role(&admin, Role::SecretProvider) == 1).then_some(())
+        })
+        .await
+        .is_some(),
+        "the listener never registered"
+    );
+
+    proxy.set_blackhole(true);
+    time::sleep(Duration::from_secs(3)).await;
+    proxy.set_blackhole(false);
+    assert!(
+        !listener.is_finished(),
+        "the waiting listener exited on a lost relay connection: {:?}",
+        listener.await
+    );
+    assert!(
+        send_eventually(CONTROL, "outage-once", &source)
+            .await
+            .is_some(),
+        "the listener never registered again after the outage"
+    );
+    let outcome = time::timeout(Duration::from_secs(10), listener)
+        .await
+        .expect("the one-shot listener did not finish after its transfer")
+        .expect("listener panicked")?;
+    assert_eq!(outcome.regular_files, 1);
     Ok(())
 }

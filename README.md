@@ -920,6 +920,11 @@ retransmits a lost segment after roughly 0.2, 0.6, 1.4, 3, 6 and 12.6 s, so a pa
 comes back within about **12 s** is picked up by a retransmission before either deadline
 fires.
 
+**File transfer.** A `bore transfer listener` that is waiting for a sender registers again
+after an outage instead of exiting, in both one-shot and `--persistent` mode. A sender, or
+a transfer interrupted mid-way on the relay path, fails within about 15 s and keeps its resume state:
+running the sender again resumes where it stopped.
+
 **Secret tunnels on the direct path.** The direct UDP path runs between consumer and
 provider without the server, so losing the server does not cost a working direct tunnel.
 A consumer on the direct path keeps serving and reconnects only when the direct path itself
@@ -2319,6 +2324,11 @@ Notes:
   no progress is made within the window.
 - `--persistent` (listener): stays alive after each transfer; per-transfer errors are logged
   but don't kill the listener.
+- Losing the relay server (an outage, an IP change, a server restart) never ends a listener
+  that is waiting for a sender, persistent or not: it notices within ~15 s, registers again
+  with the reconnect backoff (1, 2, 4, 8 s, then every 8 s) and keeps waiting. A transfer
+  already in progress fails instead (one-shot mode exits; `--persistent` waits for the next
+  sender) and keeps its staging/resume state, so re-running the sender resumes it.
 - `--no-fsync` (listener): skip the `fdatasync` that makes staged bytes durable before the
   resume journal records their chunks — and, with them, the journal's own. The two always
   move together: a durable record of non-durable bytes would claim chunks a crash never

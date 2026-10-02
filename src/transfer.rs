@@ -821,24 +821,9 @@ pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
         .await
         .context("failed to bind transfer listener loopback port")?;
     let local_port = internal.local_addr()?.port();
-    let provider = Client::new_secret_provider(
-        LOCAL_HOST,
-        local_port,
-        &options.to,
-        &transfer_id,
-        options.secret.as_deref(),
-        options.insecure,
-        !options.relay_only,
-        options.stun_server.as_deref(),
-        crate::holepunch::GatherOptions::from_flags(options.upnp, options.try_port_prediction),
-        options.nat_udp_preferred_port,
-        options.nat_udp_release_timeout,
-        DEFAULT_MAX_CONNS,
-        carriers,
-        ProviderMeta::default(),
-        None, // No access logging for transfer
-    )
-    .await?;
+    // The first registration fails fast: a wrong secret or server is a
+    // configuration error, not an outage.
+    let provider = start_listener_provider(&options, &transfer_id, local_port, carriers).await?;
     let mut provider_task = tokio::spawn(provider.listen());
 
     let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
@@ -864,11 +849,24 @@ pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
                 Some(s) => s,
                 None => bail!("accept channel closed unexpectedly"),
             },
-            result = &mut provider_task => match result {
-                Ok(Ok(())) => bail!("the listener's connection to the relay server ended while waiting for a sender"),
-                Ok(Err(err)) => return Err(err).context("transfer listener transport failed"),
-                Err(err) => bail!("transfer listener task failed: {err}"),
-            },
+            // Losing the relay server while waiting for a sender (an outage,
+            // an IP change, a server restart) is not the end of the listener:
+            // it registers again and keeps waiting, in both modes (plan 005,
+            // 1.7). Since the provider notices a dead server within seconds
+            // (its silence deadline), exiting here would turn a 20 s outage
+            // into a listener that is gone for good.
+            result = &mut provider_task => {
+                match result {
+                    Ok(Ok(())) => warn!(transfer_id = %transfer_id,
+                        "the listener's connection to the relay server ended; registering again"),
+                    Ok(Err(err)) => warn!(%err, transfer_id = %transfer_id,
+                        "the listener lost the relay server; registering again"),
+                    Err(err) => bail!("transfer listener task failed: {err}"),
+                }
+                provider_task =
+                    reregister_listener_provider(&options, &transfer_id, local_port, carriers).await;
+                continue;
+            }
             result = &mut accept_task => match result {
                 Ok(Ok(())) => bail!("the listener stopped accepting local connections while waiting for a sender"),
                 Ok(Err(err)) => return Err(err).context("transfer listener accept loop failed"),
@@ -932,6 +930,63 @@ pub async fn run_listener(options: ListenerOptions) -> Result<TransferOutcome> {
                 // Drain any leftover connections from the failed transfer.
                 while conn_rx.try_recv().is_ok() {}
             }
+        }
+    }
+}
+
+/// Register the transfer listener's secret provider with the relay server.
+async fn start_listener_provider(
+    options: &ListenerOptions,
+    transfer_id: &str,
+    local_port: u16,
+    carriers: u16,
+) -> Result<Client> {
+    Client::new_secret_provider(
+        LOCAL_HOST,
+        local_port,
+        &options.to,
+        transfer_id,
+        options.secret.as_deref(),
+        options.insecure,
+        !options.relay_only,
+        options.stun_server.as_deref(),
+        crate::holepunch::GatherOptions::from_flags(options.upnp, options.try_port_prediction),
+        options.nat_udp_preferred_port,
+        options.nat_udp_release_timeout,
+        DEFAULT_MAX_CONNS,
+        carriers,
+        ProviderMeta::default(),
+        None, // No access logging for transfer
+    )
+    .await
+}
+
+/// Register the listener's provider again after it lost the relay server,
+/// retrying with the reconnect backoff (1, 2, 4, 8 s, then every 8 s) until the
+/// server takes it. The first attempt waits one step: the server may still hold
+/// the dead registration's transfer id for a moment, until its own silence
+/// deadline frees it. The loopback listener the provider forwards to is kept,
+/// so a sender reaching the new registration lands in the same accept loop.
+async fn reregister_listener_provider(
+    options: &ListenerOptions,
+    transfer_id: &str,
+    local_port: u16,
+    carriers: u16,
+) -> tokio::task::JoinHandle<Result<()>> {
+    let mut backoff = crate::reconnect::Backoff::new();
+    loop {
+        tokio::time::sleep(backoff.next_delay()).await;
+        match start_listener_provider(options, transfer_id, local_port, carriers).await {
+            Ok(provider) => {
+                info!(%transfer_id, "transfer listener registered again with the relay server");
+                return tokio::spawn(provider.listen());
+            }
+            Err(err) => warn!(
+                %err,
+                %transfer_id,
+                retry_in = ?backoff.peek(),
+                "transfer listener could not register again; retrying"
+            ),
         }
     }
 }

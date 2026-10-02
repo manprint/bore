@@ -801,6 +801,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
     let control_stream = crate::transport::connect(&endpoint, args.insecure).await?;
 
     let (opener, mut acceptor) = crate::mux::client(control_stream);
+    let live = CtrlLiveness::new(acceptor.activity());
     let ctrl_stream = opener.open().await.context("open control stream")?;
     let mut ctrl = crate::shared::Delimited::new(ctrl_stream);
 
@@ -820,8 +821,9 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
         nat_masquerade: args.nat_masquerade,
         route_policy: None,
         nat_udp_preferred_port: args.nat_udp_preferred_port,
-        // Plan 005, D6: declared once this client beats (2.4).
-        ctrl_heartbeat_ms: 0,
+        // Plan 005, D6: this client beats whenever the server accepts it
+        // (`VpnReady.ctrl_heartbeat`, and while waiting once heartbeated).
+        ctrl_heartbeat_ms: crate::liveness::ctrl_heartbeat_declared_ms(),
     };
     ctrl.send(hello).await?;
 
@@ -830,9 +832,9 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
         .client_handshake(&mut ctrl)
         .await?;
 
-    // Wait for VpnReady
-    let msg = ctrl.recv::<crate::shared::ServerMessage>().await?;
-    let (assigned, prefix, peer_advertised, session_nonce, admin_v2, carriers) = match msg {
+    // Wait for VpnReady (heartbeating a server that heartbeats us, D6e).
+    let msg = await_vpn_ready(&mut ctrl, &live).await?;
+    let (assigned, prefix, peer_advertised, session_nonce, admin_v2, carriers, beats) = match msg {
         Some(crate::shared::ServerMessage::VpnReady {
             assigned,
             prefix,
@@ -840,6 +842,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
             session_nonce,
             admin_v2,
             carriers,
+            ctrl_heartbeat,
             ..
         }) => {
             info!(
@@ -856,6 +859,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
                 session_nonce,
                 admin_v2,
                 carriers.max(1),
+                ctrl_heartbeat,
             )
         }
         Some(crate::shared::ServerMessage::VpnError(e)) => {
@@ -879,7 +883,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
     // Hub mode (I-MC1: early branch preserves legacy 1:1 path unchanged)
     if args.max_clients > 1 {
         return hub::run_listen_hub(
-            args, acceptor, opener, ctrl, assigned, prefix, admin_v2, carriers,
+            args, acceptor, opener, ctrl, assigned, prefix, admin_v2, carriers, live, beats,
         )
         .await;
     }
@@ -940,8 +944,11 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
 
     info!(link_id = %args.id, "vpn link bridge starting");
 
-    // Control-stream actor (single owner of `ctrl` from here on).
-    let (out_tx, event_rx, ctrl_task) = spawn_ctrl_actor(ctrl);
+    // Control-stream actor (single owner of `ctrl` from here on). Between
+    // `VpnReady` and here nothing beats: the setup above (TUN, routes, relay
+    // substreams) must stay well inside the server's 15 s transport floor.
+    let on_direct = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (out_tx, event_rx, ctrl_task) = spawn_ctrl_actor(ctrl, live, beats, Arc::clone(&on_direct));
 
     // Admin v2 servers track the active path; report the initial relay state.
     if admin_v2 {
@@ -986,6 +993,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
             upgrade_tx,
             downgrade_rx,
             Arc::clone(&counters),
+            on_direct,
         )))
     };
     drop(out_tx);
@@ -1037,6 +1045,120 @@ enum CtrlEvent {
     Unavailable,
 }
 
+/// How a VPN client watches its control connection (plan 005, D6e).
+///
+/// The server heartbeats every VPN control loop every 500 ms, so ANY inbound
+/// byte going missing for `silence` means the path to the server is dead even
+/// though TCP still says ESTABLISHED — the kernel would take ≈15 min to agree.
+/// `activity` stamps every inbound byte below yamux, data included, so a link
+/// busy with bulk traffic can never look silent.
+#[derive(Clone, Debug)]
+pub(crate) struct CtrlLiveness {
+    /// The control connection's activity.
+    activity: crate::mux::ConnActivity,
+    /// Server-silence deadline (`None` disables it).
+    silence: Option<std::time::Duration>,
+    /// Interval of our own heartbeats, when the server accepts them.
+    heartbeat: std::time::Duration,
+}
+
+impl CtrlLiveness {
+    /// The production knobs: [`crate::liveness::client_silence_deadline`] and
+    /// [`crate::liveness::ctrl_client_heartbeat`].
+    fn new(activity: crate::mux::ConnActivity) -> Self {
+        Self {
+            activity,
+            silence: crate::liveness::client_silence_deadline(),
+            heartbeat: crate::liveness::ctrl_client_heartbeat(),
+        }
+    }
+
+    /// The beat schedule: the first beat one interval from now, missed beats
+    /// delayed rather than burst.
+    fn beat_interval(&self) -> tokio::time::Interval {
+        let mut beat =
+            tokio::time::interval_at(tokio::time::Instant::now() + self.heartbeat, self.heartbeat);
+        beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        beat
+    }
+}
+
+/// What a VPN control loop concludes on its liveness tick.
+#[derive(Debug, PartialEq, Eq)]
+enum SilenceVerdict {
+    /// The server was heard within the deadline (or there is no deadline).
+    Healthy,
+    /// The server is silent, but the link's data rides the direct path, which
+    /// does not need it (revision 1d(a)): keep the link.
+    ToleratedOnDirect,
+    /// The server is silent and the link depends on it: the connection is lost.
+    Lost,
+}
+
+/// Pure decision behind every VPN control loop's liveness tick.
+fn silence_verdict(
+    idle: std::time::Duration,
+    silence: Option<std::time::Duration>,
+    on_direct: bool,
+) -> SilenceVerdict {
+    match silence {
+        Some(deadline) if idle >= deadline => {
+            if on_direct {
+                SilenceVerdict::ToleratedOnDirect
+            } else {
+                SilenceVerdict::Lost
+            }
+        }
+        _ => SilenceVerdict::Healthy,
+    }
+}
+
+/// Wait for the server's answer to `HelloVpn`/`ConnectVpn`: the first message
+/// that is not a heartbeat (`None` when the server closed).
+///
+/// A 1:1 listener can wait here for hours. A server that declared nothing
+/// (old) sends nothing while it waits, and decodes no client frame — so this
+/// side neither beats nor watches the deadline until the server has PROVEN it
+/// speaks the protocol by heartbeating (I-9). A server that heartbeats a
+/// waiting listener also decodes its beats and reaps it on silence, so from
+/// the first heartbeat on this side beats and trips on silence like every
+/// other control loop.
+async fn await_vpn_ready(
+    ctrl: &mut crate::shared::Delimited<crate::mux::Stream>,
+    live: &CtrlLiveness,
+) -> Result<Option<crate::shared::ServerMessage>> {
+    let mut liveness_tick = crate::liveness::LivenessTicker::new(live.silence);
+    let mut beat = live.beat_interval();
+    let mut seen_heartbeat = false;
+    let mut beats = true;
+    loop {
+        tokio::select! {
+            msg = ctrl.recv::<crate::shared::ServerMessage>() => match msg? {
+                Some(crate::shared::ServerMessage::Heartbeat) => seen_heartbeat = true,
+                other => return Ok(other),
+            },
+            _ = liveness_tick.tick(), if seen_heartbeat => {
+                let idle = live.activity.inbound_idle();
+                if silence_verdict(idle, live.silence, false) == SilenceVerdict::Lost {
+                    live.activity.terminate();
+                    tracing::warn!(?idle, "vpn server silent while waiting for a peer; the connection is lost");
+                    bail!("no data from the vpn server for {idle:?} while waiting for a peer (connection lost)");
+                }
+            }
+            _ = beat.tick(), if seen_heartbeat && beats => {
+                match crate::client::beat_once(ctrl).await {
+                    crate::client::CtrlBeat::Sent => {}
+                    crate::client::CtrlBeat::Closed => return Ok(None),
+                    crate::client::CtrlBeat::PeerNotReading => {
+                        tracing::warn!("vpn control heartbeat write blocked: the server is not reading; standing the heartbeat down");
+                        beats = false;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Spawn the control-stream actor: the **single** owner of the control stream
 /// after `VpnReady` (one stream = one task).
 ///
@@ -1048,16 +1170,22 @@ enum CtrlEvent {
 /// error), forwards `UdpPunch`/`UdpUnavailable` to `CtrlEvent` consumers, and
 /// writes any `ClientMessage` submitted on the returned sender (candidate
 /// offers, path reports).
-/// Max silence on the 1:1 control stream before we declare the server dead.
-/// The server heartbeats every 500 ms (`vpn_server.rs`), so 60 s is a 120-beat
-/// margin — no false positives on a healthy-but-idle link — while still catching
-/// a wedged-but-TCP-alive server that `SO_KEEPALIVE` alone cannot (it only
-/// detects a broken socket, not a hung peer process). Mirrors the hub ctrl
-/// actor's 60 s timeout for parity.
-const CTRL_HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
+///
+/// Liveness (plan 005, D6e): when the connection has delivered no byte for
+/// `live.silence` the actor terminates it and returns, so the link reconnects
+/// instead of waiting ≈15 min for the kernel — UNLESS `on_direct` says the
+/// link's data rides the direct path, which does not need the server
+/// (revision 1d(a)); the actor then warns once and keeps the link, and trips
+/// on the first tick after the bridge falls back to relay. An explicit close
+/// by the server always ends the link. When `beats` (the server's
+/// `VpnReady.ctrl_heartbeat`: it decodes them, I-9) the actor also beats every
+/// `live.heartbeat` through [`crate::client::beat_once`], so the server's
+/// reaper never trips on a healthy idle link.
 fn spawn_ctrl_actor(
     mut ctrl: crate::shared::Delimited<crate::mux::Stream>,
+    live: CtrlLiveness,
+    beats: bool,
+    on_direct: Arc<std::sync::atomic::AtomicBool>,
 ) -> (
     tokio::sync::mpsc::Sender<crate::shared::ClientMessage>,
     tokio::sync::mpsc::Receiver<CtrlEvent>,
@@ -1067,6 +1195,10 @@ fn spawn_ctrl_actor(
     let (event_tx, event_rx) = tokio::sync::mpsc::channel::<CtrlEvent>(8);
     let task = tokio::spawn(async move {
         let mut out_open = true;
+        let mut beats = beats;
+        let mut liveness_tick = crate::liveness::LivenessTicker::new(live.silence);
+        let mut beat = live.beat_interval();
+        let mut warned_on_direct = false;
         loop {
             tokio::select! {
                 out = out_rx.recv(), if out_open => match out {
@@ -1078,19 +1210,49 @@ fn spawn_ctrl_actor(
                     // All senders dropped: keep draining the stream (I-7).
                     None => out_open = false,
                 },
-                msg = tokio::time::timeout(
-                    CTRL_HEARTBEAT_TIMEOUT,
-                    ctrl.recv::<crate::shared::ServerMessage>(),
-                ) => match msg {
-                    // No message (not even a heartbeat) within the window: the
-                    // server process is gone or wedged. Tear down → reconnect.
-                    Err(_) => {
-                        return anyhow!(
-                            "no server heartbeat within {CTRL_HEARTBEAT_TIMEOUT:?}; assuming server died"
-                        )
+                _ = liveness_tick.tick() => {
+                    let idle = live.activity.inbound_idle();
+                    let direct = on_direct.load(std::sync::atomic::Ordering::SeqCst);
+                    match silence_verdict(idle, live.silence, direct) {
+                        SilenceVerdict::Healthy => warned_on_direct = false,
+                        SilenceVerdict::ToleratedOnDirect => {
+                            if !warned_on_direct {
+                                tracing::warn!(
+                                    ?idle,
+                                    "vpn server silent; keeping the link, its data rides the direct path"
+                                );
+                                warned_on_direct = true;
+                            }
+                        }
+                        SilenceVerdict::Lost => {
+                            // Terminate rather than close: a graceful close
+                            // would queue behind data the dead path never
+                            // drains; every relay substream ends now.
+                            live.activity.terminate();
+                            tracing::warn!(?idle, "vpn server silent; the connection is lost, dropping it");
+                            return anyhow!("no data from the vpn server for {idle:?} (connection lost)");
+                        }
                     }
-                    Ok(Ok(Some(crate::shared::ServerMessage::Heartbeat))) => continue,
-                    Ok(Ok(Some(crate::shared::ServerMessage::UdpPunch {
+                }
+                _ = beat.tick(), if beats => {
+                    match crate::client::beat_once(&mut ctrl).await {
+                        crate::client::CtrlBeat::Sent => {}
+                        crate::client::CtrlBeat::Closed => {
+                            return anyhow!("server closed the vpn control stream");
+                        }
+                        crate::client::CtrlBeat::PeerNotReading => {
+                            tracing::warn!(
+                                "vpn control heartbeat write blocked: the server is not reading \
+                                 this link's control stream; standing the heartbeat down for \
+                                 this session"
+                            );
+                            beats = false;
+                        }
+                    }
+                }
+                msg = ctrl.recv::<crate::shared::ServerMessage>() => match msg {
+                    Ok(Some(crate::shared::ServerMessage::Heartbeat)) => continue,
+                    Ok(Some(crate::shared::ServerMessage::UdpPunch {
                         nonce,
                         peer,
                         peer_selected_stun,
@@ -1100,7 +1262,7 @@ fn spawn_ctrl_actor(
                         // VPN has its own `VpnPathReport`; the secret-tunnel
                         // capability (S-1) does not apply to this role.
                         path_report: _,
-                    }))) => {
+                    })) => {
                         tracing::debug!(?peer, ?peer_selected_stun, "received vpn udp punch");
                         let _ = event_tx
                             .send(CtrlEvent::Punch {
@@ -1111,20 +1273,20 @@ fn spawn_ctrl_actor(
                             })
                             .await;
                     }
-                    Ok(Ok(Some(crate::shared::ServerMessage::UdpUnavailable))) => {
+                    Ok(Some(crate::shared::ServerMessage::UdpUnavailable)) => {
                         let _ = event_tx.send(CtrlEvent::Unavailable).await;
                     }
-                    Ok(Ok(Some(crate::shared::ServerMessage::VpnPeerJoin { .. }))) => {
+                    Ok(Some(crate::shared::ServerMessage::VpnPeerJoin { .. })) => {
                         tracing::debug!("unexpected VpnPeerJoin on 1:1 vpn link (ignoring)");
                     }
-                    Ok(Ok(Some(crate::shared::ServerMessage::VpnPeerLeave { .. }))) => {
+                    Ok(Some(crate::shared::ServerMessage::VpnPeerLeave { .. })) => {
                         tracing::debug!("unexpected VpnPeerLeave on 1:1 vpn link (ignoring)");
                     }
-                    Ok(Ok(Some(msg))) => {
+                    Ok(Some(msg)) => {
                         tracing::debug!(?msg, "ignoring control message on vpn link");
                     }
-                    Ok(Ok(None)) => return anyhow!("server closed the vpn control stream"),
-                    Ok(Err(e)) => return anyhow!("vpn control stream error: {e}"),
+                    Ok(None) => return anyhow!("server closed the vpn control stream"),
+                    Err(e) => return anyhow!("vpn control stream error: {e}"),
                 }
             }
         }
@@ -1271,7 +1433,11 @@ async fn direct_upgrade_task(
     upgrade_tx: tokio::sync::mpsc::Sender<(link::LinkSender, link::LinkRecver)>,
     mut downgrade_rx: tokio::sync::mpsc::Receiver<()>,
     counters: Arc<bridge::BridgeCounters>,
+    // Tells the control actor whether the link's data needs the server
+    // (revision 1d(a)): set while the bridge runs on the direct path.
+    on_direct: Arc<std::sync::atomic::AtomicBool>,
 ) {
+    use std::sync::atomic::Ordering;
     let mut ticker = tokio::time::interval(DIRECT_RETRY_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut attempt: u32 = 0;
@@ -1290,7 +1456,10 @@ async fn direct_upgrade_task(
         {
             Ok(()) => {
                 // Direct is up. Block until the bridge tells us it fell back, then re-arm.
-                match downgrade_rx.recv().await {
+                on_direct.store(true, Ordering::SeqCst);
+                let fell_back = downgrade_rx.recv().await;
+                on_direct.store(false, Ordering::SeqCst);
+                match fell_back {
                     Some(()) => {
                         info!(link_id=%ctx.link_id, "direct path lost; re-arming relay→direct retry");
                         continue 'retry;
@@ -2059,6 +2228,7 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
     let control_stream = crate::transport::connect(&endpoint, args.insecure).await?;
 
     let (opener, _acceptor) = crate::mux::client(control_stream);
+    let live = CtrlLiveness::new(opener.activity());
     let ctrl_stream = opener.open().await.context("open control stream")?;
     let mut ctrl = crate::shared::Delimited::new(ctrl_stream);
 
@@ -2083,8 +2253,9 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
         nat_masquerade: args.nat_masquerade,
         route_policy,
         nat_udp_preferred_port: args.nat_udp_preferred_port,
-        // Plan 005, D6: declared once this client beats (2.4).
-        ctrl_heartbeat_ms: 0,
+        // Plan 005, D6: this client beats whenever the server accepts it
+        // (`VpnReady.ctrl_heartbeat`, and while waiting once heartbeated).
+        ctrl_heartbeat_ms: crate::liveness::ctrl_heartbeat_declared_ms(),
     };
     ctrl.send(connect_msg).await?;
 
@@ -2093,9 +2264,9 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
         .client_handshake(&mut ctrl)
         .await?;
 
-    // Wait for VpnReady
-    let msg = ctrl.recv::<crate::shared::ServerMessage>().await?;
-    let (assigned, prefix, peer_advertised, session_nonce, admin_v2, carriers) = match msg {
+    // Wait for VpnReady (heartbeating a server that heartbeats us, D6e).
+    let msg = await_vpn_ready(&mut ctrl, &live).await?;
+    let (assigned, prefix, peer_advertised, session_nonce, admin_v2, carriers, beats) = match msg {
         Some(crate::shared::ServerMessage::VpnReady {
             assigned,
             prefix,
@@ -2103,6 +2274,7 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
             session_nonce,
             admin_v2,
             carriers,
+            ctrl_heartbeat,
             ..
         }) => {
             info!(
@@ -2119,6 +2291,7 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
                 session_nonce,
                 admin_v2,
                 carriers.max(1),
+                ctrl_heartbeat,
             )
         }
         Some(crate::shared::ServerMessage::VpnError(e)) => {
@@ -2219,8 +2392,11 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
 
     info!(link_id = %args.id, "vpn link bridge starting");
 
-    // Control-stream actor (single owner of `ctrl` from here on).
-    let (out_tx, event_rx, ctrl_task) = spawn_ctrl_actor(ctrl);
+    // Control-stream actor (single owner of `ctrl` from here on). Between
+    // `VpnReady` and here nothing beats: the setup above (TUN, routes, relay
+    // substreams) must stay well inside the server's 15 s transport floor.
+    let on_direct = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (out_tx, event_rx, ctrl_task) = spawn_ctrl_actor(ctrl, live, beats, Arc::clone(&on_direct));
 
     // Admin v2 servers track the active path; report the initial relay state.
     if admin_v2 {
@@ -2265,6 +2441,7 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
             upgrade_tx,
             downgrade_rx,
             Arc::clone(&counters),
+            on_direct,
         )))
     };
     drop(out_tx);
@@ -9820,7 +9997,13 @@ mod tests {
         let ctrl = Delimited::new(client_stream);
         let mut server = Delimited::new(server_stream);
 
-        let (out_tx, mut event_rx, handle) = spawn_ctrl_actor(ctrl);
+        let live = CtrlLiveness {
+            activity: client_opener.activity(),
+            silence: None,
+            heartbeat: std::time::Duration::from_secs(3600),
+        };
+        let (out_tx, mut event_rx, handle) =
+            spawn_ctrl_actor(ctrl, live, false, Arc::new(Default::default()));
 
         // Heartbeat produces no event.
         server.send(ServerMessage::Heartbeat).await.unwrap();
@@ -9878,6 +10061,325 @@ mod tests {
             err.to_string().contains("control stream"),
             "unexpected error: {err}"
         );
+    }
+
+    // ─── Control liveness (plan 005, D6e) ────────────────────────────────
+
+    /// A connected control-stream pair over an in-memory transport: the
+    /// client end, the server end, and the client connection's activity.
+    pub(super) async fn ctrl_pair() -> (
+        Delimited<crate::mux::Stream>,
+        Delimited<crate::mux::Stream>,
+        crate::mux::ConnActivity,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (client_opener, _client_acceptor) = crate::mux::client(a);
+        let (_server_opener, mut server_acceptor) = crate::mux::server(b);
+        let mut client_stream = client_opener.open().await.unwrap();
+        client_stream
+            .write_all(&[crate::mux::STREAM_READY])
+            .await
+            .unwrap();
+        let mut server_stream = server_acceptor.accept().await.unwrap();
+        let mut marker = [0u8; 1];
+        server_stream.read_exact(&mut marker).await.unwrap();
+        (
+            Delimited::new(client_stream),
+            Delimited::new(server_stream),
+            client_opener.activity(),
+        )
+    }
+
+    pub(super) fn live(
+        activity: crate::mux::ConnActivity,
+        silence_ms: Option<u64>,
+        heartbeat_ms: u64,
+    ) -> CtrlLiveness {
+        CtrlLiveness {
+            activity,
+            silence: silence_ms.map(std::time::Duration::from_millis),
+            heartbeat: std::time::Duration::from_millis(heartbeat_ms),
+        }
+    }
+
+    fn vpn_ready() -> ServerMessage {
+        ServerMessage::VpnReady {
+            assigned: "10.99.0.1".parse().unwrap(),
+            prefix: 30,
+            peer_overlay: "10.99.0.2".parse().unwrap(),
+            peer_advertised: vec![],
+            session_nonce: [0u8; crate::shared::UDP_NONCE_LEN],
+            tuning: UdpDirectTuning::default(),
+            admin_v2: true,
+            carriers: 1,
+            ctrl_heartbeat: true,
+        }
+    }
+
+    /// Count the client frames `server` receives within `within`.
+    pub(super) async fn client_frames_within(
+        server: &mut Delimited<crate::mux::Stream>,
+        within: std::time::Duration,
+    ) -> usize {
+        let deadline = tokio::time::Instant::now() + within;
+        let mut frames = 0;
+        while let Some(left) = deadline.checked_duration_since(tokio::time::Instant::now()) {
+            match tokio::time::timeout(left, server.recv::<ClientMessage>()).await {
+                Ok(Ok(Some(ClientMessage::Heartbeat))) => frames += 1,
+                Ok(Ok(Some(other))) => panic!("unexpected client frame {other:?}"),
+                _ => break,
+            }
+        }
+        frames
+    }
+
+    #[test]
+    fn silence_verdict_table() {
+        use std::time::Duration;
+        let d = Some(Duration::from_secs(15));
+        let quiet = Duration::from_secs(15);
+        let heard = Duration::from_millis(14_999);
+        assert_eq!(silence_verdict(heard, d, false), SilenceVerdict::Healthy);
+        assert_eq!(silence_verdict(heard, d, true), SilenceVerdict::Healthy);
+        assert_eq!(silence_verdict(quiet, d, false), SilenceVerdict::Lost);
+        assert_eq!(
+            silence_verdict(quiet, d, true),
+            SilenceVerdict::ToleratedOnDirect
+        );
+        // Disabled deadline: never lost, whatever the silence.
+        assert_eq!(
+            silence_verdict(Duration::from_secs(3600), None, false),
+            SilenceVerdict::Healthy
+        );
+    }
+
+    /// The field case on a VPN link: the server goes silent (a dead path
+    /// looks exactly like this) and the link must end within the deadline,
+    /// not after the kernel's ≈15 min.
+    ///
+    /// RED-CHECK: without the liveness arm the actor never returns.
+    #[tokio::test]
+    async fn ctrl_actor_trips_when_the_server_goes_silent() {
+        let (ctrl, mut server, activity) = ctrl_pair().await;
+        let start = tokio::time::Instant::now();
+        let (_out, _events, handle) = spawn_ctrl_actor(
+            ctrl,
+            live(activity, Some(600), 3_600_000),
+            false,
+            Arc::new(Default::default()),
+        );
+        let err = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("the ctrl actor never noticed the silent server")
+            .unwrap();
+        assert!(
+            err.to_string().contains("no data"),
+            "unexpected error: {err}"
+        );
+        assert!(start.elapsed() >= std::time::Duration::from_millis(600));
+        // Terminated, not closed: the server end sees the connection go.
+        let gone = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.recv::<ClientMessage>(),
+        )
+        .await
+        .expect("the connection was not terminated");
+        assert!(matches!(gone, Ok(None) | Err(_)), "got {gone:?}");
+    }
+
+    /// A server that keeps heartbeating keeps the link, however long.
+    #[tokio::test]
+    async fn ctrl_actor_survives_while_server_heartbeats() {
+        let (ctrl, mut server, activity) = ctrl_pair().await;
+        let (_out, _events, handle) = spawn_ctrl_actor(
+            ctrl,
+            live(activity, Some(600), 3_600_000),
+            false,
+            Arc::new(Default::default()),
+        );
+        for _ in 0..15 {
+            server.send(ServerMessage::Heartbeat).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            !handle.is_finished(),
+            "a heartbeating server must never trip the deadline"
+        );
+    }
+
+    /// I-9: never beat at a server that has not said it decodes the frame —
+    /// an old server fails to decode it and drops the link.
+    #[tokio::test]
+    async fn ctrl_actor_never_beats_when_not_allowed() {
+        let (ctrl, mut server, activity) = ctrl_pair().await;
+        let (_out, _events, _handle) = spawn_ctrl_actor(
+            ctrl,
+            live(activity, None, 50),
+            false,
+            Arc::new(Default::default()),
+        );
+        assert_eq!(
+            client_frames_within(&mut server, std::time::Duration::from_millis(500)).await,
+            0
+        );
+    }
+
+    /// Allowed, the actor beats on schedule, so the server's reaper never
+    /// trips on a healthy idle link.
+    ///
+    /// RED-CHECK: without the beat arm the server receives nothing.
+    #[tokio::test]
+    async fn ctrl_actor_beats_when_allowed() {
+        let (ctrl, mut server, activity) = ctrl_pair().await;
+        let (_out, _events, _handle) = spawn_ctrl_actor(
+            ctrl,
+            live(activity, None, 50),
+            true,
+            Arc::new(Default::default()),
+        );
+        let frames = client_frames_within(&mut server, std::time::Duration::from_millis(500)).await;
+        assert!(
+            frames >= 3,
+            "only {frames} heartbeats in 500 ms at a 50 ms interval"
+        );
+    }
+
+    /// Revision 1d(a): on the direct path the link's data does not need the
+    /// server, so server silence must not end it — and must end it on the
+    /// first tick after the bridge falls back to relay.
+    ///
+    /// RED-CHECK: tripping regardless of `on_direct` ends the link while the
+    /// direct path is up.
+    #[tokio::test]
+    async fn ctrl_actor_on_direct_survives_server_silence() {
+        let (ctrl, _server, activity) = ctrl_pair().await;
+        let on_direct = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (_out, _events, handle) = spawn_ctrl_actor(
+            ctrl,
+            live(activity, Some(300), 3_600_000),
+            false,
+            Arc::clone(&on_direct),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert!(
+            !handle.is_finished(),
+            "server silence must not end a link whose data rides the direct path"
+        );
+        on_direct.store(false, std::sync::atomic::Ordering::SeqCst);
+        let err = tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("back on relay, the silent server must end the link")
+            .unwrap();
+        assert!(
+            err.to_string().contains("no data"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// An explicit close by the server ends the link even on the direct path.
+    #[tokio::test]
+    async fn ctrl_actor_ends_on_explicit_close_even_on_direct() {
+        let (ctrl, server, activity) = ctrl_pair().await;
+        let (_out, _events, handle) = spawn_ctrl_actor(
+            ctrl,
+            live(activity, Some(60_000), 3_600_000),
+            false,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        drop(server);
+        let err = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("the actor ignored an explicit close")
+            .unwrap();
+        assert!(
+            err.to_string().contains("closed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A legacy server sends nothing while the listener waits and decodes no
+    /// client frame: the listener must neither beat nor watch the deadline,
+    /// however long it waits (I-9).
+    ///
+    /// RED-CHECK: gating the liveness arm on anything but a seen heartbeat
+    /// trips this wait (the deadline is far shorter than the wait).
+    #[tokio::test]
+    async fn await_vpn_ready_legacy_server() {
+        let (mut ctrl, mut server, activity) = ctrl_pair().await;
+        let live = live(activity, Some(100), 50);
+        let server_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            server.send(vpn_ready()).await.unwrap();
+            client_frames_within(&mut server, std::time::Duration::from_millis(300)).await
+        });
+        let got = await_vpn_ready(&mut ctrl, &live).await.unwrap();
+        assert!(
+            matches!(got, Some(ServerMessage::VpnReady { .. })),
+            "got {got:?}"
+        );
+        assert_eq!(server_task.await.unwrap(), 0, "beat at a legacy server");
+    }
+
+    /// A server that heartbeats the waiting listener also reaps it, so the
+    /// listener beats back while it waits.
+    ///
+    /// RED-CHECK: without the waiting beat arm the server sees no heartbeat.
+    #[tokio::test]
+    async fn await_vpn_ready_new_server() {
+        let (mut ctrl, mut server, activity) = ctrl_pair().await;
+        let live = live(activity, Some(1000), 50);
+        let server_task = tokio::spawn(async move {
+            let mut heard = 0;
+            let mut hb = tokio::time::interval(std::time::Duration::from_millis(100));
+            let stop = tokio::time::sleep(std::time::Duration::from_millis(600));
+            tokio::pin!(stop);
+            loop {
+                tokio::select! {
+                    _ = &mut stop => break,
+                    _ = hb.tick() => server.send(ServerMessage::Heartbeat).await.unwrap(),
+                    msg = server.recv::<ClientMessage>() => match msg {
+                        Ok(Some(ClientMessage::Heartbeat)) => heard += 1,
+                        other => panic!("unexpected {other:?}"),
+                    },
+                }
+            }
+            server.send(vpn_ready()).await.unwrap();
+            heard
+        });
+        let got = await_vpn_ready(&mut ctrl, &live).await.unwrap();
+        assert!(
+            matches!(got, Some(ServerMessage::VpnReady { .. })),
+            "got {got:?}"
+        );
+        assert!(
+            server_task.await.unwrap() >= 1,
+            "the waiting listener never beat"
+        );
+    }
+
+    /// A server that heartbeated the waiting listener and then went silent
+    /// lost its path: the wait must end within the deadline.
+    ///
+    /// RED-CHECK: without the waiting liveness arm the wait never returns.
+    #[tokio::test]
+    async fn await_vpn_ready_trips_when_a_heartbeating_server_goes_silent() {
+        let (mut ctrl, mut server, activity) = ctrl_pair().await;
+        let live = live(activity, Some(400), 3_600_000);
+        server.send(ServerMessage::Heartbeat).await.unwrap();
+        server.send(ServerMessage::Heartbeat).await.unwrap();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            await_vpn_ready(&mut ctrl, &live),
+        )
+        .await
+        .expect("the wait never noticed the silent server")
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("no data"),
+            "unexpected error: {err}"
+        );
+        drop(server);
     }
 
     /// §4.3 — PMTU decision truth table.
@@ -11110,17 +11612,140 @@ pub mod hub {
         HubDirectOutcome::FellBack
     }
 
+    /// The hub listener's control-stream actor, the single owner of `ctrl`:
+    /// forwards server events (join, leave, punch) as [`HubEvent`]s, writes
+    /// the client messages submitted on the returned sender, and resolves
+    /// `Ok(())` on an explicit close or `Err` on a lost connection.
+    fn spawn_hub_ctrl_actor(
+        mut ctrl: crate::shared::Delimited<crate::mux::Stream>,
+        live: super::CtrlLiveness,
+        beats: bool,
+        event_tx_clone: mpsc::Sender<HubEvent>,
+    ) -> (
+        mpsc::Sender<crate::shared::ClientMessage>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let (tx, mut rx) = mpsc::channel::<crate::shared::ClientMessage>(16);
+        (
+            tx,
+            tokio::spawn(async move {
+                let mut out_open = true;
+                // Plan 005, D6e: same liveness as the 1:1 actor, except
+                // that a hub trips regardless of path — its spokes reach
+                // it through the server (join, leave, punch), so a hub
+                // that lost the server cannot admit anyone.
+                let mut beats = beats;
+                let mut liveness_tick = crate::liveness::LivenessTicker::new(live.silence);
+                let mut beat = live.beat_interval();
+                loop {
+                    tokio::select! {
+                        out = rx.recv(), if out_open => match out {
+                            Some(msg) => {
+                                if let Err(e) = ctrl.send(msg).await {
+                                    return Err(anyhow::anyhow!("vpn hub control stream send error: {e}"));
+                                }
+                            }
+                            // All senders dropped: keep draining the stream (I-7).
+                            None => out_open = false,
+                        },
+                        _ = liveness_tick.tick() => {
+                            let idle = live.activity.inbound_idle();
+                            if super::silence_verdict(idle, live.silence, false)
+                                == super::SilenceVerdict::Lost
+                            {
+                                live.activity.terminate();
+                                warn!(?idle, "vpn server silent; the hub connection is lost, dropping it");
+                                return Err(anyhow::anyhow!(
+                                    "no data from the vpn server for {idle:?} (connection lost)"
+                                ));
+                            }
+                        }
+                        _ = beat.tick(), if beats => {
+                            match crate::client::beat_once(&mut ctrl).await {
+                                crate::client::CtrlBeat::Sent => {}
+                                crate::client::CtrlBeat::Closed => return Ok(()),
+                                crate::client::CtrlBeat::PeerNotReading => {
+                                    warn!("vpn hub control heartbeat write blocked: the server is not reading; standing the heartbeat down");
+                                    beats = false;
+                                }
+                            }
+                        }
+                        msg = ctrl.recv::<crate::shared::ServerMessage>() => match msg {
+                            Ok(None) => return Ok(()),
+                            Ok(Some(crate::shared::ServerMessage::Heartbeat)) => continue,
+                            Ok(Some(crate::shared::ServerMessage::VpnPeerJoin {
+                                peer_id,
+                                peer_overlay,
+                                session_nonce,
+                                carriers,
+                                ..
+                            })) => {
+                                info!(%peer_id, %peer_overlay, %carriers, "vpn hub peer join");
+                                // Pass the per-peer nonce RAW — must match the
+                                // spoke's derive_keys_connector(&session_nonce).
+                                let _ = event_tx_clone
+                                    .send(HubEvent::Join {
+                                        peer_id,
+                                        overlay: peer_overlay,
+                                        nonce: session_nonce,
+                                        carriers: carriers.max(1),
+                                    })
+                                    .await;
+                            }
+                            Ok(Some(crate::shared::ServerMessage::VpnPeerLeave {
+                                peer_id,
+                            })) => {
+                                info!(%peer_id, "vpn hub peer leave");
+                                let _ = event_tx_clone.send(HubEvent::Leave { peer_id }).await;
+                            }
+                            Ok(Some(crate::shared::ServerMessage::UdpPunch {
+                                peer_id,
+                                nonce,
+                                peer,
+                                tuning,
+                                v2,
+                                ..
+                            })) => {
+                                debug!(?peer_id, ?peer, "hub ctrl: received vpn udp punch");
+                                let _ = event_tx_clone
+                                    .send(HubEvent::Punch {
+                                        peer_id,
+                                        nonce,
+                                        peer,
+                                        tuning,
+                                        // Boxed on the way in: the wire
+                                        // type is unboxed, the event is
+                                        // boxed so the large variant is
+                                        // cheap to move between channels.
+                                        v2: v2.map(Box::new),
+                                    })
+                                    .await;
+                            }
+                            Ok(Some(crate::shared::ServerMessage::UdpUnavailable)) => {
+                                debug!("hub ctrl: received UdpUnavailable (ignoring; no peer_id)");
+                            }
+                            Ok(Some(_)) => continue,
+                            Err(e) => return Err(anyhow::anyhow!("vpn hub control stream recv error: {e}")),
+                        }
+                    }
+                }
+            }),
+        )
+    }
+
     /// Run the hub listener: single TUN, per-peer router, shared downlink path.
     #[allow(clippy::too_many_arguments)]
-    pub async fn run_listen_hub(
+    pub(crate) async fn run_listen_hub(
         args: super::VpnListenArgs,
         acceptor: crate::mux::Acceptor,
         _opener: crate::mux::Opener,
-        mut ctrl: crate::shared::Delimited<crate::mux::Stream>,
+        ctrl: crate::shared::Delimited<crate::mux::Stream>,
         assigned: Ipv4Addr,
         prefix: u8,
         admin_v2: bool,
         _carriers: u16,
+        live: super::CtrlLiveness,
+        beats: bool,
     ) -> Result<()> {
         info!(
             link_id = %args.id,
@@ -11182,90 +11807,7 @@ pub mod hub {
         let coord_event_tx = event_tx.clone();
 
         // Spawn control-stream actor.
-        let (out_tx, ctrl_task) = {
-            let (tx, mut rx) = mpsc::channel::<crate::shared::ClientMessage>(16);
-            let event_tx_clone = event_tx.clone();
-            (
-                tx,
-                tokio::spawn(async move {
-                    let mut out_open = true;
-                    loop {
-                        tokio::select! {
-                            out = rx.recv(), if out_open => match out {
-                                Some(msg) => {
-                                    if let Err(e) = ctrl.send(msg).await {
-                                        return Err(anyhow::anyhow!("vpn hub control stream send error: {e}"));
-                                    }
-                                }
-                                // All senders dropped: keep draining the stream (I-7).
-                                None => out_open = false,
-                            },
-                            msg = tokio::time::timeout(
-                                std::time::Duration::from_secs(60),
-                                ctrl.recv::<crate::shared::ServerMessage>(),
-                            ) => match msg {
-                                Ok(Ok(None)) => return Ok(()),
-                                Ok(Ok(Some(crate::shared::ServerMessage::Heartbeat))) => continue,
-                                Ok(Ok(Some(crate::shared::ServerMessage::VpnPeerJoin {
-                                    peer_id,
-                                    peer_overlay,
-                                    session_nonce,
-                                    carriers,
-                                    ..
-                                }))) => {
-                                    info!(%peer_id, %peer_overlay, %carriers, "vpn hub peer join");
-                                    // Pass the per-peer nonce RAW — must match the
-                                    // spoke's derive_keys_connector(&session_nonce).
-                                    let _ = event_tx_clone
-                                        .send(HubEvent::Join {
-                                            peer_id,
-                                            overlay: peer_overlay,
-                                            nonce: session_nonce,
-                                            carriers: carriers.max(1),
-                                        })
-                                        .await;
-                                }
-                                Ok(Ok(Some(crate::shared::ServerMessage::VpnPeerLeave {
-                                    peer_id,
-                                }))) => {
-                                    info!(%peer_id, "vpn hub peer leave");
-                                    let _ = event_tx_clone.send(HubEvent::Leave { peer_id }).await;
-                                }
-                                Ok(Ok(Some(crate::shared::ServerMessage::UdpPunch {
-                                    peer_id,
-                                    nonce,
-                                    peer,
-                                    tuning,
-                                    v2,
-                                    ..
-                                }))) => {
-                                    debug!(?peer_id, ?peer, "hub ctrl: received vpn udp punch");
-                                    let _ = event_tx_clone
-                                        .send(HubEvent::Punch {
-                                            peer_id,
-                                            nonce,
-                                            peer,
-                                            tuning,
-                                            // Boxed on the way in: the wire
-                                            // type is unboxed, the event is
-                                            // boxed so the large variant is
-                                            // cheap to move between channels.
-                                            v2: v2.map(Box::new),
-                                        })
-                                        .await;
-                                }
-                                Ok(Ok(Some(crate::shared::ServerMessage::UdpUnavailable))) => {
-                                    debug!("hub ctrl: received UdpUnavailable (ignoring; no peer_id)");
-                                }
-                                Ok(Ok(Some(_))) => continue,
-                                Ok(Err(e)) => return Err(anyhow::anyhow!("vpn hub control stream recv error: {e}")),
-                                Err(_) => return Err(anyhow::anyhow!("vpn hub control stream timeout")),
-                            }
-                        }
-                    }
-                }),
-            )
-        };
+        let (out_tx, ctrl_task) = spawn_hub_ctrl_actor(ctrl, live, beats, event_tx.clone());
 
         // Send initial VpnPathReport if admin_v2.
         if admin_v2 {
@@ -11350,6 +11892,58 @@ pub mod hub {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The hub trips on server silence like the 1:1 link — regardless of
+        /// path, because a hub that lost the server cannot admit anyone.
+        ///
+        /// RED-CHECK: without the hub actor's liveness arm it never returns.
+        #[tokio::test]
+        async fn hub_ctrl_actor_trips_when_the_server_goes_silent() {
+            let (ctrl, _server, activity) = crate::vpn::tests::ctrl_pair().await;
+            let (event_tx, _event_rx) = mpsc::channel(8);
+            let (_out, handle) = spawn_hub_ctrl_actor(
+                ctrl,
+                crate::vpn::tests::live(activity, Some(400), 3_600_000),
+                false,
+                event_tx,
+            );
+            let res = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+                .await
+                .expect("the hub ctrl actor never noticed the silent server")
+                .unwrap();
+            let err = res.expect_err("a lost server must end the hub with an error");
+            assert!(
+                err.to_string().contains("no data"),
+                "unexpected error: {err}"
+            );
+        }
+
+        /// The hub beats only once the server said it decodes beats (I-9).
+        ///
+        /// RED-CHECK: without the hub actor's beat arm the allowed hub sends
+        /// nothing; ungating it makes the disallowed hub beat.
+        #[tokio::test]
+        async fn hub_ctrl_actor_beats_only_when_allowed() {
+            for (beats, expect_some) in [(true, true), (false, false)] {
+                let (ctrl, mut server, activity) = crate::vpn::tests::ctrl_pair().await;
+                let (event_tx, _event_rx) = mpsc::channel(8);
+                let (_out, _handle) = spawn_hub_ctrl_actor(
+                    ctrl,
+                    crate::vpn::tests::live(activity, None, 50),
+                    beats,
+                    event_tx,
+                );
+                let frames = crate::vpn::tests::client_frames_within(
+                    &mut server,
+                    std::time::Duration::from_millis(500),
+                )
+                .await;
+                assert_eq!(frames >= 3, expect_some, "beats={beats}: {frames} frames");
+                if !expect_some {
+                    assert_eq!(frames, 0, "a disallowed hub must never beat");
+                }
+            }
+        }
 
         #[test]
         fn router_parses_ipv4_dst() {

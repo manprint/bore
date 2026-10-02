@@ -41,6 +41,7 @@ frills attached.
   - [Local forwarding](#local-forwarding)
   - [Parallel carriers (`--carriers`)](#parallel-carriers---carriers)
   - [Automatic reconnection](#automatic-reconnection)
+  - [Connection liveness and outage recovery](#connection-liveness-and-outage-recovery)
   - [HTTPS on the tunnel port](#https-on-the-tunnel-port)
   - [WebSocket support](#websocket-support)
 - [Self-hosting (`bore server`)](#self-hosting)
@@ -883,6 +884,71 @@ establish or drops, the client reconnects on its own with a capped exponential b
 backoff. The same backoff drives `bore vhost`, `bore vpn` and `bore transfer-link`. How fast
 a dead connection is *noticed* in the first place is described in
 [Connection liveness and outage recovery](#connection-liveness-and-outage-recovery).
+
+### Connection liveness and outage recovery
+
+A short network outage — a Wi-Fi drop, an ISP that changes your public IP, a NAT box that
+forgets its mapping — usually kills a TCP connection *silently*: no FIN, no RST, both ends
+still see the socket as ESTABLISHED. Left to the kernel, such a connection is declared dead
+only after `tcp_retries2`, about **15 minutes** on Linux, and until then the server keeps the
+dead tunnel's subdomain, port or secret id, so even a client that reconnects is refused
+"in use". bore therefore watches its connections at both ends:
+
+| | Default | Effect |
+|---|---|---|
+| Server heartbeat | every 500 ms | the server writes to every client's control connection |
+| Client heartbeat | every **2 s** | the client writes to the server and declares the interval |
+| Client silence deadline | **15 s** | no byte from the server for 15 s ⇒ the client drops the connection (the main one and every `--carriers` connection) and `--auto-reconnect` reconnects |
+| Server silence deadline | **15 s** (3 × the declared heartbeat, never less than 15 s) | no byte from a client for that long ⇒ the server releases the tunnel's subdomain, public port, secret id or jump alias at once |
+| Reconnect backoff | 1, 2, 4, 8 s, then every 8 s | see [Automatic reconnection](#automatic-reconnection) |
+
+Liveness counts **any** byte received on the connection, data included, so a tunnel busy
+moving a large transfer is never mistaken for a dead one.
+
+**What a 20 s outage costs.** The client gives up on the dead connection 15 s into the
+outage and keeps retrying (each attempt gives up after a few seconds), and the server has released the
+old registration by then, so the tunnel is back within one backoff step (at most 8 s) of
+the network returning — not 15 minutes. Both `bore local`/`proxy` and `bore vhost`/`sshjhost`
+providers behave this way. A public tunnel started with `--port 0` comes back on the
+**same public port**: the reconnecting client asks for the port it held, and the server
+only picks a new random one if somebody else took it in the meantime (a fixed `--port`
+already names its port).
+
+**Brief flicks cost nothing.** A blip shorter than the deadline disconnects nothing: TCP
+retransmits what was lost and every tunnel and in-flight connection carries on. Linux
+retransmits a lost segment after roughly 0.2, 0.6, 1.4, 3, 6 and 12.6 s, so a path that
+comes back within about **12 s** is picked up by a retransmission before either deadline
+fires.
+
+**Secret tunnels on the direct path.** The direct UDP path runs between consumer and
+provider without the server, so losing the server does not cost a working direct tunnel.
+A consumer on the direct path keeps serving and reconnects only when the direct path itself
+closes. A provider that loses the server reconnects, so new consumers can find it, while the
+direct connections it already serves keep running until they end.
+
+**Tuning.** Both knobs are environment variables of the *client* (`bore local`, `proxy`,
+`vhost`, `sshjhost`), read for every connection, so they work unchanged in Docker Compose:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BORE_CTRL_SERVER_SILENCE_MS` | `15000` | client silence deadline; `0` disables it and leaves detection to the kernel (≈15 min) |
+| `BORE_CTRL_HEARTBEAT_MS` | `2000` | client heartbeat; the server reaps after 3 × this (min 15 s), so raising it makes a dead tunnel's name take longer to free |
+
+```yaml
+services:
+  bore:
+    command: vhost 127.0.0.1:5000 --subdomain app --udp --auto-reconnect
+    environment:
+      BORE_CTRL_SERVER_SILENCE_MS: "15000"   # the default; shown for reference
+```
+
+**Upgrading.** The full behaviour needs both ends on this version. A newer client against an
+older server still notices the dead connection within 15 s and reconnects, but the older
+server releases the dead registration only after its own 60 s control timeout (servers
+older still: when the kernel gives up), so a fixed subdomain or port is retried every 8 s
+until then. An older client against a newer server keeps its old behaviour: it never
+declared a heartbeat interval, so the server never applies the 15 s deadline to it — doing
+so would reap healthy idle tunnels of clients that do not beat.
 
 ### HTTPS on the tunnel port
 

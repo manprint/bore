@@ -193,10 +193,36 @@ async fn spawn_bore_server_with(
     ssh_jump_ctrl_timeout: Duration,
     direct_quic_port: Option<u16>,
 ) -> Result<BoreHarness> {
+    spawn_bore_server_full(
+        dir,
+        authorized_keys_dir,
+        passwords_file,
+        secret,
+        ssh_jump_ctrl_timeout,
+        direct_quic_port,
+        None,
+    )
+    .await
+}
+
+/// [`spawn_bore_server_with`] plus an optional transport-reap floor (plan
+/// 005), so a test can see the transport reaper act in seconds.
+async fn spawn_bore_server_full(
+    dir: &Path,
+    authorized_keys_dir: PathBuf,
+    passwords_file: Option<PathBuf>,
+    secret: Option<&str>,
+    ssh_jump_ctrl_timeout: Duration,
+    direct_quic_port: Option<u16>,
+    transport_reap_floor: Option<Duration>,
+) -> Result<BoreHarness> {
     let control_port = free_port().await?;
     let gateway_port = free_port().await?;
     let mut server =
         Server::new(20000..=21000, secret).ssh_jump_ctrl_timeout(ssh_jump_ctrl_timeout);
+    if let Some(floor) = transport_reap_floor {
+        server = server.transport_reap_floor(floor);
+    }
     server.set_bind_addr("127.0.0.1".parse()?);
     server.set_bind_tunnels("127.0.0.1".parse()?);
     server.set_control_port(control_port);
@@ -1012,6 +1038,77 @@ async fn pure_openssh_provider_password_auth_real_proxyjump() -> Result<()> {
     wait_alias(&harness.registry, "password-vm", false).await?;
     harness.task.abort();
     target_task.abort();
+    Ok(())
+}
+
+/// Plan 005 (D3): a native provider that DECLARED a heartbeat interval and
+/// then goes silent — the shape of a provider whose network dropped or whose
+/// IP changed — frees its alias after the transport deadline, long before the
+/// legacy control timeout (here 600 s, i.e. never within the test).
+///
+/// RED-CHECK: removing the `reap_if_due` arm in `ssh_jump::serve_native_provider`
+/// leaves the alias held and the wait times out.
+#[tokio::test]
+async fn declared_silent_native_provider_is_transport_reaped() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    if !has_program("ssh-keygen").await {
+        eprintln!("WARNING: ssh-keygen unavailable; skipping native liveness e2e");
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let identity = gen_keypair(dir.path(), "operator").await?;
+    let keys_dir = dir.path().join("authorized_keys.d");
+    std::fs::create_dir(&keys_dir)?;
+    std::fs::copy(identity.with_extension("pub"), keys_dir.join("fabio"))?;
+    let harness = spawn_bore_server_full(
+        dir.path(),
+        keys_dir,
+        None,
+        None,
+        Duration::from_secs(600),
+        None,
+        Some(Duration::from_secs(1)),
+    )
+    .await?;
+
+    let socket = TcpStream::connect(("127.0.0.1", harness.control_port)).await?;
+    let (opener, _acceptor) = mux::client(socket);
+    let mut control = Delimited::new(opener.open().await?);
+    control
+        .send(ClientMessage::HelloSshJump {
+            ctrl_heartbeat_ms: 200,
+            alias: "gone-vm".to_string(),
+            ssh_port: 2222,
+            notes: None,
+            carriers: 1,
+            udp: false,
+            auto_reconnect: true,
+            local_host: "127.0.0.1".to_string(),
+            local_port: 2222,
+        })
+        .await?;
+    anyhow::ensure!(
+        matches!(
+            control.recv::<ServerMessage>().await?,
+            Some(ServerMessage::SshJumpReady { .. })
+        ),
+        "declared raw provider did not register"
+    );
+    wait_alias(&harness.registry, "gone-vm", true).await?;
+    let silent_since = time::Instant::now();
+
+    // Never beat again and never read: nothing reaches the server any more.
+    wait_alias(&harness.registry, "gone-vm", false).await?;
+    wait_admin_role(&harness.admin, Role::SshJumpHost, 0).await?;
+    anyhow::ensure!(
+        silent_since.elapsed() < Duration::from_secs(5),
+        "alias freed only after {:?}",
+        silent_since.elapsed()
+    );
+
+    drop(control);
+    drop(opener);
+    harness.task.abort();
     Ok(())
 }
 

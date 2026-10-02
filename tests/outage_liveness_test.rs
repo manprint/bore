@@ -1077,3 +1077,96 @@ async fn secret_provider_trip_keeps_its_live_direct_path() -> Result<()> {
     }
     Ok(())
 }
+
+// ─── Sticky public port (1.5) ────────────────────────────────────────────────
+
+/// A public client asking for any port, carrying `preferred_port`.
+async fn public_client_preferring(
+    control: u16,
+    local: u16,
+    preferred: Option<u16>,
+) -> Result<Client> {
+    Client::new(
+        "127.0.0.1",
+        local,
+        &format!("127.0.0.1:{control}"),
+        0,
+        None,
+        false,
+        TunnelOptions {
+            preferred_port: preferred,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+}
+
+/// A `--port 0` tunnel that reconnects after an outage gets its old port
+/// back, so its public address survives the outage.
+///
+/// RED-CHECK: a server that ignores `preferred_port` hands out a random port
+/// of 200, three rounds in a row, so luck cannot pass it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_port_zero_reconnect_gets_the_same_port() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    const CONTROL: u16 = 18761;
+    spawn_server(CONTROL, 18800..=18999, Duration::from_secs(15), None).await?;
+    let local = echo_service().await?;
+
+    let mut client = public_client_preferring(CONTROL, local, None).await?;
+    let held = client.remote_port();
+    for round in 0..3 {
+        // The connection goes away and the server frees the port...
+        drop(client);
+        wait_port(held, false).await;
+        // ...and the reconnect asks for it back.
+        client = public_client_preferring(CONTROL, local, Some(held)).await?;
+        assert_eq!(
+            client.remote_port(),
+            held,
+            "round {round}: the public port moved"
+        );
+    }
+    Ok(())
+}
+
+/// A preferred port outside the server's range is ignored, never an error:
+/// the client asked for ANY port.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preferred_port_out_of_range_is_ignored() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    const CONTROL: u16 = 18762;
+    spawn_server(CONTROL, 18770..=18779, Duration::from_secs(15), None).await?;
+    let local = echo_service().await?;
+
+    let client = public_client_preferring(CONTROL, local, Some(18_000)).await?;
+    assert!(
+        (18770..=18779).contains(&client.remote_port()),
+        "got {}",
+        client.remote_port()
+    );
+    Ok(())
+}
+
+/// A preferred port someone else holds now is not taken from them: the
+/// reconnecting client gets another port instead of an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preferred_port_taken_falls_back_to_random() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    const CONTROL: u16 = 18763;
+    spawn_server(CONTROL, 18780..=18789, Duration::from_secs(15), None).await?;
+    let local = echo_service().await?;
+
+    let holder = public_client_preferring(CONTROL, local, None).await?;
+    let taken = holder.remote_port();
+    let other = public_client_preferring(CONTROL, local, Some(taken)).await?;
+    assert_ne!(
+        other.remote_port(),
+        taken,
+        "the holder's port was handed out twice"
+    );
+    assert!((18780..=18789).contains(&other.remote_port()));
+    drop(holder);
+    Ok(())
+}

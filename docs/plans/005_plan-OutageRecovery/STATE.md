@@ -26,10 +26,10 @@ Read this first in every session. Updated 2026-10-02 by claude-opus-5-5.
 - Active scope: plan (all phases) — user: "implementa il piano, testa tutto, committa su Dev e segui la ci".
 - Scope result: RUNNING.
 - Type / ID / attempt: none.
-- Next action: open 1.5 (public sticky port).
-- Next eligible plan unit: 1.5.
+- Next action: open 1.6 (README).
+- Next eligible plan unit: 1.6.
 - Unit base: f7b0745; branch: dev.
-- Repo state: plan commits on dev after f7b0745 (latest: the 1.4 commit, matched by `PEV-Unit: 1.4`).
+- Repo state: plan commits on dev after f7b0745 (latest: the 1.4 commit, matched by `PEV-Unit: 1.5`).
 
 ## 2. Feature context and readiness
 
@@ -131,7 +131,7 @@ None. Environment note: ports 19000/19001 are held by a foreign node process on 
 | 1.2 | phase_02.md | 1.1 | DONE | 1 | G-U12 5/0; red-check: neutered reap_if_due → 4 FAIL; reap-undeclared → I-5 test FAIL |
 | 1.3 | phase_02.md | 1.1 | DONE | 1 | G-U12 10/0 (5 new); red-checks: liveness arm off → 3 trip tests time out; `terminate_all` off → carrier test FAIL; `deadline/4` → flick test FAIL 3/3 |
 | 1.4 | phase_02.md | 1.1 | DONE | 1 | G-U12 16/0 (6 new); red-checks: Proxy liveness arm off → trip test times out; per-carrier watch off → dead-carrier test FAIL; watch + terminate_all off → carrier-close test FAIL; no beats → heartbeat test FAIL; trip-regardless-of-path → direct-survival test FAIL; linger off → provider direct test FAIL; full `cargo test` 1100+ passed, only failure = env `vhost_entry_redirect_overrides_both` (foreign port 19000) |
-| 1.5 | phase_02.md | 1.1 | TODO | 1 | — |
+| 1.5 | phase_02.md | 1.1 | DONE | 1 | G-U12 19/0 (3 new) + `sticky_preferred_port_table`; red-checks: server ignores `preferred_port` → `public_port_zero_reconnect_gets_the_same_port` FAIL; no fallback on a taken preferred port → `preferred_port_taken_falls_back_to_random` FAIL. The `bore local` closure wiring (store after connect) is gated end-to-end by T-OUT-IPCHANGE0 (4.1) |
 | 1.6 | phase_02.md | 1.2–1.5 | TODO | 1 | — |
 | 2.1 | phase_03.md | P1 | TODO | 1 | — |
 | 2.2 | phase_03.md | 2.1 | TODO | 1 | — |
@@ -161,7 +161,7 @@ None. Environment note: ports 19000/19001 are held by a foreign node process on 
 | liveness tables | 0.2 | G-U02 | PASS | 6 tests incl. LivenessTicker |
 | backoff cap | 0.3 | G-U03 | PASS | 8 passed |
 | serde defaults | 1.1/2.1/3.1 | G-U11 | PASS (1.1) | 7 new in shared::tests |
-| outage_liveness_test | 1.2–1.5 | G-U12 | PARTIAL (1.4: 16/0) | server reapers vhost/public/secret provider/consumer + I-5; client trips public/vhost/secret provider, flick survival, carrier termination |
+| outage_liveness_test | 1.2–1.5 | G-U12 | PARTIAL (1.5: 19/0) | server reapers vhost/public/secret provider/consumer + I-5; client trips public/vhost/secret provider+consumer, flick survival, carrier termination, consumer direct survival, provider linger, sticky public port |
 | vpn liveness/teardown | 2.2–2.4 | G-U2 | TODO | — |
 | owner + sshgw | 3.1/3.2 | G-U3 | TODO | — |
 | T-OUT-* | 4.1 | G-NETNS-OUT | TODO | — |

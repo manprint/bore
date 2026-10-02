@@ -2196,6 +2196,27 @@ impl Server {
         bind_public_listener(self.bind_tunnels, &self.port_range, port).await
     }
 
+    /// [`Server::create_listener`] for a client that accepts any port (`port`
+    /// 0) but prefers the one it held before an outage (plan 005, D7). The
+    /// preferred port is tried first and is ignored when it is outside the
+    /// range or taken, so the request can never fail because of it. It grants
+    /// nothing new: any client may already ask for a specific port in range.
+    async fn create_listener_preferring(
+        &self,
+        port: u16,
+        preferred: Option<u16>,
+    ) -> Result<TcpListener, &'static str> {
+        if port == 0 {
+            if let Some(preferred) = preferred.filter(|p| *p != 0 && self.port_range.contains(p)) {
+                match self.create_listener(preferred).await {
+                    Ok(listener) => return Ok(listener),
+                    Err(err) => debug!(preferred, err, "preferred public port unavailable"),
+                }
+            }
+        }
+        self.create_listener(port).await
+    }
+
     /// Route an accepted (and TLS-terminated, if applicable) control connection.
     ///
     /// When the admin status page or the vhost frontend is enabled, the first byte
@@ -2978,7 +2999,10 @@ impl Server {
         opts.https = eff_https;
         opts.force_https = eff_force_https;
 
-        let listener = match self.create_listener(port).await {
+        let listener = match self
+            .create_listener_preferring(port, opts.preferred_port)
+            .await
+        {
             Ok(listener) => listener,
             Err(err) => {
                 control.send(ServerMessage::Error(err.into())).await?;

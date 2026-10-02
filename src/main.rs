@@ -2220,16 +2220,26 @@ async fn dispatch(command: Command) -> Result<()> {
                         // Filled per attempt by the connect closure (D7).
                         preferred_port: None,
                     };
+                    // Sticky public port (plan 005, D7): a `--port 0` tunnel
+                    // that reconnects asks for the port it held, so an outage
+                    // does not move its public address. The server falls back
+                    // to a random port when that one is gone.
+                    let last_port = Arc::new(std::sync::atomic::AtomicU16::new(0));
                     let connect = move || {
-                        let (local_host, to, secret, options, access_logger) = (
+                        let (local_host, to, secret, mut options, access_logger, last_port) = (
                             local_host.clone(),
                             to.clone(),
                             secret.clone(),
                             options.clone(),
                             access_logger.clone(),
+                            Arc::clone(&last_port),
                         );
                         async move {
-                            Client::new(
+                            options.preferred_port = sticky_preferred_port(
+                                port,
+                                last_port.load(std::sync::atomic::Ordering::Relaxed),
+                            );
+                            let client = Client::new(
                                 &local_host,
                                 local_port,
                                 &to,
@@ -2239,7 +2249,10 @@ async fn dispatch(command: Command) -> Result<()> {
                                 options,
                                 access_logger,
                             )
-                            .await
+                            .await?;
+                            last_port
+                                .store(client.remote_port(), std::sync::atomic::Ordering::Relaxed);
+                            Ok(client)
                         }
                     };
                     reconnect::run(auto_reconnect, connect, serve_client).await?;
@@ -3357,6 +3370,13 @@ fn clamp_notes(notes: Option<String>) -> Option<String> {
     })
 }
 
+/// The port a reconnecting public tunnel asks to get back: the one it held
+/// last, only when the operator asked for "any port" (`--port 0`) and a
+/// previous attempt actually got one. A fixed `--port` already says which.
+fn sticky_preferred_port(requested: u16, last_held: u16) -> Option<u16> {
+    (requested == 0 && last_held != 0).then_some(last_held)
+}
+
 /// Run a connected client until its connection ends.
 async fn serve_client(client: Client) -> Result<()> {
     client.listen().await
@@ -3752,6 +3772,20 @@ mod tests {
         assert_eq!(super::stream_bandwidth_mb_s(16 * 1024 * 1024, 100), 160);
         // A zero RTT is not a division by zero.
         assert_eq!(super::stream_bandwidth_mb_s(1024 * 1024, 0), 0);
+    }
+
+    /// Plan 005, D7: only a `--port 0` tunnel that already held a port asks
+    /// for it back; a fixed `--port` already names its port.
+    #[test]
+    fn sticky_preferred_port_table() {
+        assert_eq!(super::sticky_preferred_port(0, 0), None, "first attempt");
+        assert_eq!(super::sticky_preferred_port(0, 41_234), Some(41_234));
+        assert_eq!(
+            super::sticky_preferred_port(5000, 41_234),
+            None,
+            "fixed port"
+        );
+        assert_eq!(super::sticky_preferred_port(5000, 0), None);
     }
     use super::*;
     use bore_cli::shared::HttpsPolicy;

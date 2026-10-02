@@ -47,35 +47,19 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 /// control channel is a yamux substream, so a half-open/abandoned peer is
 /// invisible to `send`/`recv`; without this deadline the loop blocks forever on
 /// `recv` and the RAII admin `Registration` never drops — a zombie entry. The
-/// client sends [`ClientMessage::Heartbeat`] every [`CTRL_CLIENT_HEARTBEAT`] so a
-/// healthy idle tunnel always beats this. Parity with the VPN
+/// client sends [`ClientMessage::Heartbeat`] every
+/// [`crate::liveness::CTRL_CLIENT_HEARTBEAT`] so a healthy idle tunnel always
+/// beats this. Parity with the VPN
 /// `CTRL_HEARTBEAT_TIMEOUT` (60 s). Overridable per-server (see
 /// [`crate::server::Server::secret_ctrl_timeout`]) so tests can reap fast.
 pub(crate) const SECRET_CTRL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How often a secret/vhost provider (or secret consumer) *client* sends
-/// [`ClientMessage::Heartbeat`] up the control substream. Must stay well under
-/// [`SECRET_CTRL_TIMEOUT`] so a few lost frames never trip the server's reaper.
-pub(crate) const CTRL_CLIENT_HEARTBEAT: Duration = Duration::from_secs(20);
-
-/// [`CTRL_CLIENT_HEARTBEAT`] with a test-only override
-/// (`BORE_CTRL_HEARTBEAT_MS`), read per call so a harness can set it after
-/// startup. Mirrors `ssh_open_timeout`'s `BORE_SSH_OPEN_TIMEOUT_MS`.
-///
-/// Exists because the interesting property — *the client actually sends what it
-/// declared on the wire* — is otherwise only provable by a test that idles past
-/// a 20 s beat and a longer server deadline, i.e. 25 s+ of wall clock. A client
-/// that sets `HelloVhost::ctrl_heartbeat` and then fails to beat converts every
-/// healthy tunnel into a reaped one, so that gate has to be cheap enough to
-/// keep.
+/// [`ClientMessage::Heartbeat`] up the control substream: owned by
+/// [`crate::liveness`] since plan 005 (5 s, was 20 s), kept here under its old
+/// name for existing callers.
 pub(crate) fn ctrl_client_heartbeat() -> Duration {
-    match std::env::var("BORE_CTRL_HEARTBEAT_MS") {
-        Ok(ms) => match ms.parse::<u64>() {
-            Ok(ms) if ms > 0 => Duration::from_millis(ms),
-            _ => CTRL_CLIENT_HEARTBEAT,
-        },
-        Err(_) => CTRL_CLIENT_HEARTBEAT,
-    }
+    crate::liveness::ctrl_client_heartbeat()
 }
 
 /// How long a control heartbeat write may block before the client concludes the
@@ -96,11 +80,14 @@ pub(crate) fn ctrl_client_heartbeat() -> Duration {
 /// blocked if the control path is genuinely broken, and the server's own
 /// deadline then reaps the registration — which is what should happen.
 ///
-/// Comfortably below [`SECRET_CTRL_TIMEOUT`] so a stand-down is always visible
-/// to the server as a missed deadline rather than as an ambiguous stall, and at
-/// or below [`CTRL_CLIENT_HEARTBEAT`] so beats can never queue up behind one
-/// another. `BORE_CTRL_HEARTBEAT_SEND_TIMEOUT_MS` overrides it, read per call
-/// for the same reason [`ctrl_client_heartbeat`] is.
+/// Comfortably below [`SECRET_CTRL_TIMEOUT`] and below the transport reap floor
+/// ([`crate::liveness::TRANSPORT_REAP_FLOOR`]) so a stand-down is always visible
+/// to the server as a missed deadline rather than as an ambiguous stall. Beats
+/// cannot queue up behind one another even though it exceeds
+/// [`crate::liveness::CTRL_CLIENT_HEARTBEAT`]: the write is awaited in place,
+/// and a write that times out stops the beating for the session.
+/// `BORE_CTRL_HEARTBEAT_SEND_TIMEOUT_MS` overrides it, read per call for the
+/// same reason [`ctrl_client_heartbeat`] is.
 const CTRL_HEARTBEAT_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// [`CTRL_HEARTBEAT_SEND_TIMEOUT`] with its test-only override.

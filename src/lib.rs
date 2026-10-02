@@ -43,6 +43,7 @@ pub mod edge;
 pub mod fast_link;
 pub mod fdlimit;
 pub mod holepunch;
+pub mod liveness;
 pub mod mux;
 pub mod pool;
 #[cfg(feature = "udp")]

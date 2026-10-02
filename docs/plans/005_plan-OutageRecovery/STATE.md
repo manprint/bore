@@ -26,8 +26,8 @@ Read this first in every session. Updated 2026-10-02 by claude-opus-5-5.
 - Active scope: plan (all phases) — user: "implementa il piano, testa tutto, committa su Dev e segui la ci".
 - Scope result: RUNNING.
 - Type / ID / attempt: none.
-- Next action: open 0.2 (`src/liveness.rs`).
-- Next eligible plan unit: 0.2.
+- Next action: open 0.3 (backoff cap).
+- Next eligible plan unit: 0.3.
 - Unit base: f7b0745; branch: dev.
 - Repo state: HEAD f7b0745 plus the untracked plan folder.
 
@@ -92,6 +92,7 @@ None.
 |-----------|---------|--------|--------------------------|---------------------|------|
 | G-U01 | `cargo test --lib mux::tests` | PASS | 15 passed, 5 new | 0.1 diff | 2026-10-02 |
 | G-FMT/G-CLIPPY | per §3 | PASS | clean | 0.1 diff | 2026-10-02 |
+| G-U02 | `cargo test --lib liveness` | PASS | 6 new | 0.2 diff | 2026-10-02 |
 
 | Review | Reviewer | Plan revision / reviewed change | Invariants/assertions checked | Verdict |
 |--------|----------|---------------------------------|------------------------------|---------|
@@ -100,6 +101,7 @@ None.
 
 | Revision | Previous decision/step | Approved replacement and reason | Supervisor | Dependents/revalidation |
 |----------|------------------------|---------------------------------|------------|------------------------|
+| 1a | 0.2 contract: `secret::CTRL_CLIENT_HEARTBEAT` kept as a delegating const | the const became unused (only `ctrl_client_heartbeat()` read it), so it is removed and doc links point at `liveness::CTRL_CLIENT_HEARTBEAT`; `ctrl_client_heartbeat()` keeps its name. Added `liveness::LivenessTicker` (disarmable tick) + `declared_ms_for(Duration)` used by 1.x/2.x/3.x. `CTRL_HEARTBEAT_SEND_TIMEOUT` stays 10 s; its doc no longer claims "≤ heartbeat" (beats are awaited in place, cannot queue). | claude-opus-5-5 | none |
 
 ## 9. Blockers
 
@@ -116,7 +118,7 @@ None.
 | ID | Phase file | Depends on | Status | Attempt | Evidence / reason |
 |----|------------|------------|--------|---------|-------------------|
 | 0.1 | phase_01.md | none | DONE | 1 | G-U01 15/0 (5 new); terminate red-checked |
-| 0.2 | phase_01.md | none | TODO | 1 | — |
+| 0.2 | phase_01.md | none | DONE | 1 | G-U02 6 liveness tests pass |
 | 0.3 | phase_01.md | none | TODO | 1 | — |
 | 0.4 | phase_01.md | 0.3 | TODO | 1 | — |
 | 1.1 | phase_02.md | P0 | TODO | 1 | — |
@@ -150,7 +152,7 @@ None.
 | ID/name | Owning unit | Gate | Status | Evidence |
 |---------|-------------|------|--------|----------|
 | mux activity/terminate (5) | 0.1 | G-U01 | PASS | 15 passed; red-check terminate arm → timeout |
-| liveness tables | 0.2 | G-U02 | TODO | — |
+| liveness tables | 0.2 | G-U02 | PASS | 6 tests incl. LivenessTicker |
 | backoff cap | 0.3 | G-U03 | TODO | — |
 | serde defaults | 1.1/2.1/3.1 | G-U11 | TODO | — |
 | outage_liveness_test | 1.2–1.5 | G-U12 | TODO | — |

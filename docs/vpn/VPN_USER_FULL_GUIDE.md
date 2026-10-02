@@ -692,7 +692,11 @@ sudo bore vpn connect \
 - With pool addressing the overlay /30 **may change** across reconnects (the
   server re-allocates); use static addressing if you need stable addresses.
 - The direct-path upgrade is re-attempted on every reconnect (fresh nonce).
-- An attempt that stayed up >60 s resets the backoff to 1 second.
+- An attempt the server paired (or one that stayed up >60 s) resets the backoff
+  to 1 second, and for 60 s after such a link is lost every retry waits only
+  1 second: both ends of the link lost it and both are redialling, so the side
+  that comes back first must not sleep through the other's return. Past that
+  window the backoff escalates 1, 2, 4, 8 s again.
 - A server the client has not heard from for 15 s ends the link and starts a
   reconnect (`BORE_CTRL_SERVER_SILENCE_MS`), so a silent path loss such as an ISP
   IP change costs seconds, not the kernel's ~15 minutes. A 1:1 link on the

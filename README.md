@@ -942,7 +942,9 @@ listener that is still **waiting** for its peer is watched too, so it registers 
 an outage instead of waiting on a dead connection. When one side of a link leaves the
 server — reaped, exited or reconnecting — the server closes the other side as well, so both
 reconnect and pair again instead of one end waiting on a peer that is gone; a hub that leaves
-takes its spokes with it the same way. A 1:1 link already on the **direct** path does not
+takes its spokes with it the same way. Because both ends are redialling, a link that had paired
+retries every **1 s** for the first 60 s after it is lost (then 1, 2, 4, 8 s as usual), so the
+end that comes back first is never asleep on a long backoff when its peer returns. A 1:1 link already on the **direct** path does not
 cross the server, so a silent server alone does not end it: the link logs one warning and
 keeps running, and reconnects when the direct path itself fails. A hub always reconnects,
 because its spokes reach it through the server.

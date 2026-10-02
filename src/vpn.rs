@@ -487,6 +487,36 @@ mod routes {
     }
 }
 
+/// What one [`run_with_reconnect`] attempt reached, written by the attempt and
+/// read by the loop after it ends. Only "the server paired this link" for now:
+/// that is the VPN's equivalent of [`crate::reconnect::run`]'s successful
+/// connect, the point after which a loss is a NEW outage and not a retry.
+#[derive(Clone, Default)]
+struct LinkProgress(Arc<std::sync::atomic::AtomicBool>);
+
+impl LinkProgress {
+    /// The server answered `VpnReady`: this attempt brought a link up.
+    fn mark_paired(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn paired(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// How long after losing a link the server had PAIRED every retry waits only
+/// the minimum delay (plan 005, O-1). Both ends of a 1:1 link lose it within
+/// one deadline of each other and both redial, so for this window the peer is
+/// expected back at any moment: the side that returns first must not sleep
+/// through the other's arrival. Measured before it existed: the connector's
+/// "listener not found" retries had climbed to the 8 s cap by the time the
+/// listener re-registered, and the pair came back 7-8 s after the listener
+/// could have served. A retry here is one connect (bounded by the 3 s connect
+/// timeout while the network is still down) or one rejected handshake, so the
+/// window is cheap; past it the normal 1 s .. 8 s backoff resumes.
+const VPN_PEER_RETURN_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Reconnect wrapper (DEC-4): a local loop reusing [`crate::reconnect::Backoff`],
 /// NOT `reconnect::run` — the VPN must distinguish fatal configuration errors
 /// from lost links, which the shared helper deliberately does not.
@@ -494,24 +524,39 @@ mod routes {
 /// Every attempt is a full teardown + rebuild (DEC-5): `run_*_once` owns the
 /// TUN and `NetConfig` as locals, so their RAII drops run before the next
 /// attempt; `ip route replace` keeps a re-apply idempotent.
+///
+/// Delay policy: an attempt the server paired (or one that lived >60 s) was a
+/// link that came up, so its loss restarts the backoff, and for
+/// [`VPN_PEER_RETURN_GRACE`] after that loss every retry uses the minimum
+/// delay. Otherwise the backoff escalates 1 s .. 8 s.
 async fn run_with_reconnect<F, Fut>(auto: bool, mut attempt: F) -> Result<()>
 where
-    F: FnMut() -> Fut,
+    F: FnMut(LinkProgress) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
     if !auto {
-        return attempt().await;
+        return attempt(LinkProgress::default()).await;
     }
     let mut backoff = crate::reconnect::Backoff::new(); // 1 s .. 8 s
+    let mut paired_link_lost_at: Option<tokio::time::Instant> = None;
     loop {
         let started = tokio::time::Instant::now();
-        match attempt().await {
+        let progress = LinkProgress::default();
+        match attempt(progress.clone()).await {
             Ok(()) => return Ok(()), // clean exit (future: shutdown signal)
             Err(e) if is_fatal(&e) => return Err(e),
             Err(e) => {
-                // An attempt that lived >60 s was a healthy link: restart the
-                // backoff from the minimum instead of escalating.
-                if started.elapsed() > std::time::Duration::from_secs(60) {
+                // Pairing is the signal that matters (plan 005, O-1): with the
+                // lifetime rule alone a link that reconnected and dropped again
+                // within a minute — a flapping line, an IP change shortly after
+                // an outage — waited the full 8 s cap before redialling, which
+                // `reconnect::run` never does (it resets on every connect).
+                if progress.paired() {
+                    paired_link_lost_at = Some(tokio::time::Instant::now());
+                }
+                let in_grace =
+                    paired_link_lost_at.is_some_and(|t| t.elapsed() < VPN_PEER_RETURN_GRACE);
+                if in_grace || started.elapsed() > std::time::Duration::from_secs(60) {
                     backoff.reset();
                 }
                 let delay = backoff.next_delay();
@@ -778,11 +823,14 @@ pub async fn run_listen(args: VpnListenArgs) -> Result<()> {
     #[cfg(target_os = "windows")]
     emit_windows_flag_warnings(args.tun_queues);
     let auto = args.auto_reconnect;
-    run_with_reconnect(auto, move || run_listen_once(args.clone())).await
+    run_with_reconnect(auto, move |progress| {
+        run_listen_once(args.clone(), progress)
+    })
+    .await
 }
 
 /// One full listener attempt: connect, pair, bring the link up, run the bridge.
-async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
+async fn run_listen_once(args: VpnListenArgs, progress: LinkProgress) -> Result<()> {
     // Preflight checks (fatal: retrying cannot fix privileges or PATH)
     hostcfg::check_root().map_err(|e| FatalVpnError(e.to_string()))?;
     // Linux and Android both use iproute2-compatible `ip` (toybox on Android
@@ -852,6 +900,7 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
                 iface = %args.tun_name,
                 "vpn link paired"
             );
+            progress.mark_paired();
             (
                 assigned,
                 prefix,
@@ -2227,11 +2276,14 @@ pub async fn run_connect(args: VpnConnectArgs) -> Result<()> {
     #[cfg(target_os = "windows")]
     emit_windows_flag_warnings(args.tun_queues);
     let auto = args.auto_reconnect;
-    run_with_reconnect(auto, move || run_connect_once(args.clone())).await
+    run_with_reconnect(auto, move |progress| {
+        run_connect_once(args.clone(), progress)
+    })
+    .await
 }
 
 /// One full connector attempt: connect, pair, bring the link up, run the bridge.
-async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
+async fn run_connect_once(args: VpnConnectArgs, progress: LinkProgress) -> Result<()> {
     // Preflight checks (fatal: retrying cannot fix privileges or PATH)
     hostcfg::check_root().map_err(|e| FatalVpnError(e.to_string()))?;
     // Linux/Android `ip` probe (D8/I-M7): macOS uses BSD tools that lack `--version`.
@@ -2303,6 +2355,7 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
                 iface = %args.tun_name,
                 "vpn link paired"
             );
+            progress.mark_paired();
             (
                 assigned,
                 prefix,
@@ -10793,7 +10846,7 @@ mod tests {
         // 3 retryable failures, then a fatal one: exactly 4 attempts, Err out.
         let n = Arc::new(AtomicU32::new(0));
         let n2 = Arc::clone(&n);
-        let result = run_with_reconnect(true, move || {
+        let result = run_with_reconnect(true, move |_| {
             let n = Arc::clone(&n2);
             async move {
                 let i = n.fetch_add(1, Ordering::SeqCst);
@@ -10812,7 +10865,7 @@ mod tests {
         // auto = false: a retryable error is NOT retried.
         let n = Arc::new(AtomicU32::new(0));
         let n2 = Arc::clone(&n);
-        let result = run_with_reconnect(false, move || {
+        let result = run_with_reconnect(false, move |_| {
             let n = Arc::clone(&n2);
             async move {
                 n.fetch_add(1, Ordering::SeqCst);
@@ -10828,8 +10881,59 @@ mod tests {
         );
 
         // Ok() exits the loop immediately.
-        let result = run_with_reconnect(true, || async { Ok(()) }).await;
+        let result = run_with_reconnect(true, |_| async { Ok(()) }).await;
         assert!(result.is_ok());
+    }
+
+    /// Plan 005, O-1: losing a link the server had PAIRED restarts the backoff
+    /// however short the link lived, and for `VPN_PEER_RETURN_GRACE` after that
+    /// loss every retry waits the minimum. Before this only a >60 s lifetime
+    /// reset it: after an IP change that followed an outage the listener
+    /// redialled after 4 s and the connector after 8 s, and during an outage
+    /// the connector's "listener not found" retries reached the 8 s cap while
+    /// the listener was already back (T-OUT-IPCHANGE0 / T-OUT-OUTAGE).
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_paired_link_retries_at_the_minimum_until_the_grace_ends() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::time::Instant;
+
+        // 0..=2: fail before pairing — the ordinary escalation 1, 2, 4 s.
+        // 3: pairs, then drops at once — restart at 1 s, not 8 s.
+        // 4, 5: fail unpaired inside the grace — 1 s each, no escalation.
+        // 6: fails unpaired after running 59 s (< the 60 s lifetime rule), so
+        //    it ends past the grace — escalation resumes (2 s).
+        // 7: fatal, ends the loop.
+        let n = Arc::new(AtomicU32::new(0));
+        let starts = Arc::new(Mutex::new(Vec::<Instant>::new()));
+        let (n2, starts2) = (Arc::clone(&n), Arc::clone(&starts));
+        let result = run_with_reconnect(true, move |progress| {
+            let (n, starts) = (Arc::clone(&n2), Arc::clone(&starts2));
+            async move {
+                starts.lock().unwrap().push(Instant::now());
+                match n.fetch_add(1, Ordering::SeqCst) {
+                    3 => {
+                        progress.mark_paired();
+                        Err(anyhow!("link lost"))
+                    }
+                    6 => {
+                        tokio::time::sleep(std::time::Duration::from_secs(59)).await;
+                        Err(anyhow!("vpn listener 'x' not found"))
+                    }
+                    7 => Err(anyhow::Error::new(FatalVpnError("stop".into()))),
+                    _ => Err(anyhow!("could not connect")),
+                }
+            }
+        })
+        .await;
+        assert!(is_fatal(&result.unwrap_err()));
+        let starts = starts.lock().unwrap();
+        let gaps: Vec<u64> = starts.windows(2).map(|w| (w[1] - w[0]).as_secs()).collect();
+        assert_eq!(
+            gaps,
+            vec![1, 2, 4, 1, 1, 1, 59 + 2],
+            "start-to-start gap before each retry (s)"
+        );
     }
 }
 

@@ -399,8 +399,13 @@ overlay /30 may change across reconnects (the server re-allocates); static
 addressing keeps the same addresses. The direct-path upgrade is re-attempted on
 every reconnect with a fresh nonce.
 
-An attempt that stayed up for more than 60 seconds resets the backoff to 1 s,
-so a long-lived link that drops reconnects promptly.
+An attempt the server paired — or one that stayed up for more than 60 seconds
+— resets the backoff to 1 s, and for 60 s after such a link is lost every retry
+waits only 1 s (`VPN_PEER_RETURN_GRACE`). Both ends of a 1:1 link lose it within
+one deadline of each other and both redial, so the side that returns first must
+not be asleep on an escalated backoff when the other re-registers: before this
+the connector's "listener not found" retries had reached the 8 s cap by the time
+the listener was back. Past the window the backoff escalates 1, 2, 4, 8 s again.
 
 **Control-connection liveness.** The server heartbeats every client every
 500 ms, including a listener still waiting for its peer. The client counts any

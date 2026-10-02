@@ -51,7 +51,7 @@ Existing sockets keep source `.2`, so they are dead forever; new ones use `.3`. 
 ## Sub-phases
 
 ### 4.1 `scripts/outage_netns_test.sh`
-- **Files:** NEW `scripts/outage_netns_test.sh` (executable). Conventions: copy the staleness guard, `pass`/`fail`/`die`, trap cleanup, and dependency SKIP from `scripts/local_proxy_netns_test.sh`. The `BORE` env override allows the red-check on another binary.
+- **Files:** NEW `scripts/outage_netns_test.sh` (executable). Conventions: copy the staleness guard, `pass`/`fail`/`die`, trap cleanup, and dependency SKIP from `scripts/local_proxy_netns_test.sh`. The `--bore PATH` option (rev 1k: sudo's `env_reset` drops a `BORE=` variable; the variable still works where it survives) allows the red-check on another binary; `--events`, `--keep-logs`, `--window`, `--window0` likewise.
 - **Change:**
   1. S1 — topology + services + server (`--vhost-domain`, `--udp`, `--vpn`, `--ssh-gateway` as needed by the modes; read `bore server --help` for exact flags).
   2. S2 — tunnels + baseline probes (all PASS before any event).
@@ -59,7 +59,7 @@ Existing sockets keep source `.2`, so they are dead forever; new ones use `.3`. 
   4. S4 — summary `PASS: n FAIL: m`; exit 1 on any FAIL.
   - Checkpoint after each S.
 - **Tests:** the script itself; it must run green with the new binary.
-  - **Red-check:** build the baseline `f7b0745` into a separate target dir (`git worktree add /tmp/…/base f7b0745 && cargo build --release --features vpn,ssh-gateway`), run with `BORE=…` and an `OUT_WINDOW` default. T-OUT-IPCHANGE must FAIL for at least the vhost/public modes.
+  - **Red-check:** build the baseline `f7b0745` into a separate target dir (`git worktree add /tmp/…/base f7b0745 && cargo build --release --features vpn,ssh-gateway`), run with `--bore …` and the default windows. T-OUT-IPCHANGE must FAIL for at least the vhost/public modes.
   - Record both runs in STATE §7.
 - **Done:** green on new; red on baseline; committed.
 

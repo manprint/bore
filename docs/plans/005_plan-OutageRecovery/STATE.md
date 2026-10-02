@@ -26,8 +26,8 @@ Read this first in every session. Updated 2026-10-02 by claude-opus-5-5.
 - Active scope: plan (all phases) — user: "implementa il piano, testa tutto, committa su Dev e segui la ci".
 - Scope result: RUNNING.
 - Type / ID / attempt: none.
-- Next action: P0 closure (G-PHASE), then 1.1.
-- Next eligible plan unit: P0.
+- Next action: open 1.1 (wire fields).
+- Next eligible plan unit: 1.1.
 - Unit base: f7b0745; branch: dev.
 - Repo state: HEAD f7b0745 plus the untracked plan folder.
 
@@ -93,6 +93,7 @@ None.
 | G-U01 | `cargo test --lib mux::tests` | PASS | 15 passed, 5 new | 0.1 diff | 2026-10-02 |
 | G-FMT/G-CLIPPY | per §3 | PASS | clean | 0.1 diff | 2026-10-02 |
 | G-U02 | `cargo test --lib liveness` | PASS | 6 new | 0.2 diff | 2026-10-02 |
+| G-PHASE P0 | `cargo test` / `--features vpn` / `--features ssh-gateway` | PASS (env-only reds) | default 1010 pass + `transfer_ask_confirm_returns_err_when_no_tty_available` flaky (passes on rerun 43/0; dials default port while other tests run servers); vpn 1204 pass + `vhost_entry_redirect_overrides_both` red = port 19000 held by a foreign `node build/new_configurator/index.js` (pid 3179752) on this workstation; ssh 991 pass 0 fail | HEAD after 0.4 | 2026-10-02 |
 
 | Review | Reviewer | Plan revision / reviewed change | Invariants/assertions checked | Verdict |
 |--------|----------|---------------------------------|------------------------------|---------|
@@ -105,7 +106,7 @@ None.
 
 ## 9. Blockers
 
-None.
+None. Environment note: ports 19000/19001 are held by a foreign node process on this workstation, so `vhost_entry_redirect_overrides_both` cannot pass locally; CI is its oracle.
 
 ## 10. Do-not-repeat
 
@@ -142,7 +143,7 @@ None.
 ### Phases
 | ID | File | Closure unit | Status | Review / commit reference |
 |----|------|--------------|--------|---------------------------|
-| 0 | phase_01.md | P0 | TODO | — |
+| 0 | phase_01.md | P0 | DONE | self-review: no callers of terminate yet; heartbeat 5 s only speeds beats; PEV-Unit P0 |
 | 1 | phase_02.md | P1 | TODO | — |
 | 2 | phase_03.md | P2 | TODO | — |
 | 3 | phase_04.md | P3 | TODO | — |

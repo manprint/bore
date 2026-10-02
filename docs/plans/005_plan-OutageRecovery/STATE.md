@@ -24,10 +24,10 @@ Read this first in every session. Updated 2026-10-02 by claude-opus-5-5.
 ## 1. Current unit and scope
 
 - Active scope: plan (all phases) — user: "implementa il piano, testa tutto, committa su Dev e segui la ci".
-- Scope result: RUNNING (all phases DONE; G-CI round 5 pending — round 4 = §7, fixed by rev 1o).
+- Scope result: COMPLETE — all phases DONE, every gate PASS, G-CI PASS on 025a50b (§7 round 5).
 - Type / ID / attempt: none.
-- Next action: G-CI round 5 — push, watch every workflow on the new HEAD until green, then mark COMPLETE and report.
-- Next eligible plan unit: none (all phases DONE; G-CI round 5 pending).
+- Next action: none (plan complete; final report to the user).
+- Next eligible plan unit: none.
 - Unit base: f7b0745; branch: dev.
 - Repo state: plan commits on dev after f7b0745 (latest: P2, matched by `PEV-Unit: P2`).
 
@@ -67,7 +67,7 @@ Read this first in every session. Updated 2026-10-02 by claude-opus-5-5.
 | G-PHASE | P0–P3 | `cargo test` + `cargo test --features vpn` + `cargo test --features ssh-gateway` | 0 failed |
 | G-NETNS-OUT | 4.1 | `sudo -n $PWD/scripts/outage_netns_test.sh` | FAIL: 0; red on baseline |
 | G-NETNS-REG | 4.2 | the `local_proxy_netns_test`, `secret_netns_test`, `vhost_netns_test`, `vpn_netns_test` and `ssh_gateway_test` harnesses, serially via `sudo -n $PWD/scripts/<x>.sh` | FAIL: 0 (or proven pre-existing) |
-| G-CI | final | `git push origin dev`, then `gh run list --branch dev` / `gh run watch` | all workflows success — PASS on da621a1 (§7) |
+| G-CI | final | `git push origin dev`, then `gh run list --branch dev` / `gh run watch` | all workflows success — PASS on 025a50b (§7 round 5) |
 
 ## 4. Work ledger
 
@@ -103,6 +103,7 @@ None.
 | G-U12 (1.3) | `cargo test --test outage_liveness_test` | PASS | 10 passed (5 new client-side) | 1.3 diff | 2026-10-02 |
 | full `cargo test` (1.3) | `cargo test` | PASS (env-only red) | 1095 pass; only `vhost_entry_redirect_overrides_both` (port 19000 foreign pid 3179752, §9) | 1.3 diff | 2026-10-02 |
 | G-PHASE P3 (G-P3) | main tree at 91243d6 (uncommitted: only the 4.1/4.2 harness + workflow, not compiled): fmt; clippy default, `vpn,ssh-gateway`, all-features; all-features `--no-fail-fast` lib/bins/examples/tests (skip `t_ssh_`/`t_dmx_`); doc; ssh serial; web serial; no-default `transfer_link_test`; `cargo test --features ssh-gateway --no-fail-fast`; root `npm test`; `web/transfer` `npm run test:unit` | PASS (env-only red) | all-features 1415 passed, 1 failed = `vhost_entry_redirect_overrides_both` (port 19000, §9); doc 1/0; ssh serial 48/0; web serial 41/0; no-default 22/0; `--features ssh-gateway` 1294 passed, the same 1 env-only failure; npm 125/0; web unit 227/0; fmt + 3 clippy clean. (A first run was void: the root filesystem that holds /tmp hit ENOSPC mid-run (what filled it was not identified; ~36 GB of /tmp belongs to other projects' sessions) and every log came back empty; rerun after freeing this plan's own 14 GB isolated target) | HEAD 91243d6 | 2026-10-02 |
+| G-CI round 5 | push 025a50b; `gh run list --commit 025a50b` | PASS | all 5 workflows success (CI, E2E (netns), Docker (GHCR), Mean Bean CI, Mean Bean Deploy; Docker SSH client path-filtered, not triggered). `Web transfer e2e` chromium/firefox/webkit all success with rev 1o. CI's only red on the first attempt was `Fast link` `T-FL-PERF` median ratio 0.985 (raw vhost 796.4/794.7/619.0, fast 782.4/1190.9/653.9) — NOT this plan: `src/fast_link/` untouched, and the only plan-005 change on either arm's path (the mux `ConnActivity` stamp) sits on the VHOST arm, which could only RAISE the ratio. Distribution over 11 CI runs: pre-plan 1.003, 1.100, 1.232, 1.235, 1.519, 1.672; post-plan 0.990, 0.985, 1.056, 1.319, 1.704 — a gate whose expected value sits ~0.2 above its threshold with run-to-run spread >0.7 (both arms pay the same four TLS passes on a 4-vCPU runner). Re-run of the failed job (gh `rerun --failed`): ratio 1.182 PASS, T-FL-E 13/13, T-FL-TRANSIT PASS. Gate left unchanged (plan 004's; out of scope) — follow-up recorded in §9 | 025a50b | 2026-10-02 |
 | G-CI round 4 | push 7a6d7d6; `gh run list --branch dev` | 1 red | E2E (netns), Docker (GHCR), Mean Bean CI (macos aarch64 included: rev 1n's gate green), Mean Bean Deploy success; CI red on `Web transfer e2e (chromium)`: `download.spec.mjs:144` (connecting cancel) 54/1, the source page logged `WebSocket is already in CLOSING or CLOSED state.` x45 — a real client defect, rev 1o. Same job green in the 40 CI runs before it (rare race). aa720f0's `Web transfer e2e (webkit)` red was `T-WEB-DIRECT-DIAG` (`sample.pair` undefined): pre-existing WebKit flake family (d7f7839 `T-WEB-FOLDER-OFFER`, daeecaa `T-WEB-MULTIPEER-FINAL`, both before this plan), webrtc untouched by plan 005. Fix verified locally: web unit 228/0, chromium e2e (CI command, `--workers=1`) 57 passed / 1 skipped / 0 failed | 7a6d7d6 | 2026-10-02 |
 | G-CI round 3 | push aa720f0 (STATE only); `gh run list --branch dev` | 1 red | Mean Bean CI macos (stable, aarch64-apple-darwin): web_transfer_test 38/2 — this plan's 3.4 gate + pre-existing `t_web_fairness` (control-rtt worst 3917 ms: runner freeze). Fixed by rev 1n. Docker (GHCR) + Mean Bean Deploy success | aa720f0 | 2026-10-02 |
 | G-CI round 2 | push da621a1; `gh run list --branch dev` | PASS | all 5 workflows success (CI, E2E (netns), Docker (GHCR), Mean Bean CI, Mean Bean Deploy; Docker SSH client is path-filtered and not triggered — it was green on ac1beed). macos-14: `a_browser_that_stops_answering_pings_leaves_on_the_transport_deadline ... ok`, web_transfer_test 40 passed / 1 ignored; Fast link `T-FL-PERF` median ratio 1.056 PASS; ac1beed's Windows job also success | da621a1 | 2026-10-02 |
@@ -146,7 +147,7 @@ None.
 
 ## 9. Blockers
 
-None. Environment note: ports 19000/19001 are held by a foreign node process on this workstation, so `vhost_entry_redirect_overrides_both` cannot pass locally; CI is its oracle.
+None. Follow-up outside this plan's scope (not a blocker): plan 004's `T-FL-PERF` gate (`scripts/fast_link_perf.sh`, fast >= 1.0x vhost on 3 interleaved samples) is noise-limited on the CI runner class — 3 of 11 recent runs read 0.985-1.003 with `src/fast_link/` unchanged (§7 round 5); it needs more samples or a margin derived from its measured spread before it can gate without re-runs. Environment note: ports 19000/19001 are held by a foreign node process on this workstation, so `vhost_entry_redirect_overrides_both` cannot pass locally; CI is its oracle.
 
 ## 10. Do-not-repeat
 

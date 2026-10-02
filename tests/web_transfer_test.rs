@@ -7777,7 +7777,11 @@ async fn a_browser_that_stops_answering_pings_leaves_on_the_transport_deadline()
     let registry = server.web_transfer().expect("registry enabled");
     tokio::spawn(server.listen());
     support::wait_port(port, true).await;
-    let transport = Duration::from_millis(1500);
+    // The Ping period is the fixed 1 s, so a reading peer's last frame is up
+    // to ~1 s old when the 500 ms reaper looks. 3 s leaves 2 s for a slow
+    // runner's late Ping; at 1.5 s the 0.5 s margin reaped a healthy A on
+    // macos-14. Still far below the legacy 60 s the red-check tells apart.
+    let transport = Duration::from_secs(3);
     registry.set_peer_transport_timeout(transport);
     let member = MemberToken::from_bytes([0x91u8; 32]);
     let owner = OwnerToken::from_bytes([0x92u8; 32]);
@@ -7803,7 +7807,24 @@ async fn a_browser_that_stops_answering_pings_leaves_on_the_transport_deadline()
 
     // B proves it answers Pings, then stops reading: its socket stays open, so
     // nothing but the transport deadline can tell the server it is gone.
-    b.answer_one_ping_then_go_silent(wait).await?;
+    //
+    // A must keep reading while B waits for its first Ping (one full period):
+    // the client library answers a Ping only while its stream is polled, and A
+    // may already have answered one on a slow runner, so an idle A is held to
+    // the transport deadline and can be reaped itself. `next_text` is
+    // cancel-safe (`Stream::next` keeps partial frames), so dropping A's read
+    // when B is done loses no frame; any text A receives here is a failure,
+    // because nothing can have left yet.
+    {
+        let silent = b.answer_one_ping_then_go_silent(wait);
+        tokio::pin!(silent);
+        tokio::select! {
+            r = &mut silent => r?,
+            early = a.next_text(wait) => {
+                anyhow::bail!("A received {early:?} before B went silent");
+            }
+        }
+    }
     let silent_at = tokio::time::Instant::now();
     let (typ, body) = control_msg(&a.next_text(Duration::from_secs(10)).await?.expect("left B"));
     let took = silent_at.elapsed();

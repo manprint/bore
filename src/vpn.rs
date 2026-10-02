@@ -2155,6 +2155,11 @@ async fn direct_diag(
 /// gone): the link is torn down loudly. The bridge finishing (error or upgrade
 /// channel logic) aborts the actor; the caller's RAII guards then revert host
 /// state.
+///
+/// On control loss the bridge is STOPPED AND AWAITED, never merely dropped:
+/// its pumps hold the TUN descriptors, and the reconnect that follows creates
+/// the next interface as soon as this returns. A dropped bridge left the old
+/// `boreN` up with the same address as the new one (O-1).
 #[allow(clippy::too_many_arguments)]
 async fn run_bridge_with_ctrl(
     link_id: &str,
@@ -2168,18 +2173,32 @@ async fn run_bridge_with_ctrl(
     upgrade_rx: tokio::sync::mpsc::Receiver<(link::LinkSender, link::LinkRecver)>,
     downgrade_tx: tokio::sync::mpsc::Sender<()>,
 ) -> Result<()> {
-    let result = tokio::select! {
-        res = bridge::run(devs, sender, recver, counters, mtu, offload, upgrade_rx, downgrade_tx) => {
+    let stop = tokio_util::sync::CancellationToken::new();
+    let bridge = bridge::run(
+        devs,
+        sender,
+        recver,
+        counters,
+        mtu,
+        offload,
+        upgrade_rx,
+        downgrade_tx,
+        stop.clone(),
+    );
+    tokio::pin!(bridge);
+    tokio::select! {
+        res = &mut bridge => {
             ctrl_task.abort();
             res
         }
         res = &mut ctrl_task => {
             let err = res.unwrap_or_else(|e| anyhow!("vpn control task panicked: {e}"));
             error!(link_id = %link_id, error = %err, "vpn control connection lost; closing link");
+            stop.cancel();
+            let _ = bridge.await;
             Err(err)
         }
-    };
-    result
+    }
 }
 
 /// Start a VPN connector (reconnect loop around [`run_connect_once`]).
@@ -9425,6 +9444,41 @@ pub mod bridge {
         }
     }
 
+    /// Aborts every pump the bridge spawned when it is dropped (O-1).
+    ///
+    /// Each pump owns an `Arc<TunDevice>`, and a TUN interface only disappears
+    /// when its LAST descriptor closes. Dropping a future does NOT abort the
+    /// tasks it spawned, so a bridge future dropped mid-flight (the control
+    /// connection died first and a `select!` discarded the bridge) used to
+    /// leave its pumps running with the old `boreN` alive: the reconnect then
+    /// created `boreN+1` with the SAME address and the two links fought over
+    /// the route. The orderly path still aborts AND awaits every pump in
+    /// `run`'s tail; this guard is what makes an unorderly drop release them.
+    #[derive(Default)]
+    struct PumpGuard(Vec<tokio::task::AbortHandle>);
+
+    impl PumpGuard {
+        /// Track a freshly spawned pump. Finished pumps are pruned first so a
+        /// link that switches path many times keeps the list bounded.
+        fn track<T>(&mut self, handle: &tokio::task::JoinHandle<T>) {
+            self.0.retain(|h| !h.is_finished());
+            self.0.push(handle.abort_handle());
+        }
+
+        #[cfg(test)]
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    impl Drop for PumpGuard {
+        fn drop(&mut self) {
+            for h in &self.0 {
+                h.abort();
+            }
+        }
+    }
+
     /// Run the VPN data-plane bridge until the link dies or the tun closes.
     ///
     /// Spawns one uplink pump per TUN queue (the kernel hashes flows across
@@ -9442,6 +9496,12 @@ pub mod bridge {
     /// substreams. Relay-only callers pass a channel whose sender is already
     /// dropped: the first `recv()` yields `None` and the upgrade arm is
     /// disabled for good.
+    ///
+    /// `stop`: cancelling it ends the bridge through the SAME tail as a link
+    /// death — every pump aborted and awaited, so every TUN descriptor this
+    /// bridge holds is closed by the time `run` returns. The caller cancels it
+    /// when the control connection dies and then AWAITS `run`, so the
+    /// reconnect never creates a second interface beside a still-open one.
     #[allow(clippy::too_many_arguments)]
     pub async fn run(
         devs: Vec<Arc<TunDevice>>,
@@ -9452,9 +9512,11 @@ pub mod bridge {
         offload: bool,
         mut upgrade_rx: tokio::sync::mpsc::Receiver<(LinkSender, LinkRecver)>,
         downgrade_tx: tokio::sync::mpsc::Sender<()>,
+        stop: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         assert!(!devs.is_empty(), "bridge needs at least one TUN queue");
-        let stats_task = tokio::spawn({
+        let mut guard = PumpGuard::default();
+        let mut stats_task = tokio::spawn({
             let c = Arc::clone(&counters);
             async move {
                 let start = tokio::time::Instant::now();
@@ -9482,6 +9544,7 @@ pub mod bridge {
                 }
             }
         });
+        guard.track(&stats_task);
 
         /// Spawn uplinks only (not downlinks); first to die wins.
         fn spawn_uplinks(
@@ -9554,16 +9617,24 @@ pub mod bridge {
         // single active uplink set is switched between relay and direct.
         let relay_sender = sender.clone();
         let mut relay_dl = spawn_relay_downlink(&devs, recver, &counters, offload);
+        guard.track(&relay_dl);
         // Once the relay downlink has died we must stop selecting on it: re-polling a
         // finished `JoinHandle` panics. `relay_dead` both disables its branch and feeds the
         // `relay_alive` argument of `bridge_next_action`.
         let mut relay_dead = false;
         let mut direct_dl: Option<tokio::task::JoinHandle<Result<()>>> = None;
         let mut uplinks = spawn_uplinks(&devs, relay_sender.clone(), &counters, mtu, offload);
+        uplinks.iter().for_each(|h| guard.track(h));
         let mut mode = BridgeMode::Relay;
 
         let result: Result<()> = 'outer: loop {
             tokio::select! {
+                // The caller is tearing the link down (control connection lost):
+                // leave through the tail below so every pump is awaited.
+                _ = stop.cancelled() => {
+                    abort_await!(uplinks);
+                    break 'outer Ok(());
+                }
                 // Relay downlink — disabled once dead (no re-poll of a finished handle).
                 res = &mut relay_dl, if !relay_dead => {
                     let outcome = res.unwrap_or_else(|e| Err(anyhow::anyhow!("relay downlink panic: {e}")));
@@ -9588,6 +9659,7 @@ pub mod bridge {
                             let _ = downgrade_tx.try_send(());
                             abort_await!(uplinks);
                             uplinks = spawn_uplinks(&devs, relay_sender.clone(), &counters, mtu, offload);
+                            uplinks.iter().for_each(|h| guard.track(h));
                             mode = BridgeMode::Relay;
                             tracing::warn!(path = "relay", "direct path lost; fell back to relay (link preserved)");
                         }
@@ -9611,6 +9683,7 @@ pub mod bridge {
                                 d.abort();
                             }
                             uplinks = spawn_uplinks(&devs, relay_sender.clone(), &counters, mtu, offload);
+                            uplinks.iter().for_each(|h| guard.track(h));
                             mode = BridgeMode::Relay;
                             tracing::warn!(path = "relay", "direct path lost; fell back to relay (link preserved)");
                         }
@@ -9629,7 +9702,10 @@ pub mod bridge {
                             abort_await!(uplinks);
                             let (direct_sender, direct_recver) = pair;
                             uplinks = spawn_uplinks(&devs, direct_sender, &counters, mtu, offload);
-                            direct_dl = Some(spawn_direct_downlink(&devs, direct_recver, &counters, offload));
+                            uplinks.iter().for_each(|h| guard.track(h));
+                            let dl = spawn_direct_downlink(&devs, direct_recver, &counters, offload);
+                            guard.track(&dl);
+                            direct_dl = Some(dl);
                             mode = BridgeMode::Direct;
                             tracing::info!(path = "direct", "bridge switched to direct path");
                         }
@@ -9641,12 +9717,22 @@ pub mod bridge {
             }
         };
 
+        // Abort AND await: an aborted pump drops its `Arc<TunDevice>` only when
+        // the runtime next polls it, and the caller may create the next TUN the
+        // moment `run` returns. A handle already polled to completion (the one
+        // whose death ended the loop) must not be awaited again.
         stats_task.abort();
+        let _ = (&mut stats_task).await;
         relay_dl.abort();
-        if let Some(d) = direct_dl.take() {
+        if !relay_dead && !relay_dl.is_finished() {
+            let _ = (&mut relay_dl).await;
+        }
+        if let Some(mut d) = direct_dl.take() {
             d.abort();
+            let _ = (&mut d).await;
         }
         abort_await!(uplinks);
+        drop(guard);
         result
     }
 
@@ -9847,7 +9933,58 @@ pub mod bridge {
 
     #[cfg(test)]
     mod tests {
+        use std::sync::Arc;
         use std::time::Duration;
+
+        /// O-1 — dropping the guard aborts every tracked pump, which releases
+        /// what the pump owns. In production that is the `Arc<TunDevice>` that
+        /// keeps `boreN` up; a bridge future dropped without this guard left
+        /// the old interface alive beside the reconnect's new one.
+        #[tokio::test]
+        async fn pump_guard_aborts_tracked_pumps_on_drop() {
+            let held = Arc::new(());
+            let mut guard = super::PumpGuard::default();
+            for _ in 0..3 {
+                let h = Arc::clone(&held);
+                let pump = tokio::spawn(async move {
+                    let _h = h;
+                    std::future::pending::<()>().await
+                });
+                guard.track(&pump);
+            }
+            tokio::task::yield_now().await;
+            assert_eq!(Arc::strong_count(&held), 4);
+            drop(guard);
+            for _ in 0..100 {
+                if Arc::strong_count(&held) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                Arc::strong_count(&held),
+                1,
+                "a dropped guard must abort every pump it tracks"
+            );
+        }
+
+        /// O-1 — a link that switches path many times respawns its uplinks each
+        /// time; finished pumps are pruned so the guard stays bounded.
+        #[tokio::test]
+        async fn pump_guard_prunes_finished_pumps() {
+            let mut guard = super::PumpGuard::default();
+            for _ in 0..50 {
+                let mut done = tokio::spawn(async {});
+                let _ = (&mut done).await;
+                guard.track(&done);
+            }
+            assert_eq!(guard.len(), 1, "finished pumps must be pruned on track");
+            let live: Vec<_> = (0..2)
+                .map(|_| tokio::spawn(std::future::pending::<()>()))
+                .collect();
+            live.iter().for_each(|h| guard.track(h));
+            assert_eq!(guard.len(), 2, "live pumps are kept, finished ones pruned");
+        }
 
         /// D1 — truth table for the one-shot persistent-drops warning.
         #[test]
@@ -10746,8 +10883,13 @@ pub mod hub {
     }
 
     /// Live peer entry: (downlink_task, peer_handle, punch_tx for direct upgrade).
+    ///
+    /// The downlink is held in an [`AbortOnDrop`]: it owns an `Arc<TunDevice>`,
+    /// and when the hub link dies the coordinator is aborted and this map is
+    /// dropped with it. A bare `JoinHandle` here left every peer's downlink
+    /// running — and the hub's `boreN` open — after the link was gone (O-1).
     type LivePeerEntry = (
-        tokio::task::JoinHandle<()>,
+        AbortOnDrop<()>,
         Arc<PeerHandle>,
         tokio::sync::mpsc::Sender<HubEvent>,
     );
@@ -11095,7 +11237,7 @@ pub mod hub {
                             if let Some((dl_task, peer, _punch_tx)) = live_peers.remove(&peer_id) {
                                 peer_table.remove(&peer.overlay);
                                 peer.shutdown.notify_waiters();
-                                dl_task.abort();
+                                drop(dl_task);
                             }
                             pending.remove(&peer_id);
                         }
@@ -11260,7 +11402,7 @@ pub mod hub {
             });
         }
 
-        live_peers.insert(peer_id, (dl_task, peer, punch_tx));
+        live_peers.insert(peer_id, (AbortOnDrop(dl_task), peer, punch_tx));
         pending.remove(&peer_id);
         info!(%peer_id, %overlay, %carriers, "hub peer link built");
     }
@@ -11843,7 +11985,7 @@ pub mod hub {
         let secret = args.secret.clone();
         let counters_clone = Arc::clone(&counters);
         let table_clone = Arc::clone(&peer_table);
-        let _coordinator_guard = AbortOnDrop(tokio::spawn(run_hub_coordinator(
+        let mut coordinator = AbortOnDrop(tokio::spawn(run_hub_coordinator(
             devs_clone,
             secret,
             counters_clone,
@@ -11881,11 +12023,22 @@ pub mod hub {
             }
         };
 
-        // Abort the surviving router uplinks; the accept/coordinator guards abort
-        // on scope exit. (The already-finished task in each arm is a no-op abort.)
+        // Abort AND await the surviving router uplinks and the coordinator: they
+        // own the TUN (the coordinator through every peer's downlink, which its
+        // `live_peers` map aborts as it drops), and the reconnect creates the
+        // next interface as soon as this returns (O-1). The router task whose
+        // death ended the `select!` was polled to completion and is skipped; the
+        // accept task holds no TUN and its guard aborts it on scope exit.
         for t in &router_tasks {
             t.abort();
         }
+        for t in &mut router_tasks {
+            if !t.is_finished() {
+                let _ = t.await;
+            }
+        }
+        coordinator.0.abort();
+        let _ = (&mut coordinator.0).await;
         result
     }
 

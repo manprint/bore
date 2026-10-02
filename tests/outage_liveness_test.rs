@@ -79,6 +79,12 @@ struct ProxiedConn {
     blackholed: AtomicBool,
 }
 
+impl ProxiedConn {
+    fn set_blackhole(&self, on: bool) {
+        self.blackholed.store(on, Ordering::SeqCst);
+    }
+}
+
 /// A TCP forwarder `client <-> proxy <-> upstream` that can be blackholed:
 /// while blackholed it forwards nothing in either direction and closes
 /// nothing, so both endpoints see a live socket that has gone silent. Bytes
@@ -742,5 +748,332 @@ async fn client_terminates_carrier_connections_on_trip() -> Result<()> {
         closed.is_some(),
         "the client left a carrier connection open after its main one tripped"
     );
+    Ok(())
+}
+
+// ─── Secret consumer (1.4) ───────────────────────────────────────────────────
+
+/// One request through a consumer's local port, answered by the echo service
+/// behind the provider.
+async fn consumer_request(local: SocketAddr) -> Option<Vec<u8>> {
+    let mut conn = TcpStream::connect(local).await.ok()?;
+    let mut reply = Vec::new();
+    time::timeout(Duration::from_secs(2), conn.read_to_end(&mut reply))
+        .await
+        .ok()?
+        .ok()?;
+    (reply == b"alive").then_some(reply)
+}
+
+/// The consumer (`bore proxy`) on the relay path notices the dead path too.
+///
+/// RED-CHECK: without the liveness arm in `Proxy::listen` this times out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn secret_consumer_returns_when_the_server_goes_silent() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let _env = LivenessEnv::set(200, 1500);
+    const CONTROL: u16 = 18701;
+    spawn_server(CONTROL, 18702..=18702, SERVER_NEVER_REAPS, None).await?;
+    let proxy = BlackholeProxy::start(control_addr(CONTROL)).await?;
+    let local = echo_service().await?;
+
+    let provider = secret_provider(&format!("127.0.0.1:{CONTROL}"), local, "db").await?;
+    tokio::spawn(provider.listen());
+    let consumer = secret_consumer(&proxy.to(), "db").await?;
+    assert_listen_trips(&proxy, consumer.listen(), Duration::from_millis(1500)).await;
+    Ok(())
+}
+
+/// A trip takes the consumer's relay carriers down with its main connection.
+///
+/// RED-CHECK: without `terminate_all` (and with the per-carrier watch below
+/// disabled) a carrier connection stays open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn secret_consumer_terminates_its_carriers_on_trip() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let _env = LivenessEnv::set(200, 1500);
+    const CONTROL: u16 = 18711;
+    spawn_server(CONTROL, 18712..=18712, SERVER_NEVER_REAPS, None).await?;
+    let proxy = BlackholeProxy::start(control_addr(CONTROL)).await?;
+    let local = echo_service().await?;
+
+    let provider = secret_provider(&format!("127.0.0.1:{CONTROL}"), local, "db").await?;
+    tokio::spawn(provider.listen());
+    let consumer = secret_consumer_with_carriers(&proxy.to(), "db", 2).await?;
+    assert_eq!(
+        proxy.conns().len(),
+        2,
+        "main + one carrier through the proxy"
+    );
+    assert_listen_trips(&proxy, consumer.listen(), Duration::from_millis(1500)).await;
+
+    time::sleep(Duration::from_millis(300)).await;
+    proxy.set_blackhole(false);
+    let closed = eventually(Duration::from_secs(3), || async {
+        proxy
+            .conns()
+            .iter()
+            .all(|c| c.client_closed.load(Ordering::SeqCst))
+            .then_some(())
+    })
+    .await;
+    assert!(
+        closed.is_some(),
+        "the consumer left a carrier connection open after its main one tripped"
+    );
+    Ok(())
+}
+
+/// A carrier whose OWN path dies while the main connection stays healthy
+/// leaves the pool, so connections are not routed into it. Every consumer
+/// carrier is heartbeated by the server, so each one can tell.
+///
+/// RED-CHECK: without the per-carrier watch, requests routed to the dead
+/// carrier hang and the carrier is never closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn secret_consumer_drops_a_silent_carrier_and_keeps_serving() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let _env = LivenessEnv::set(200, 1500);
+    const CONTROL: u16 = 18721;
+    spawn_server(CONTROL, 18722..=18722, SERVER_NEVER_REAPS, None).await?;
+    let proxy = BlackholeProxy::start(control_addr(CONTROL)).await?;
+    let local = echo_service().await?;
+
+    let provider = secret_provider(&format!("127.0.0.1:{CONTROL}"), local, "db").await?;
+    tokio::spawn(provider.listen());
+    let consumer = secret_consumer_with_carriers(&proxy.to(), "db", 2).await?;
+    let bound = consumer.local_addr()?;
+    let conns = proxy.conns();
+    assert_eq!(conns.len(), 2, "main + one carrier through the proxy");
+    let task = tokio::spawn(consumer.listen());
+
+    // Kill the carrier's path only, and wait past its deadline.
+    conns[1].set_blackhole(true);
+    time::sleep(Duration::from_millis(1500 + 1500)).await;
+    for i in 0..4 {
+        assert!(
+            consumer_request(bound).await.is_some(),
+            "request {i} was routed into the dead carrier"
+        );
+    }
+    assert!(!task.is_finished(), "the healthy main connection tripped");
+
+    conns[1].set_blackhole(false);
+    let closed = eventually(Duration::from_secs(3), || async {
+        conns[1].client_closed.load(Ordering::SeqCst).then_some(())
+    })
+    .await;
+    assert!(closed.is_some(), "the silent carrier was never dropped");
+    assert!(
+        !conns[0].client_closed.load(Ordering::SeqCst),
+        "the main connection must stay up"
+    );
+    Ok(())
+}
+
+/// The consumer's heartbeats (now written through the bounded `beat_once`)
+/// still reach the server: with the legacy control-message reaper lowered to
+/// 1 s, a consumer that beats every 200 ms keeps its admin row.
+///
+/// RED-CHECK: a consumer that does not beat is reaped inside the window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn secret_consumer_heartbeats_reach_the_server() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let _env = LivenessEnv::set(200, 0);
+    const CONTROL: u16 = 18731;
+    wait_port(CONTROL, false).await;
+    let mut server = Server::new(18732..=18732, None).secret_ctrl_timeout(Duration::from_secs(1));
+    server.set_control_port(CONTROL);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    let admin = server.admin_registry();
+    tokio::spawn(server.listen());
+    wait_port(CONTROL, true).await;
+    let local = echo_service().await?;
+
+    let provider = secret_provider(&format!("127.0.0.1:{CONTROL}"), local, "db").await?;
+    tokio::spawn(provider.listen());
+    let consumer = secret_consumer(&format!("127.0.0.1:{CONTROL}"), "db").await?;
+    let task = tokio::spawn(consumer.listen());
+    time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        count_role(&admin, Role::SecretConsumer),
+        1,
+        "a beating consumer was reaped: its heartbeats do not reach the server"
+    );
+    assert!(!task.is_finished());
+    Ok(())
+}
+
+/// A consumer on the DIRECT path keeps serving through a server outage. The
+/// direct path runs consumer<->provider and does not need the server, so
+/// tripping on server silence there would turn a server outage into a tunnel
+/// outage that did not exist before. The consumer reconnects only when the
+/// direct path itself closes.
+///
+/// RED-CHECK: tripping regardless of the path ends `listen` and closes the
+/// consumer's local port.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn secret_consumer_on_direct_survives_a_server_outage() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let _env = LivenessEnv::set(200, 1500);
+    const CONTROL: u16 = 18741;
+    wait_port(CONTROL, false).await;
+    let mut server = Server::new(18742..=18742, None).transport_reap_floor(SERVER_NEVER_REAPS);
+    server.set_control_port(CONTROL);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_udp(true);
+    tokio::spawn(server.listen());
+    wait_port(CONTROL, true).await;
+    let stun = format!("127.0.0.1:{CONTROL}");
+    let proxy = BlackholeProxy::start(control_addr(CONTROL)).await?;
+    let local = echo_service().await?;
+
+    let provider = Client::new_secret_provider(
+        "127.0.0.1",
+        local,
+        &format!("127.0.0.1:{CONTROL}"),
+        "p2p",
+        None,
+        false,
+        true,
+        Some(&stun),
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
+        0,
+        0,
+        64,
+        1,
+        ProviderMeta::default(),
+        None,
+    )
+    .await?;
+    tokio::spawn(provider.listen());
+    time::sleep(Duration::from_millis(300)).await;
+
+    let consumer = Proxy::new(
+        &proxy.to(),
+        "127.0.0.1:0".parse()?,
+        "p2p",
+        None,
+        false,
+        true,
+        Some(&stun),
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
+        0,
+        0,
+        1,
+        None,
+        false,
+    )
+    .await?;
+    assert!(
+        consumer.is_direct(),
+        "the consumer must negotiate the direct path"
+    );
+    let bound = consumer.local_addr()?;
+    let task = tokio::spawn(consumer.listen());
+    assert!(
+        consumer_request(bound).await.is_some(),
+        "healthy direct path serves"
+    );
+
+    // The server becomes unreachable for the consumer only.
+    proxy.set_blackhole(true);
+    time::sleep(Duration::from_millis(1500 + 1500)).await;
+    assert!(
+        !task.is_finished(),
+        "a server outage tore down a working direct path: {:?}",
+        task.await
+    );
+    for i in 0..3 {
+        assert!(
+            consumer_request(bound).await.is_some(),
+            "request {i} failed although the direct path is alive"
+        );
+    }
+    Ok(())
+}
+
+/// The provider's half of the same rule. A provider that loses the server
+/// trips and reconnects (it must, to be found by NEW consumers), but the
+/// direct path it already serves is not tied to its control connection, so a
+/// consumer already on it keeps being served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn secret_provider_trip_keeps_its_live_direct_path() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let _env = LivenessEnv::set(200, 1500);
+    const CONTROL: u16 = 18751;
+    wait_port(CONTROL, false).await;
+    let mut server = Server::new(18752..=18752, None).transport_reap_floor(SERVER_NEVER_REAPS);
+    server.set_control_port(CONTROL);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_udp(true);
+    tokio::spawn(server.listen());
+    wait_port(CONTROL, true).await;
+    let stun = format!("127.0.0.1:{CONTROL}");
+    let proxy = BlackholeProxy::start(control_addr(CONTROL)).await?;
+    let local = echo_service().await?;
+
+    let provider = Client::new_secret_provider(
+        "127.0.0.1",
+        local,
+        &proxy.to(),
+        "p2p",
+        None,
+        false,
+        true,
+        Some(&stun),
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
+        0,
+        0,
+        64,
+        1,
+        ProviderMeta::default(),
+        None,
+    )
+    .await?;
+    let provider_task = tokio::spawn(provider.listen());
+    time::sleep(Duration::from_millis(300)).await;
+
+    let consumer = Proxy::new(
+        &format!("127.0.0.1:{CONTROL}"),
+        "127.0.0.1:0".parse()?,
+        "p2p",
+        None,
+        false,
+        true,
+        Some(&stun),
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
+        0,
+        0,
+        1,
+        None,
+        false,
+    )
+    .await?;
+    assert!(
+        consumer.is_direct(),
+        "the consumer must negotiate the direct path"
+    );
+    let bound = consumer.local_addr()?;
+    tokio::spawn(consumer.listen());
+    assert!(
+        consumer_request(bound).await.is_some(),
+        "healthy direct path serves"
+    );
+
+    proxy.set_blackhole(true);
+    let joined = time::timeout(Duration::from_secs(6), provider_task)
+        .await
+        .expect("the provider never noticed the dead path");
+    assert!(
+        joined.expect("provider panicked").is_err(),
+        "the provider must report the lost connection"
+    );
+    for i in 0..3 {
+        assert!(
+            consumer_request(bound).await.is_some(),
+            "request {i} failed: the provider's trip took its live direct path down"
+        );
+    }
     Ok(())
 }

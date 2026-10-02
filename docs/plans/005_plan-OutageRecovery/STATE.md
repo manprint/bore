@@ -26,10 +26,10 @@ Read this first in every session. Updated 2026-10-02 by claude-opus-5-5.
 - Active scope: plan (all phases) — user: "implementa il piano, testa tutto, committa su Dev e segui la ci".
 - Scope result: RUNNING.
 - Type / ID / attempt: none.
-- Next action: open 1.4 (secret Proxy deadline + beat_once).
-- Next eligible plan unit: 1.4.
+- Next action: open 1.5 (public sticky port).
+- Next eligible plan unit: 1.5.
 - Unit base: f7b0745; branch: dev.
-- Repo state: HEAD f7b0745 plus the untracked plan folder.
+- Repo state: plan commits on dev after f7b0745 (latest: the 1.4 commit, matched by `PEV-Unit: 1.4`).
 
 ## 2. Feature context and readiness
 
@@ -104,6 +104,7 @@ None.
 
 | Revision | Previous decision/step | Approved replacement and reason | Supervisor | Dependents/revalidation |
 |----------|------------------------|---------------------------------|------------|------------------------|
+| 1d | 1.4: `Proxy::listen` trips on server silence unconditionally (D2) | Three availability refinements found while testing, all within the requirement "a server outage must not cost more than it must": (a) **consumer on DIRECT does not trip** — the direct path runs consumer↔provider without the server, so a server outage must not end a working tunnel; it warns once and reconnects when the direct path itself closes (already an existing arm). In the field case (IP change) the direct path dies within the QUIC idle timeout (10 s) and the trip follows, so detection is unchanged. (b) **provider lingers its direct path on a TRIP** — `provider_direct` used to close the QUIC listener when the control connection went away (correct for a clean exit: consumers re-negotiate at once). On a trip (server LOST, not left) it now keeps serving the consumers already on it until their connections end (`UdpProviderCfg.linger_direct`, live counter + `LiveGuard`), while the reconnected provider registers afresh for new consumers. Deferring the provider's trip instead was rejected: it would hide the provider from NEW consumers for as long as an old direct session lasted. (c) **per-carrier watch for consumer relay carriers** — the server heartbeats every consumer carrier, so each carrier's drain task checks its own silence and leaves the pool (connections routed to a dead carrier would otherwise hang); public/vhost carriers have no server beat (`serve_carrier` only reads), so they rely on the main trip. VPN (2.4) must apply rule (a) to its 1:1 direct path. | claude-opus-5-5 | 2.4: direct-alive VPN link must not be torn down by server silence; 1.6 README documents (a)/(b) |
 | 1c | 1.3 S3: carrier activities in a local `Vec` | `liveness::ConnActivities` (track/forget/terminate_all) shared with 1.4 and 2.x, plus `mux::ConnActivity::same_connection`. Each carrier pump tracks on start and forgets on exit, so the set never holds a finished carrier and stays bounded across re-dials; only a trip terminates (clean exits keep the graceful close and in-flight streams). The flick test (I-3) uses 2.5 s of a 4 s deadline: a 1 s flick of 3 s let a `deadline/4` mutation pass by tick-phase luck. | claude-opus-5-5 | 1.4 uses ConnActivities |
 | 1b | D3: `CTRL_CLIENT_HEARTBEAT` 5 s | **2 s**. Reason (arithmetic, pinned by `server_deadline_covers_a_beat_plus_the_retransmit_ladder`): on an idle tunnel the server's silence after a flick = one beat + Linux's RTO ladder (next retransmit 12.6 s after first loss for flicks 6.2–12.6 s at RTO 200 ms); 5 + 12.6 > 15 would let the server reap a client that itself survives; 2 + 12.6 < 15 restores I-3 on the server side. Server deadline formula unchanged (max(3×2 s, 15 s) = 15 s). Cost: one ~15 B frame / 2 s / tunnel. Also added `liveness::TransportReaper` + `reap_if_due` used by every server loop. | claude-opus-5-5 | 3.1 OWNER_HEARTBEAT follows the same reasoning (2 s); docs (1.6/3.3/4.3) quote 2 s |
 | 1a | 0.2 contract: `secret::CTRL_CLIENT_HEARTBEAT` kept as a delegating const | the const became unused (only `ctrl_client_heartbeat()` read it), so it is removed and doc links point at `liveness::CTRL_CLIENT_HEARTBEAT`; `ctrl_client_heartbeat()` keeps its name. Added `liveness::LivenessTicker` (disarmable tick) + `declared_ms_for(Duration)` used by 1.x/2.x/3.x. `CTRL_HEARTBEAT_SEND_TIMEOUT` stays 10 s; its doc no longer claims "≤ heartbeat" (beats are awaited in place, cannot queue). | claude-opus-5-5 | none |
@@ -129,7 +130,7 @@ None. Environment note: ports 19000/19001 are held by a foreign node process on 
 | 1.1 | phase_02.md | P0 | DONE | 1 | G-U11 70/0 (7 new serde tests) |
 | 1.2 | phase_02.md | 1.1 | DONE | 1 | G-U12 5/0; red-check: neutered reap_if_due → 4 FAIL; reap-undeclared → I-5 test FAIL |
 | 1.3 | phase_02.md | 1.1 | DONE | 1 | G-U12 10/0 (5 new); red-checks: liveness arm off → 3 trip tests time out; `terminate_all` off → carrier test FAIL; `deadline/4` → flick test FAIL 3/3 |
-| 1.4 | phase_02.md | 1.1 | TODO | 1 | — |
+| 1.4 | phase_02.md | 1.1 | DONE | 1 | G-U12 16/0 (6 new); red-checks: Proxy liveness arm off → trip test times out; per-carrier watch off → dead-carrier test FAIL; watch + terminate_all off → carrier-close test FAIL; no beats → heartbeat test FAIL; trip-regardless-of-path → direct-survival test FAIL; linger off → provider direct test FAIL; full `cargo test` 1100+ passed, only failure = env `vhost_entry_redirect_overrides_both` (foreign port 19000) |
 | 1.5 | phase_02.md | 1.1 | TODO | 1 | — |
 | 1.6 | phase_02.md | 1.2–1.5 | TODO | 1 | — |
 | 2.1 | phase_03.md | P1 | TODO | 1 | — |
@@ -160,7 +161,7 @@ None. Environment note: ports 19000/19001 are held by a foreign node process on 
 | liveness tables | 0.2 | G-U02 | PASS | 6 tests incl. LivenessTicker |
 | backoff cap | 0.3 | G-U03 | PASS | 8 passed |
 | serde defaults | 1.1/2.1/3.1 | G-U11 | PASS (1.1) | 7 new in shared::tests |
-| outage_liveness_test | 1.2–1.5 | G-U12 | PARTIAL (1.3: 10/0) | server reapers vhost/public/secret provider/consumer + I-5; client trips public/vhost/secret provider, flick survival, carrier termination |
+| outage_liveness_test | 1.2–1.5 | G-U12 | PARTIAL (1.4: 16/0) | server reapers vhost/public/secret provider/consumer + I-5; client trips public/vhost/secret provider, flick survival, carrier termination |
 | vpn liveness/teardown | 2.2–2.4 | G-U2 | TODO | — |
 | owner + sshgw | 3.1/3.2 | G-U3 | TODO | — |
 | T-OUT-* | 4.1 | G-NETNS-OUT | TODO | — |

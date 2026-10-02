@@ -410,6 +410,13 @@ struct UdpProviderCfg {
     permits: Arc<Semaphore>,
     /// Seconds before re-checking if the preferred UDP port was released by NAT.
     nat_udp_release_timeout: Duration,
+    /// Set when this provider LOSES its server connection (a server-silence
+    /// trip, never a clean exit). The direct listener then keeps serving the
+    /// consumers already on it until their connections end, instead of closing
+    /// them together with the control connection: those sessions run
+    /// peer-to-peer, are already authenticated, and do not need the server.
+    /// The reconnected provider registers afresh for NEW consumers.
+    linger_direct: Arc<AtomicBool>,
 }
 
 impl Client {
@@ -761,6 +768,7 @@ impl Client {
             udp_port,
             permits: Arc::new(Semaphore::new(max_conns)),
             nat_udp_release_timeout: Duration::from_secs(nat_udp_release_timeout),
+            linger_direct: Arc::new(AtomicBool::new(false)),
         });
 
         Ok(Client {
@@ -1510,6 +1518,11 @@ impl Client {
                             // hanging, and `--auto-reconnect` takes over.
                             main_activity.terminate();
                             let carriers = carriers.terminate_all();
+                            // Ordered before `punch_tx` drops with this frame.
+                            #[cfg(feature = "udp")]
+                            if let Some(cfg) = &this.udp_cfg {
+                                cfg.linger_direct.store(true, Ordering::SeqCst);
+                            }
                             warn!(
                                 ?idle,
                                 ?deadline,
@@ -2705,6 +2718,9 @@ async fn provider_direct(
         None => crate::holepunch::DirectListener::new(socket, peers, tuning).await?,
     };
     info!("direct udp path ready, accepting connections");
+    // Direct connections currently being served, so a provider that lost its
+    // server can keep them until they end (`linger_direct`).
+    let live = Arc::new(AtomicUsize::new(0));
     loop {
         tokio::select! {
             _ = wait_for_scope_cancel(scope_token.clone()) => {
@@ -2720,7 +2736,9 @@ async fn provider_direct(
                         let owner = Arc::clone(&client);
                         let task_client = Arc::clone(&client);
                         let permits = Arc::clone(&permits);
+                        let live_guard = LiveGuard::new(&live);
                         owner.spawn_task(async move {
+                            let _live = live_guard;
                             let scope_token = task_client.scope.as_ref().map(|scope| scope.token());
                             loop {
                                 let stream = match tokio::select! {
@@ -2779,13 +2797,56 @@ async fn provider_direct(
                     listener.punch_via_endpoint(&peers);
                 }
                 // Control connection gone: close the endpoint gracefully so the
-                // consumer detects the teardown at once, then stop.
+                // consumer detects the teardown at once, then stop. Unless the
+                // server was LOST rather than left: then the consumers already
+                // on this path keep it until their own connections end.
                 None => {
+                    let lost_server = client
+                        .udp_cfg
+                        .as_ref()
+                        .is_some_and(|cfg| cfg.linger_direct.load(Ordering::SeqCst));
+                    if lost_server && live.load(Ordering::SeqCst) > 0 {
+                        info!(
+                            live = live.load(Ordering::SeqCst),
+                            "server connection lost; the direct path keeps serving the \
+                             consumers already on it until they disconnect"
+                        );
+                        while live.load(Ordering::SeqCst) > 0 {
+                            tokio::select! {
+                                _ = wait_for_scope_cancel(scope_token.clone()) => break,
+                                _ = tokio::time::sleep(DIRECT_LINGER_POLL) => {}
+                            }
+                        }
+                        debug!("lingering direct path drained; closing it");
+                    }
                     listener.close();
                     return Ok(());
                 }
             }
         }
+    }
+}
+
+/// How often a lingering direct path checks whether its last consumer left.
+#[cfg(feature = "udp")]
+const DIRECT_LINGER_POLL: Duration = Duration::from_millis(250);
+
+/// Counts one live direct connection for as long as it is held.
+#[cfg(feature = "udp")]
+struct LiveGuard(Arc<AtomicUsize>);
+
+#[cfg(feature = "udp")]
+impl LiveGuard {
+    fn new(live: &Arc<AtomicUsize>) -> Self {
+        live.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(live))
+    }
+}
+
+#[cfg(feature = "udp")]
+impl Drop for LiveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

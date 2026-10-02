@@ -1105,6 +1105,12 @@ impl AsyncWrite for DataStream {
 /// and forwards each accepted connection to the provider through the server.
 pub struct Proxy {
     control: Delimited<mux::Stream>,
+    /// Liveness of the main (control) connection, captured before its opener
+    /// moved into the carrier pool (plan 005, D2).
+    ctrl_activity: mux::ConnActivity,
+    /// Liveness of the extra relay carriers, terminated with the main
+    /// connection on a server-silence trip.
+    carrier_activities: crate::liveness::ConnActivities,
     /// Current data path: the server relay (a carrier pool of one or more
     /// connections) or, after a successful negotiation, the direct UDP path.
     data_path: DataPath,
@@ -1237,6 +1243,8 @@ impl Proxy {
         let endpoint = Endpoint::parse(to);
         let socket = transport::connect(&endpoint, insecure).await?;
         let (opener, _acceptor) = mux::client(socket);
+        let ctrl_activity = opener.activity();
+        let carrier_activities = crate::liveness::ConnActivities::default();
         let mut control = Delimited::with_label(
             opener
                 .open()
@@ -1380,6 +1388,7 @@ impl Proxy {
                     tcp_secret_id,
                     &pool,
                     carriers,
+                    &carrier_activities,
                 )
                 .await
                 {
@@ -1407,6 +1416,8 @@ impl Proxy {
 
         Ok(Proxy {
             control,
+            ctrl_activity,
+            carrier_activities,
             data_path,
             listener,
             direct,
@@ -1454,6 +1465,8 @@ impl Proxy {
     pub async fn listen(self) -> Result<()> {
         let Proxy {
             mut control,
+            ctrl_activity,
+            carrier_activities,
             mut data_path,
             listener,
             mut direct,
@@ -1553,6 +1566,17 @@ impl Proxy {
             t.set_missed_tick_behavior(MissedTickBehavior::Delay);
             t
         };
+        // Mutable for the same reason as in `Client::listen`: a server that
+        // stops READING the control substream makes the heartbeat stand down
+        // instead of wedging the loop (P-9, `beat_once`).
+        let mut sends_ctrl_heartbeat = true;
+        // Server-silence deadline (plan 005, D2): the server heartbeats every
+        // 500 ms, so ANY inbound byte going missing for the deadline means the
+        // path is dead although TCP still says ESTABLISHED.
+        let silence = crate::liveness::client_silence_deadline();
+        let mut liveness_tick = crate::liveness::LivenessTicker::new(silence);
+        // Set while the server is silent but the direct path still serves.
+        let mut silent_on_direct = false;
         loop {
             // Kick off an upgrade attempt on the timer. Non-blocking: the attempt
             // runs in `upgrade_task`; this loop keeps accepting and forwarding.
@@ -1874,9 +1898,51 @@ impl Proxy {
                         }
                     }
                 }
-                _ = ctrl_heartbeat.tick() => {
-                    if control.send(ClientMessage::Heartbeat).await.is_err() {
-                        return Ok(());
+                _ = liveness_tick.tick() => {
+                    if let Some(deadline) = silence {
+                        let idle = ctrl_activity.inbound_idle();
+                        if idle < deadline {
+                            if silent_on_direct {
+                                info!(%path, "server reachable again");
+                                silent_on_direct = false;
+                            }
+                        } else if direct {
+                            // The direct path runs consumer<->provider and
+                            // does not need the server, so a server outage
+                            // must not cost a working tunnel. Keep serving;
+                            // the direct-closed arm reconnects the moment the
+                            // direct path itself dies.
+                            if !silent_on_direct {
+                                warn!(?idle,
+                                    "server silent; keeping the live direct path and \
+                                     reconnecting only if it closes");
+                                silent_on_direct = true;
+                            }
+                        } else {
+                            // Terminate rather than close: a graceful close
+                            // would queue behind data the dead path never
+                            // drains (D2).
+                            ctrl_activity.terminate();
+                            let carriers = carrier_activities.terminate_all();
+                            warn!(?idle, ?deadline, carriers,
+                                "server silent; the connection is lost, dropping it");
+                            bail!("server silent for {idle:?} (connection lost)");
+                        }
+                    }
+                }
+                _ = ctrl_heartbeat.tick(), if sends_ctrl_heartbeat => {
+                    match crate::client::beat_once(&mut control).await {
+                        crate::client::CtrlBeat::Sent => {}
+                        crate::client::CtrlBeat::Closed => return Ok(()),
+                        crate::client::CtrlBeat::PeerNotReading => {
+                            warn!(
+                                timeout = ?ctrl_heartbeat_send_timeout(),
+                                "control heartbeat write blocked: the server is not reading \
+                                 this consumer's control substream. Standing the heartbeat \
+                                 down for this session rather than stalling the tunnel."
+                            );
+                            sends_ctrl_heartbeat = false;
+                        }
                     }
                 }
                 accepted = listener.accept() => {
@@ -1934,9 +2000,11 @@ async fn open_consumer_carrier(
     id: &str,
     pool: &Arc<CarrierPool>,
     max: u16,
+    activities: &crate::liveness::ConnActivities,
 ) -> Result<()> {
     let socket = transport::connect(endpoint, insecure).await?;
     let (opener, _acceptor) = mux::client(socket);
+    let activity = opener.activity();
     let mut control = Delimited::with_label(
         opener
             .open()
@@ -1979,11 +2047,35 @@ async fn open_consumer_carrier(
     if !pool.push(carrier, max as usize) {
         return Ok(()); // pool already at capacity
     }
+    activities.track(activity.clone());
+    let activities = activities.clone();
     tokio::spawn(async move {
-        // The server only sends heartbeats here; drain them so flow control does
-        // not stall, and mark the carrier dead when the connection drops.
-        while let Ok(Some(_)) = control.recv::<ServerMessage>().await {}
+        // The server heartbeats every carrier every 500 ms. Drain them so flow
+        // control does not stall, and WATCH them: a carrier whose path died
+        // leaves the pool within the deadline instead of hanging every
+        // connection routed to it until the kernel gives up (≈15 min). The
+        // check rides its own tick, never `timeout(recv)` (DEC-VE3).
+        let silence = crate::liveness::client_silence_deadline();
+        let mut liveness_tick = crate::liveness::LivenessTicker::new(silence);
+        loop {
+            tokio::select! {
+                message = control.recv::<ServerMessage>() => {
+                    if !matches!(message, Ok(Some(_))) {
+                        break;
+                    }
+                }
+                _ = liveness_tick.tick() => {
+                    if activity.reap_due(silence) {
+                        warn!(idle = ?activity.inbound_idle(),
+                            "secret relay carrier silent; dropping it from the pool");
+                        activity.terminate();
+                        break;
+                    }
+                }
+            }
+        }
         alive.store(false, Ordering::Relaxed);
+        activities.forget(&activity);
     });
     Ok(())
 }

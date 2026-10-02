@@ -2,8 +2,8 @@
 //!
 //! Client roles (`bore local`, `bore proxy`) can run a connect/serve cycle once,
 //! or — with `--auto-reconnect` — forever: when a connection fails to establish
-//! or drops, it is retried after a backoff (default sequence: 1, 2, 4, 8, 16, 32
-//! seconds, then every 32 seconds indefinitely). The sequence, cap, and initial
+//! or drops, it is retried after a backoff (default sequence: 1, 2, 4, 8
+//! seconds, then every 8 seconds indefinitely). The sequence, cap, and initial
 //! delay are configurable via [`Backoff::new_with`] for use cases like the UDP
 //! direct-path upgrade retry. A successful connection resets the backoff.
 
@@ -18,7 +18,13 @@ use tracing::{info, warn};
 const DEFAULT_INITIAL_BACKOFF_SECS: u64 = 1;
 
 /// Default maximum backoff delay, in seconds.
-const DEFAULT_MAX_BACKOFF_SECS: u64 = 32;
+///
+/// 8 s, not the 32 s it was before plan 005: after an outage the next attempt is
+/// what ends the downtime, and a 32 s step meant a connection whose path came
+/// back a moment after a failed dial waited up to half a minute for nothing. A
+/// failing dial costs one TCP handshake, so retrying every 8 s is cheap for
+/// both ends.
+const DEFAULT_MAX_BACKOFF_SECS: u64 = 8;
 
 /// Capped exponential backoff: yields `initial, initial*2, initial*4, ...`
 /// up to `max_secs`, then stays at `max_secs` indefinitely.
@@ -31,7 +37,7 @@ pub struct Backoff {
 }
 
 impl Backoff {
-    /// Create a backoff with the default sequence (1 → 32 s).
+    /// Create a backoff with the default sequence (1 → 8 s).
     pub fn new() -> Self {
         Self::new_with(DEFAULT_INITIAL_BACKOFF_SECS, DEFAULT_MAX_BACKOFF_SECS)
     }
@@ -120,8 +126,17 @@ mod tests {
     #[test]
     fn backoff_follows_capped_doubling_sequence() {
         let mut backoff = Backoff::new();
-        let seconds: Vec<u64> = (0..8).map(|_| backoff.next_delay().as_secs()).collect();
-        assert_eq!(seconds, vec![1, 2, 4, 8, 16, 32, 32, 32]);
+        let seconds: Vec<u64> = (0..6).map(|_| backoff.next_delay().as_secs()).collect();
+        assert_eq!(seconds, vec![1, 2, 4, 8, 8, 8]);
+    }
+
+    /// An outage must never be followed by a long idle wait before the next
+    /// attempt (plan 005, D5).
+    #[test]
+    fn default_cap_is_eight_seconds() {
+        let mut backoff = Backoff::new();
+        let worst = (0..64).map(|_| backoff.next_delay()).max().unwrap();
+        assert_eq!(worst, Duration::from_secs(8));
     }
 
     #[test]
@@ -130,7 +145,7 @@ mod tests {
         for _ in 0..5 {
             backoff.next_delay();
         }
-        assert_eq!(backoff.next_delay().as_secs(), 32);
+        assert_eq!(backoff.next_delay().as_secs(), 8);
         backoff.reset();
         assert_eq!(backoff.next_delay().as_secs(), 1);
     }

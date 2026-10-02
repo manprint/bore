@@ -502,7 +502,7 @@ where
     if !auto {
         return attempt().await;
     }
-    let mut backoff = crate::reconnect::Backoff::new(); // 1 s .. 32 s
+    let mut backoff = crate::reconnect::Backoff::new(); // 1 s .. 8 s
     loop {
         let started = tokio::time::Instant::now();
         match attempt().await {

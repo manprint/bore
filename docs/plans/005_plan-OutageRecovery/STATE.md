@@ -26,8 +26,8 @@ Read this first in every session. Updated 2026-10-02 by claude-opus-5-5.
 - Active scope: plan (all phases) — user: "implementa il piano, testa tutto, committa su Dev e segui la ci".
 - Scope result: RUNNING.
 - Type / ID / attempt: none.
-- Next action: open 0.3 (backoff cap).
-- Next eligible plan unit: 0.3.
+- Next action: open 0.4 (README backoff).
+- Next eligible plan unit: 0.4.
 - Unit base: f7b0745; branch: dev.
 - Repo state: HEAD f7b0745 plus the untracked plan folder.
 
@@ -119,7 +119,7 @@ None.
 |----|------------|------------|--------|---------|-------------------|
 | 0.1 | phase_01.md | none | DONE | 1 | G-U01 15/0 (5 new); terminate red-checked |
 | 0.2 | phase_01.md | none | DONE | 1 | G-U02 6 liveness tests pass |
-| 0.3 | phase_01.md | none | TODO | 1 | — |
+| 0.3 | phase_01.md | none | DONE | 1 | G-U03 8/0 (sequence [1,2,4,8,8,8] + default_cap_is_eight_seconds) |
 | 0.4 | phase_01.md | 0.3 | TODO | 1 | — |
 | 1.1 | phase_02.md | P0 | TODO | 1 | — |
 | 1.2 | phase_02.md | 1.1 | TODO | 1 | — |
@@ -153,7 +153,7 @@ None.
 |---------|-------------|------|--------|----------|
 | mux activity/terminate (5) | 0.1 | G-U01 | PASS | 15 passed; red-check terminate arm → timeout |
 | liveness tables | 0.2 | G-U02 | PASS | 6 tests incl. LivenessTicker |
-| backoff cap | 0.3 | G-U03 | TODO | — |
+| backoff cap | 0.3 | G-U03 | PASS | 8 passed |
 | serde defaults | 1.1/2.1/3.1 | G-U11 | TODO | — |
 | outage_liveness_test | 1.2–1.5 | G-U12 | TODO | — |
 | vpn liveness/teardown | 2.2–2.4 | G-U2 | TODO | — |

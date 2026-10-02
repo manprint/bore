@@ -26,10 +26,10 @@ Read this first in every session. Updated 2026-10-02 by claude-opus-5-5.
 - Active scope: plan (all phases) — user: "implementa il piano, testa tutto, committa su Dev e segui la ci".
 - Scope result: RUNNING.
 - Type / ID / attempt: none.
-- Next action: P1 closure (G-P1 gates + self-review).
-- Next eligible plan unit: P1.
+- Next action: 2.1 (wire fields) — implemented in the worktree `scratchpad/wt` together with 2.2; gate and commit 2.1 first, then 2.2.
+- Next eligible plan unit: 2.1.
 - Unit base: f7b0745; branch: dev.
-- Repo state: plan commits on dev after f7b0745 (latest: the 1.4 commit, matched by `PEV-Unit: 1.7`).
+- Repo state: plan commits on dev after f7b0745 (latest: the P1 closure, matched by `PEV-Unit: P1`).
 
 ## 2. Feature context and readiness
 
@@ -95,10 +95,12 @@ None.
 | G-U02 | `cargo test --lib liveness` | PASS | 6 new | 0.2 diff | 2026-10-02 |
 | G-U12 (1.3) | `cargo test --test outage_liveness_test` | PASS | 10 passed (5 new client-side) | 1.3 diff | 2026-10-02 |
 | full `cargo test` (1.3) | `cargo test` | PASS (env-only red) | 1095 pass; only `vhost_entry_redirect_overrides_both` (port 19000 foreign pid 3179752, §9) | 1.3 diff | 2026-10-02 |
+| G-PHASE P1 (G-P1) | all-features `--no-fail-fast` lib/bins/examples/tests (skip `t_ssh_`/`t_dmx_`), doc, ssh serial, web serial, no-default `transfer_link_test`, `npm test`; `cargo fmt --check`; both G-CLIPPY | PASS (env-only red) | 1489 passed, 1 failed = `vhost_entry_redirect_overrides_both` (port 19000 held by the foreign `node build/new_configurator/index.js`, pid 3179752); the same test passes in a private network namespace (`unshare -rn`, 1/0); doc 1/0, ssh 48/0, web 40/0 (1 ignored), no-default 22/0, npm 0 fail; fmt + clippy (default and `vpn,ssh-gateway`) clean | HEAD 52e0428 | 2026-10-02 |
 | G-PHASE P0 | `cargo test` / `--features vpn` / `--features ssh-gateway` | PASS (env-only reds) | default 1010 pass + `transfer_ask_confirm_returns_err_when_no_tty_available` flaky (passes on rerun 43/0; dials default port while other tests run servers); vpn 1204 pass + `vhost_entry_redirect_overrides_both` red = port 19000 held by a foreign `node build/new_configurator/index.js` (pid 3179752) on this workstation; ssh 991 pass 0 fail | HEAD after 0.4 | 2026-10-02 |
 
 | Review | Reviewer | Plan revision / reviewed change | Invariants/assertions checked | Verdict |
 |--------|----------|---------------------------------|------------------------------|---------|
+| P1 self-review | claude-opus-5-5 (agent-1, supervisor) | revisions 1b–1e; f7b0745..52e0428 | every reap path returns/breaks so the RAII registration drops (no zombie row); reap checked on the heartbeat tick, never `timeout(recv)` (DEC-VE3); undeclared clients get `None` (DEC-VE2, `undeclared_client_is_never_transport_reaped`); consumer carriers get no reaper (BUG-S2) and provider carriers go through `serve_carrier`; a client never declares `ctrl_heartbeat_ms` without beating (`Client::new`/`Proxy` set both); beats use `beat_once` (P-9); explicit server close always ends the client; transfer one-shot in-progress failure path unchanged (resume state kept) | PASS |
 
 ## 8. Technical revisions and deviations
 
@@ -151,7 +153,7 @@ None. Environment note: ports 19000/19001 are held by a foreign node process on 
 | ID | File | Closure unit | Status | Review / commit reference |
 |----|------|--------------|--------|---------------------------|
 | 0 | phase_01.md | P0 | DONE | self-review: no callers of terminate yet; heartbeat 5 s only speeds beats; PEV-Unit P0 |
-| 1 | phase_02.md | P1 | TODO | — |
+| 1 | phase_02.md | P1 | DONE | G-P1 + self-review (§7); PEV-Unit P1 |
 | 2 | phase_03.md | P2 | TODO | — |
 | 3 | phase_04.md | P3 | TODO | — |
 | 4 | phase_05.md | P4 | TODO | — |
@@ -172,7 +174,7 @@ None. Environment note: ports 19000/19001 are held by a foreign node process on 
 | Document/sections | Owning unit | Status | Evidence |
 |-------------------|-------------|--------|----------|
 | README auto-reconnect backoff | 0.4 | DONE | README §Automatic reconnection |
-| README liveness section | 1.6 | TODO | — |
+| README liveness section | 1.6 | DONE | README "Connection liveness and outage recovery" + transfer paragraph (1.7) |
 | README VPN | 2.5 | TODO | — |
 | README web-transfer + SSH, SSH_GATEWAY.md | 3.3 | TODO | — |
 | CLAUDE.md invariant + README final | 4.3 | TODO | — |

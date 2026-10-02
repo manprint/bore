@@ -200,6 +200,11 @@ impl ConnActivity {
     pub fn is_terminated(&self) -> bool {
         self.0.cancel.is_cancelled()
     }
+
+    /// Whether `other` watches the same connection as `self`.
+    pub fn same_connection(&self, other: &ConnActivity) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 /// The socket as the driver sees it: unchanged, except that every read that

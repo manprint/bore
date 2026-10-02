@@ -1450,6 +1450,15 @@ impl Client {
         // than wedge the whole listen loop. See `beat_once`.
         let mut sends_ctrl_heartbeat = self.sends_ctrl_heartbeat;
         let scope_token = self.scope.as_ref().map(|scope| scope.token());
+        // Server-silence deadline (D2). The server heartbeats this connection
+        // every 500 ms, so ANY inbound byte going missing for the deadline means
+        // the path is dead even though TCP still says ESTABLISHED — the kernel
+        // would take ≈15 min to agree, because our own heartbeats keep data
+        // unacknowledged and SO_KEEPALIVE only probes an idle socket. Checked on
+        // its own tick, never as `timeout(recv)` (DEC-VE3).
+        let silence = crate::liveness::client_silence_deadline();
+        let mut liveness_tick = crate::liveness::LivenessTicker::new(silence);
+        let main_activity = acceptor.activity();
         let this = Arc::new(self);
 
         // Carrier pool: pump each extra carrier's accepted data substreams into a
@@ -1457,6 +1466,7 @@ impl Client {
         // liveness counter drives the re-dial timer that keeps the pool full.
         let (carrier_tx, mut carrier_rx) = mpsc::unbounded_channel::<mux::Stream>();
         let carrier_live = Arc::new(AtomicUsize::new(0));
+        let carriers = crate::liveness::ConnActivities::default();
         for (control_keepalive, acc) in carrier_acceptors {
             spawn_carrier_pump(
                 &this,
@@ -1464,6 +1474,7 @@ impl Client {
                 acc,
                 carrier_tx.clone(),
                 Arc::clone(&carrier_live),
+                &carriers,
             );
         }
         let carrier_redial_inflight = Arc::new(AtomicBool::new(false));
@@ -1488,6 +1499,27 @@ impl Client {
         loop {
             tokio::select! {
                 _ = wait_for_scope_cancel(scope_token.clone()) => return Ok(()),
+                _ = liveness_tick.tick() => {
+                    if let Some(deadline) = silence {
+                        let idle = main_activity.inbound_idle();
+                        if idle >= deadline {
+                            // Terminate rather than close: a graceful close
+                            // would queue behind data the dead path never
+                            // drains. Every substream ends now, so the
+                            // proxied connections fail fast instead of
+                            // hanging, and `--auto-reconnect` takes over.
+                            main_activity.terminate();
+                            let carriers = carriers.terminate_all();
+                            warn!(
+                                ?idle,
+                                ?deadline,
+                                carriers,
+                                "server silent; the connection is lost, dropping it"
+                            );
+                            bail!("server silent for {idle:?} (connection lost)");
+                        }
+                    }
+                }
                 _ = ctrl_heartbeat.tick(), if sends_ctrl_heartbeat => {
                     match beat_once(&mut control).await {
                         CtrlBeat::Sent => {}
@@ -1545,6 +1577,7 @@ impl Client {
                                             &carrier_tx,
                                             &carrier_live,
                                             &carrier_redial_inflight,
+                                            &carriers,
                                         );
                                     } else if extra < previous {
                                         info!(
@@ -2008,6 +2041,7 @@ impl Client {
                             &carrier_tx,
                             &carrier_live,
                             &carrier_redial_inflight,
+                            &carriers,
                         );
                     }
                 }
@@ -2329,11 +2363,16 @@ fn spawn_carrier_pump(
     mut acceptor: mux::Acceptor,
     tx: mpsc::UnboundedSender<mux::Stream>,
     live: Arc<AtomicUsize>,
+    carriers: &crate::liveness::ConnActivities,
 ) {
     live.fetch_add(1, Ordering::Relaxed);
+    let activity = acceptor.activity();
+    carriers.track(activity.clone());
     let scope_token = client.scope.as_ref().map(|scope| scope.token());
     let owner = Arc::clone(client);
     let task_live = Arc::clone(&live);
+    let task_carriers = carriers.clone();
+    let task_activity = activity.clone();
     let spawned = owner.spawn_task(async move {
         // Held only to keep the substream (and thus the carrier) open; never read.
         let _control = control;
@@ -2346,9 +2385,11 @@ fn spawn_carrier_pump(
                 }
             }
         }
+        task_carriers.forget(&task_activity);
         task_live.fetch_sub(1, Ordering::Relaxed);
     });
     if spawned.is_none() {
+        carriers.forget(&activity);
         live.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -2359,10 +2400,15 @@ fn spawn_carrier_pump_scoped(
     mut acceptor: mux::Acceptor,
     tx: mpsc::UnboundedSender<mux::Stream>,
     live: Arc<AtomicUsize>,
+    carriers: &crate::liveness::ConnActivities,
 ) {
     live.fetch_add(1, Ordering::Relaxed);
+    let activity = acceptor.activity();
+    carriers.track(activity.clone());
     let scope_token = scope.as_ref().map(|scope| scope.token());
     let task_live = Arc::clone(&live);
+    let task_carriers = carriers.clone();
+    let task_activity = activity.clone();
     let task = async move {
         let _control = control;
         loop {
@@ -2374,11 +2420,13 @@ fn spawn_carrier_pump_scoped(
                 }
             }
         }
+        task_carriers.forget(&task_activity);
         task_live.fetch_sub(1, Ordering::Relaxed);
     };
     match scope {
         Some(scope) => {
             if scope.spawn(task).is_none() {
+                carriers.forget(&activity);
                 live.fetch_sub(1, Ordering::Relaxed);
             }
         }
@@ -2397,6 +2445,7 @@ fn maybe_redial_carriers(
     tx: &mpsc::UnboundedSender<mux::Stream>,
     live: &Arc<AtomicUsize>,
     inflight: &Arc<AtomicBool>,
+    carriers: &crate::liveness::ConnActivities,
 ) {
     let target = dialer.target_extra.load(Ordering::Relaxed);
     let current = live.load(Ordering::Relaxed);
@@ -2412,6 +2461,7 @@ fn maybe_redial_carriers(
     let tx = tx.clone();
     let live = Arc::clone(live);
     let inflight = Arc::clone(inflight);
+    let carriers = carriers.clone();
     let scope = dialer.scope.clone();
     let scope_token = scope.as_ref().map(|scope| scope.token());
     client.spawn_task(async move {
@@ -2443,6 +2493,7 @@ fn maybe_redial_carriers(
                         acceptor,
                         tx.clone(),
                         Arc::clone(&live),
+                        &carriers,
                     );
                     info!("re-dialed a carrier connection");
                 }

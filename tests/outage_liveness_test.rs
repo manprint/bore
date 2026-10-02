@@ -75,6 +75,8 @@ struct ProxiedConn {
     client_closed: AtomicBool,
     /// The server side of this connection reached EOF (the server closed it).
     server_closed: AtomicBool,
+    /// Blackhole THIS connection only (the proxy-wide flag covers them all).
+    blackholed: AtomicBool,
 }
 
 /// A TCP forwarder `client <-> proxy <-> upstream` that can be blackholed:
@@ -85,7 +87,6 @@ struct ProxiedConn {
 struct BlackholeProxy {
     addr: SocketAddr,
     blackholed: Arc<AtomicBool>,
-    #[allow(dead_code)] // read by the client-side tests (1.3)
     conns: Arc<std::sync::Mutex<Vec<Arc<ProxiedConn>>>>,
 }
 
@@ -124,14 +125,13 @@ impl BlackholeProxy {
         self.blackholed.store(on, Ordering::SeqCst);
     }
 
-    #[allow(dead_code)] // read by the client-side tests (1.3)
     fn conns(&self) -> Vec<Arc<ProxiedConn>> {
         self.conns.lock().unwrap().clone()
     }
 }
 
-async fn wait_released(blackholed: &AtomicBool) {
-    while blackholed.load(Ordering::SeqCst) {
+async fn wait_released(blackholed: &AtomicBool, conn: &ProxiedConn) {
+    while blackholed.load(Ordering::SeqCst) || conn.blackholed.load(Ordering::SeqCst) {
         time::sleep(Duration::from_millis(10)).await;
     }
 }
@@ -145,7 +145,7 @@ async fn pump(
 ) {
     let mut buf = vec![0u8; 16 * 1024];
     loop {
-        wait_released(&blackholed).await;
+        wait_released(&blackholed, &state).await;
         let n = from.read(&mut buf).await.unwrap_or_default();
         if n == 0 {
             if from_client {
@@ -157,7 +157,7 @@ async fn pump(
             return;
         }
         // A read that completed just as the blackhole went up is held.
-        wait_released(&blackholed).await;
+        wait_released(&blackholed, &state).await;
         if to.write_all(&buf[..n]).await.is_err() {
             return;
         }
@@ -271,6 +271,10 @@ async fn secret_provider(to: &str, local: u16, id: &str) -> Result<Client> {
 }
 
 async fn secret_consumer(to: &str, id: &str) -> Result<Proxy> {
+    secret_consumer_with_carriers(to, id, 1).await
+}
+
+async fn secret_consumer_with_carriers(to: &str, id: &str, carriers: u16) -> Result<Proxy> {
     Proxy::new(
         to,
         "127.0.0.1:0".parse()?,
@@ -282,7 +286,7 @@ async fn secret_consumer(to: &str, id: &str) -> Result<Proxy> {
         Default::default(),
         0,
         0,
-        1,
+        carriers,
         None,
         false,
     )
@@ -513,5 +517,230 @@ async fn undeclared_client_is_never_transport_reaped() -> Result<()> {
         "an undeclared client must keep its port: {busy:?}"
     );
     drop((opener, control));
+    Ok(())
+}
+
+// ─── Client server-silence deadline (1.3) ────────────────────────────────────
+
+/// Server reap floor for the client-side tests: far beyond every test's
+/// horizon, so what is observed is the CLIENT noticing, never the server.
+const SERVER_NEVER_REAPS: Duration = Duration::from_secs(600);
+
+/// Run `listen` healthy for longer than the deadline (a healthy client must
+/// never trip), then blackhole the path and require `listen` to return the
+/// server-silence error well before the kernel would have (≈15 min).
+async fn assert_listen_trips<F>(proxy: &BlackholeProxy, listen: F, deadline: Duration)
+where
+    F: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    let task = tokio::spawn(listen);
+    time::sleep(deadline + Duration::from_millis(500)).await;
+    assert!(
+        !task.is_finished(),
+        "a healthy client tripped its server-silence deadline"
+    );
+
+    proxy.set_blackhole(true);
+    let start = Instant::now();
+    let joined = time::timeout(Duration::from_secs(6), task)
+        .await
+        .expect("listen never returned: the dead path was not noticed (the production symptom)");
+    let took = start.elapsed();
+    let err = joined
+        .expect("listen panicked")
+        .expect_err("a lost connection must be an error, so --auto-reconnect logs why");
+    assert!(
+        err.to_string().contains("silent"),
+        "unexpected error: {err:#}"
+    );
+    assert!(
+        took < deadline + Duration::from_millis(2500),
+        "took {took:?} for a {deadline:?} deadline"
+    );
+}
+
+/// The field case, public flavour: the path dies, the client notices within
+/// its deadline and returns, so `--auto-reconnect` reconnects.
+///
+/// RED-CHECK: without the liveness arm in `Client::listen` this times out —
+/// `listen` would have waited for the kernel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_client_returns_when_the_server_goes_silent() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let _env = LivenessEnv::set(200, 1500);
+    const CONTROL: u16 = 18651;
+    const PORT: u16 = 18652;
+    spawn_server(CONTROL, PORT..=PORT, SERVER_NEVER_REAPS, None).await?;
+    let proxy = BlackholeProxy::start(control_addr(CONTROL)).await?;
+    let local = echo_service().await?;
+
+    let client = Client::new(
+        "127.0.0.1",
+        local,
+        &proxy.to(),
+        PORT,
+        None,
+        false,
+        TunnelOptions::default(),
+        None,
+    )
+    .await?;
+    assert_listen_trips(&proxy, client.listen(), Duration::from_millis(1500)).await;
+    Ok(())
+}
+
+/// Same for a vhost provider (the exact field configuration, minus docker).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vhost_client_returns_when_the_server_goes_silent() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let _env = LivenessEnv::set(200, 1500);
+    const CONTROL: u16 = 18661;
+    const HTTP: u16 = 18662;
+    spawn_server(CONTROL, 18663..=18663, SERVER_NEVER_REAPS, Some(HTTP)).await?;
+    let proxy = BlackholeProxy::start(control_addr(CONTROL)).await?;
+    let local = echo_service().await?;
+
+    let client = vhost_provider(&proxy.to(), local, "field").await?;
+    assert_listen_trips(&proxy, client.listen(), Duration::from_millis(1500)).await;
+    Ok(())
+}
+
+/// Same for a secret provider.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn secret_provider_client_returns_when_the_server_goes_silent() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let _env = LivenessEnv::set(200, 1500);
+    const CONTROL: u16 = 18671;
+    spawn_server(CONTROL, 18672..=18672, SERVER_NEVER_REAPS, None).await?;
+    let proxy = BlackholeProxy::start(control_addr(CONTROL)).await?;
+    let local = echo_service().await?;
+
+    let client = secret_provider(&proxy.to(), local, "db").await?;
+    assert_listen_trips(&proxy, client.listen(), Duration::from_millis(1500)).await;
+    Ok(())
+}
+
+/// Read the echo service's reply through the public port.
+async fn public_request(port: u16) -> Option<Vec<u8>> {
+    let mut conn = TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+    let mut reply = Vec::new();
+    time::timeout(Duration::from_secs(2), conn.read_to_end(&mut reply))
+        .await
+        .ok()?
+        .ok()?;
+    (reply == b"alive").then_some(reply)
+}
+
+/// I-3: a flick shorter than the deadline costs NOTHING — no disconnection,
+/// no reconnect, and the tunnel serves again as soon as the path is back.
+///
+/// The flick is most of the deadline on purpose (2.5 s of 4 s, plus up to one
+/// 500 ms server-beat gap): a check that fired early — against the tick period,
+/// say — must trip here, not pass by luck.
+///
+/// RED-CHECK: comparing against `deadline / 4` disconnects the client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_survives_a_short_flick() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let _env = LivenessEnv::set(200, 4000);
+    const CONTROL: u16 = 18681;
+    const PORT: u16 = 18682;
+    spawn_server(CONTROL, PORT..=PORT, SERVER_NEVER_REAPS, None).await?;
+    let proxy = BlackholeProxy::start(control_addr(CONTROL)).await?;
+    let local = echo_service().await?;
+
+    let client = Client::new(
+        "127.0.0.1",
+        local,
+        &proxy.to(),
+        PORT,
+        None,
+        false,
+        TunnelOptions::default(),
+        None,
+    )
+    .await?;
+    let task = tokio::spawn(client.listen());
+    assert!(
+        public_request(PORT).await.is_some(),
+        "healthy tunnel serves"
+    );
+
+    proxy.set_blackhole(true);
+    time::sleep(Duration::from_millis(2500)).await;
+    proxy.set_blackhole(false);
+
+    time::sleep(Duration::from_secs(4)).await;
+    assert!(
+        !task.is_finished(),
+        "a 2.5 s flick against a 4 s deadline disconnected the client: {:?}",
+        task.await
+    );
+    assert!(
+        public_request(PORT).await.is_some(),
+        "the tunnel does not serve after the flick"
+    );
+    assert_eq!(
+        proxy.conns().len(),
+        1,
+        "the client must not have reconnected"
+    );
+    Ok(())
+}
+
+/// A trip takes the carrier connections down with the main one. Carriers
+/// carry no heartbeat of their own, so nothing else would ever notice that
+/// their path died, and each would hold its proxied connections hanging.
+///
+/// RED-CHECK: without `terminate_all` the carrier connection is still open
+/// after the main one is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_terminates_carrier_connections_on_trip() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let _env = LivenessEnv::set(200, 1500);
+    const CONTROL: u16 = 18691;
+    const PORT: u16 = 18692;
+    spawn_server(CONTROL, PORT..=PORT, SERVER_NEVER_REAPS, None).await?;
+    let proxy = BlackholeProxy::start(control_addr(CONTROL)).await?;
+    let local = echo_service().await?;
+
+    let client = Client::new(
+        "127.0.0.1",
+        local,
+        &proxy.to(),
+        PORT,
+        None,
+        false,
+        TunnelOptions {
+            carriers: 2,
+            ..Default::default()
+        },
+        None,
+    )
+    .await?;
+    let both = eventually(Duration::from_secs(3), || async {
+        (proxy.conns().len() == 2).then_some(())
+    })
+    .await;
+    assert!(both.is_some(), "main + one carrier through the proxy");
+    assert_listen_trips(&proxy, client.listen(), Duration::from_millis(1500)).await;
+
+    // Hold the blackhole a little longer: the server must not be the one that
+    // closes anything (it never reaps in this test, and it cannot see the
+    // client's FIN until the path is back).
+    time::sleep(Duration::from_millis(300)).await;
+    proxy.set_blackhole(false);
+    let closed = eventually(Duration::from_secs(3), || async {
+        proxy
+            .conns()
+            .iter()
+            .all(|c| c.client_closed.load(Ordering::SeqCst))
+            .then_some(())
+    })
+    .await;
+    assert!(
+        closed.is_some(),
+        "the client left a carrier connection open after its main one tripped"
+    );
     Ok(())
 }

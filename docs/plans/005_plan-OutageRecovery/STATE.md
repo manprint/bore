@@ -26,8 +26,8 @@ Read this first in every session. Updated 2026-10-02 by claude-opus-5-5.
 - Active scope: plan (all phases) — user: "implementa il piano, testa tutto, committa su Dev e segui la ci".
 - Scope result: RUNNING.
 - Type / ID / attempt: none.
-- Next action: open 1.3 (Client::listen deadline + carriers).
-- Next eligible plan unit: 1.3.
+- Next action: open 1.4 (secret Proxy deadline + beat_once).
+- Next eligible plan unit: 1.4.
 - Unit base: f7b0745; branch: dev.
 - Repo state: HEAD f7b0745 plus the untracked plan folder.
 
@@ -93,6 +93,8 @@ None.
 | G-U01 | `cargo test --lib mux::tests` | PASS | 15 passed, 5 new | 0.1 diff | 2026-10-02 |
 | G-FMT/G-CLIPPY | per §3 | PASS | clean | 0.1 diff | 2026-10-02 |
 | G-U02 | `cargo test --lib liveness` | PASS | 6 new | 0.2 diff | 2026-10-02 |
+| G-U12 (1.3) | `cargo test --test outage_liveness_test` | PASS | 10 passed (5 new client-side) | 1.3 diff | 2026-10-02 |
+| full `cargo test` (1.3) | `cargo test` | PASS (env-only red) | 1095 pass; only `vhost_entry_redirect_overrides_both` (port 19000 foreign pid 3179752, §9) | 1.3 diff | 2026-10-02 |
 | G-PHASE P0 | `cargo test` / `--features vpn` / `--features ssh-gateway` | PASS (env-only reds) | default 1010 pass + `transfer_ask_confirm_returns_err_when_no_tty_available` flaky (passes on rerun 43/0; dials default port while other tests run servers); vpn 1204 pass + `vhost_entry_redirect_overrides_both` red = port 19000 held by a foreign `node build/new_configurator/index.js` (pid 3179752) on this workstation; ssh 991 pass 0 fail | HEAD after 0.4 | 2026-10-02 |
 
 | Review | Reviewer | Plan revision / reviewed change | Invariants/assertions checked | Verdict |
@@ -102,6 +104,7 @@ None.
 
 | Revision | Previous decision/step | Approved replacement and reason | Supervisor | Dependents/revalidation |
 |----------|------------------------|---------------------------------|------------|------------------------|
+| 1c | 1.3 S3: carrier activities in a local `Vec` | `liveness::ConnActivities` (track/forget/terminate_all) shared with 1.4 and 2.x, plus `mux::ConnActivity::same_connection`. Each carrier pump tracks on start and forgets on exit, so the set never holds a finished carrier and stays bounded across re-dials; only a trip terminates (clean exits keep the graceful close and in-flight streams). The flick test (I-3) uses 2.5 s of a 4 s deadline: a 1 s flick of 3 s let a `deadline/4` mutation pass by tick-phase luck. | claude-opus-5-5 | 1.4 uses ConnActivities |
 | 1b | D3: `CTRL_CLIENT_HEARTBEAT` 5 s | **2 s**. Reason (arithmetic, pinned by `server_deadline_covers_a_beat_plus_the_retransmit_ladder`): on an idle tunnel the server's silence after a flick = one beat + Linux's RTO ladder (next retransmit 12.6 s after first loss for flicks 6.2–12.6 s at RTO 200 ms); 5 + 12.6 > 15 would let the server reap a client that itself survives; 2 + 12.6 < 15 restores I-3 on the server side. Server deadline formula unchanged (max(3×2 s, 15 s) = 15 s). Cost: one ~15 B frame / 2 s / tunnel. Also added `liveness::TransportReaper` + `reap_if_due` used by every server loop. | claude-opus-5-5 | 3.1 OWNER_HEARTBEAT follows the same reasoning (2 s); docs (1.6/3.3/4.3) quote 2 s |
 | 1a | 0.2 contract: `secret::CTRL_CLIENT_HEARTBEAT` kept as a delegating const | the const became unused (only `ctrl_client_heartbeat()` read it), so it is removed and doc links point at `liveness::CTRL_CLIENT_HEARTBEAT`; `ctrl_client_heartbeat()` keeps its name. Added `liveness::LivenessTicker` (disarmable tick) + `declared_ms_for(Duration)` used by 1.x/2.x/3.x. `CTRL_HEARTBEAT_SEND_TIMEOUT` stays 10 s; its doc no longer claims "≤ heartbeat" (beats are awaited in place, cannot queue). | claude-opus-5-5 | none |
 
@@ -125,7 +128,7 @@ None. Environment note: ports 19000/19001 are held by a foreign node process on 
 | 0.4 | phase_01.md | 0.3 | DONE | 1 | README backoff text 1,2,4,8; anchor to liveness section (added in 1.6) |
 | 1.1 | phase_02.md | P0 | DONE | 1 | G-U11 70/0 (7 new serde tests) |
 | 1.2 | phase_02.md | 1.1 | DONE | 1 | G-U12 5/0; red-check: neutered reap_if_due → 4 FAIL; reap-undeclared → I-5 test FAIL |
-| 1.3 | phase_02.md | 1.1 | TODO | 1 | — |
+| 1.3 | phase_02.md | 1.1 | DONE | 1 | G-U12 10/0 (5 new); red-checks: liveness arm off → 3 trip tests time out; `terminate_all` off → carrier test FAIL; `deadline/4` → flick test FAIL 3/3 |
 | 1.4 | phase_02.md | 1.1 | TODO | 1 | — |
 | 1.5 | phase_02.md | 1.1 | TODO | 1 | — |
 | 1.6 | phase_02.md | 1.2–1.5 | TODO | 1 | — |
@@ -157,7 +160,7 @@ None. Environment note: ports 19000/19001 are held by a foreign node process on 
 | liveness tables | 0.2 | G-U02 | PASS | 6 tests incl. LivenessTicker |
 | backoff cap | 0.3 | G-U03 | PASS | 8 passed |
 | serde defaults | 1.1/2.1/3.1 | G-U11 | PASS (1.1) | 7 new in shared::tests |
-| outage_liveness_test | 1.2–1.5 | G-U12 | PARTIAL (1.2: 5/0) | server reapers vhost/public/secret provider/consumer + I-5 |
+| outage_liveness_test | 1.2–1.5 | G-U12 | PARTIAL (1.3: 10/0) | server reapers vhost/public/secret provider/consumer + I-5; client trips public/vhost/secret provider, flick survival, carrier termination |
 | vpn liveness/teardown | 2.2–2.4 | G-U2 | TODO | — |
 | owner + sshgw | 3.1/3.2 | G-U3 | TODO | — |
 | T-OUT-* | 4.1 | G-NETNS-OUT | TODO | — |

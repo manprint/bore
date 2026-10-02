@@ -29,7 +29,10 @@
 //!   reaping a peer that never promised to talk would kill healthy legacy
 //!   tunnels).
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use crate::mux::ConnActivity;
 
 /// How often a client sends `ClientMessage::Heartbeat` up its control
 /// substream. 20 s before plan 005; 2 s now.
@@ -134,17 +137,13 @@ pub fn transport_reap_deadline(declared_ms: u32, floor: Duration) -> Option<Dura
 /// an `Option<TransportReaper>` of `None` IS the legacy, never-reaped path.
 #[derive(Clone, Debug)]
 pub struct TransportReaper {
-    activity: crate::mux::ConnActivity,
+    activity: ConnActivity,
     deadline: Duration,
 }
 
 impl TransportReaper {
     /// The reaper for a client that declared `declared_ms` (`None` for 0).
-    pub fn new(
-        activity: crate::mux::ConnActivity,
-        declared_ms: u32,
-        floor: Duration,
-    ) -> Option<Self> {
+    pub fn new(activity: ConnActivity, declared_ms: u32, floor: Duration) -> Option<Self> {
         transport_reap_deadline(declared_ms, floor).map(|deadline| Self { activity, deadline })
     }
 
@@ -197,6 +196,53 @@ impl LivenessTicker {
             }
             None => std::future::pending::<()>().await,
         }
+    }
+}
+
+/// The liveness handles of a tunnel's extra carrier connections, so a trip on
+/// the main connection tears the WHOLE tunnel down at once (D2). A dead path
+/// leaves every carrier socket as stuck as the main one, and each would
+/// otherwise hold its proxied connections hanging until the kernel gives up
+/// (≈15 min).
+///
+/// Whoever owns a carrier tracks it when it starts and forgets it when it
+/// ends, so the set never holds a carrier that has already gone.
+#[derive(Clone, Debug, Default)]
+pub struct ConnActivities(Arc<Mutex<Vec<ConnActivity>>>);
+
+impl ConnActivities {
+    /// Start tracking a carrier connection.
+    pub fn track(&self, activity: ConnActivity) {
+        self.lock().push(activity);
+    }
+
+    /// Stop tracking a carrier connection that has ended.
+    pub fn forget(&self, activity: &ConnActivity) {
+        self.lock()
+            .retain(|tracked| !tracked.same_connection(activity));
+    }
+
+    /// Terminate every tracked carrier; returns how many there were.
+    pub fn terminate_all(&self) -> usize {
+        let carriers = std::mem::take(&mut *self.lock());
+        for carrier in &carriers {
+            carrier.terminate();
+        }
+        carriers.len()
+    }
+
+    /// How many carriers are tracked.
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// Whether no carrier is tracked.
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<ConnActivity>> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 

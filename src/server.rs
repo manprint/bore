@@ -2830,6 +2830,8 @@ impl Server {
                 nat_masquerade,
                 route_policy,
                 nat_udp_preferred_port,
+                // Plan 005, D6: honoured once the server reaps (2.2).
+                ctrl_heartbeat_ms: _,
             }) => {
                 #[cfg(feature = "vpn")]
                 if self.vpn_enabled {
@@ -2895,6 +2897,8 @@ impl Server {
                 nat_masquerade,
                 route_policy,
                 nat_udp_preferred_port,
+                // Plan 005, D6: honoured once the server reaps (2.2).
+                ctrl_heartbeat_ms: _,
             }) => {
                 #[cfg(feature = "vpn")]
                 if self.vpn_enabled {

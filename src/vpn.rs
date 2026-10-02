@@ -820,6 +820,8 @@ async fn run_listen_once(args: VpnListenArgs) -> Result<()> {
         nat_masquerade: args.nat_masquerade,
         route_policy: None,
         nat_udp_preferred_port: args.nat_udp_preferred_port,
+        // Plan 005, D6: declared once this client beats (2.4).
+        ctrl_heartbeat_ms: 0,
     };
     ctrl.send(hello).await?;
 
@@ -2081,6 +2083,8 @@ async fn run_connect_once(args: VpnConnectArgs) -> Result<()> {
         nat_masquerade: args.nat_masquerade,
         route_policy,
         nat_udp_preferred_port: args.nat_udp_preferred_port,
+        // Plan 005, D6: declared once this client beats (2.4).
+        ctrl_heartbeat_ms: 0,
     };
     ctrl.send(connect_msg).await?;
 

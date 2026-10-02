@@ -1698,6 +1698,15 @@ pub enum ClientMessage {
         /// Display-only: client's `--nat-udp-preferred-port` (0 = unset/ephemeral).
         #[serde(default)]
         nat_udp_preferred_port: u16,
+        /// The heartbeat interval this client promises to keep after pairing
+        /// (plan 005, D6). The server heartbeats a declared listener while it
+        /// waits for a connector, accepts [`ClientMessage::Heartbeat`] from it,
+        /// answers [`ServerMessage::VpnReady::ctrl_heartbeat`] `true`, and
+        /// reaps the link once the connection has delivered no byte for
+        /// [`crate::liveness::transport_reap_deadline`]. `0` (an old client)
+        /// keeps every legacy path byte-identical. `#[serde(default)]`.
+        #[serde(default)]
+        ctrl_heartbeat_ms: u32,
     },
 
     /// Connect as the connector for a VPN link id.
@@ -1735,6 +1744,15 @@ pub enum ClientMessage {
         /// Display-only: client's `--nat-udp-preferred-port` (0 = unset/ephemeral).
         #[serde(default)]
         nat_udp_preferred_port: u16,
+        /// The heartbeat interval this client promises to keep after pairing
+        /// (plan 005, D6). The server heartbeats a declared listener while it
+        /// waits for a connector, accepts [`ClientMessage::Heartbeat`] from it,
+        /// answers [`ServerMessage::VpnReady::ctrl_heartbeat`] `true`, and
+        /// reaps the link once the connection has delivered no byte for
+        /// [`crate::liveness::transport_reap_deadline`]. `0` (an old client)
+        /// keeps every legacy path byte-identical. `#[serde(default)]`.
+        #[serde(default)]
+        ctrl_heartbeat_ms: u32,
     },
 
     /// Report the active VPN data-plane path (`"relay"` or `"direct"`) for the
@@ -2072,6 +2090,13 @@ pub enum ServerMessage {
         /// `min(listener, connector, server max)`. Old server → absent → 1.
         #[serde(default = "default_vpn_carriers")]
         carriers: u16,
+        /// This server decodes [`ClientMessage::Heartbeat`] on this link's
+        /// control stream and reaps it on transport silence: `true` only for a
+        /// side that declared `ctrl_heartbeat_ms`. The client beats after
+        /// pairing iff it is set — an old server would fail to decode the frame
+        /// (I-9). Old server → absent → `false`.
+        #[serde(default)]
+        ctrl_heartbeat: bool,
     },
 
     /// VPN pairing failed (duplicate id, pool exhausted, overlap, etc.).
@@ -2516,9 +2541,10 @@ impl ControlFrameSummary for ServerMessage {
                 tuning,
                 admin_v2,
                 carriers,
+                ctrl_heartbeat,
             } => {
                 format!(
-                    "VpnReady {{ assigned={}, prefix={}, peer_overlay={}, peer_advertised={:?}, session_nonce={}, tuning={{ {} }}, admin_v2={}, carriers={} }}",
+                    "VpnReady {{ assigned={}, prefix={}, peer_overlay={}, peer_advertised={:?}, session_nonce={}, tuning={{ {} }}, admin_v2={}, carriers={}, ctrl_heartbeat={} }}",
                     assigned,
                     prefix,
                     peer_overlay,
@@ -2527,6 +2553,7 @@ impl ControlFrameSummary for ServerMessage {
                     tuning.control_frame_summary(),
                     admin_v2,
                     carriers,
+                    ctrl_heartbeat,
                 )
             }
             ServerMessage::VpnError(msg) => {
@@ -3870,6 +3897,7 @@ fn serde_roundtrip_vpn_messages() {
         nat_masquerade: false,
         route_policy: None,
         nat_udp_preferred_port: 0,
+        ctrl_heartbeat_ms: 0,
     };
     let json = serde_json::to_string(&msg).unwrap();
     let back: ClientMessage = serde_json::from_str(&json).unwrap();
@@ -3884,6 +3912,7 @@ fn serde_roundtrip_vpn_messages() {
         tuning: UdpDirectTuning::default(),
         admin_v2: true,
         carriers: 1,
+        ctrl_heartbeat: false,
     };
     let json = serde_json::to_string(&msg).unwrap();
     let back: ServerMessage = serde_json::from_str(&json).unwrap();
@@ -3949,6 +3978,7 @@ fn t_vpnwire_hello_roundtrip_with_flags() {
         nat_masquerade: true,
         route_policy: Some("accept:2 refuse:1".to_string()),
         nat_udp_preferred_port: 8443,
+        ctrl_heartbeat_ms: 0,
     };
     let json = serde_json::to_string(&msg).unwrap();
     let back: ClientMessage = serde_json::from_str(&json).unwrap();
@@ -4067,6 +4097,75 @@ fn advertise_parse_mixed_list() {
     assert_eq!(exposed[1], "172.16.0.0/24".parse::<Ipv4Net>().unwrap());
 }
 
+/// Plan 005, D6: the VPN liveness fields are additive in both directions. A
+/// legacy `HelloVpn`/`ConnectVpn` (no `ctrl_heartbeat_ms`) declares nothing,
+/// a legacy `VpnReady` (no `ctrl_heartbeat`) never invites a beat, and both
+/// survive a round trip.
+#[test]
+fn vpn_liveness_fields_default_and_roundtrip() {
+    let legacy_hello = r#"{"HelloVpn":{"id":"l","advertised":[],"addr":"Pool","notes":null}}"#;
+    match serde_json::from_str::<ClientMessage>(legacy_hello).unwrap() {
+        ClientMessage::HelloVpn {
+            ctrl_heartbeat_ms, ..
+        } => assert_eq!(ctrl_heartbeat_ms, 0),
+        other => panic!("unexpected {other:?}"),
+    }
+    let legacy_connect = r#"{"ConnectVpn":{"id":"l","advertised":[],"addr":"Pool","notes":null}}"#;
+    match serde_json::from_str::<ClientMessage>(legacy_connect).unwrap() {
+        ClientMessage::ConnectVpn {
+            ctrl_heartbeat_ms, ..
+        } => assert_eq!(ctrl_heartbeat_ms, 0),
+        other => panic!("unexpected {other:?}"),
+    }
+    let ready = ServerMessage::VpnReady {
+        assigned: "10.99.0.1".parse().unwrap(),
+        prefix: 30,
+        peer_overlay: "10.99.0.2".parse().unwrap(),
+        peer_advertised: vec![],
+        session_nonce: [0u8; 16],
+        tuning: UdpDirectTuning::default(),
+        admin_v2: true,
+        carriers: 1,
+        ctrl_heartbeat: true,
+    };
+    let mut json: serde_json::Value = serde_json::to_value(&ready).unwrap();
+    match serde_json::from_value::<ServerMessage>(json.clone()).unwrap() {
+        ServerMessage::VpnReady { ctrl_heartbeat, .. } => assert!(ctrl_heartbeat),
+        other => panic!("unexpected {other:?}"),
+    }
+    json["VpnReady"]
+        .as_object_mut()
+        .unwrap()
+        .remove("ctrl_heartbeat");
+    match serde_json::from_value::<ServerMessage>(json).unwrap() {
+        ServerMessage::VpnReady { ctrl_heartbeat, .. } => assert!(!ctrl_heartbeat),
+        other => panic!("unexpected {other:?}"),
+    }
+    let hello = ClientMessage::ConnectVpn {
+        id: "l".into(),
+        advertised: vec![],
+        addr: VpnAddrRequest::Pool,
+        notes: None,
+        carriers: 1,
+        relay_only: false,
+        pin_mtu: false,
+        mtu: None,
+        forward_accept: false,
+        nat_masquerade: false,
+        route_policy: None,
+        nat_udp_preferred_port: 0,
+        ctrl_heartbeat_ms: 2000,
+    };
+    let back: ClientMessage =
+        serde_json::from_str(&serde_json::to_string(&hello).unwrap()).unwrap();
+    match back {
+        ClientMessage::ConnectVpn {
+            ctrl_heartbeat_ms, ..
+        } => assert_eq!(ctrl_heartbeat_ms, 2000),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
 #[test]
 fn hello_vpn_serde_roundtrip_with_and_without_max_clients() {
     // Test legacy payload without max_clients deserializes to 0
@@ -4094,6 +4193,7 @@ fn hello_vpn_serde_roundtrip_with_and_without_max_clients() {
         nat_masquerade: false,
         route_policy: None,
         nat_udp_preferred_port: 0,
+        ctrl_heartbeat_ms: 0,
     };
     let json = serde_json::to_string(&msg).unwrap();
     let back: ClientMessage = serde_json::from_str(&json).unwrap();

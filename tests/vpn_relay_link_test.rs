@@ -140,6 +140,7 @@ async fn vpn_relay_link_bulk_bidirectional_no_wedge() {
             nat_masquerade: false,
             route_policy: None,
             nat_udp_preferred_port: 0,
+            ctrl_heartbeat_ms: 0,
         })
         .await
         .unwrap();
@@ -162,6 +163,7 @@ async fn vpn_relay_link_bulk_bidirectional_no_wedge() {
             nat_masquerade: false,
             route_policy: None,
             nat_udp_preferred_port: 0,
+            ctrl_heartbeat_ms: 0,
         })
         .await
         .unwrap();
@@ -262,6 +264,7 @@ async fn pair_multi(
             nat_masquerade: false,
             route_policy: None,
             nat_udp_preferred_port: 0,
+            ctrl_heartbeat_ms: 0,
         })
         .await
         .unwrap();
@@ -283,6 +286,7 @@ async fn pair_multi(
             nat_masquerade: false,
             route_policy: None,
             nat_udp_preferred_port: 0,
+            ctrl_heartbeat_ms: 0,
         })
         .await
         .unwrap();
@@ -375,6 +379,7 @@ async fn vpn_relay_multi_carrier_one_stream_dies() {
             nat_masquerade: false,
             route_policy: None,
             nat_udp_preferred_port: 0,
+            ctrl_heartbeat_ms: 0,
         })
         .await
         .unwrap();
@@ -395,6 +400,7 @@ async fn vpn_relay_multi_carrier_one_stream_dies() {
             nat_masquerade: false,
             route_policy: None,
             nat_udp_preferred_port: 0,
+            ctrl_heartbeat_ms: 0,
         })
         .await
         .unwrap();

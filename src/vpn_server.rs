@@ -798,6 +798,7 @@ pub async fn serve_vpn_listener(
                 tuning: udp_tuning,
                 admin_v2: true,
                 carriers,
+                ctrl_heartbeat: false,
             })
             .await?;
 
@@ -1194,6 +1195,7 @@ pub async fn serve_vpn_connector(
                 tuning: udp_tuning,
                 admin_v2: true,
                 carriers: effective_carriers,
+                ctrl_heartbeat: false,
             })
             .await?;
 
@@ -1589,6 +1591,7 @@ pub async fn serve_vpn_connector(
         tuning: udp_tuning,
         admin_v2: true,
         carriers: effective_carriers,
+        ctrl_heartbeat: false,
     };
 
     let connector_ready = ServerMessage::VpnReady {
@@ -1600,6 +1603,7 @@ pub async fn serve_vpn_connector(
         tuning: udp_tuning,
         admin_v2: true,
         carriers: effective_carriers,
+        ctrl_heartbeat: false,
     };
 
     // Send VpnReady to connector

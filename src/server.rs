@@ -2762,12 +2762,23 @@ impl Server {
                 // Owner control runs its own dedicated loop (heartbeat tick
                 // reaper, epoch-matched close). Auth ordering and transport
                 // setup above are unchanged; a disabled service answers the
-                // generic upgrade error from inside.
+                // generic upgrade error from inside. A declared owner
+                // (plan 005, D8) is also reaped on transport silence.
+                let declared_ms = match &msg {
+                    ClientMessage::CreateWebTransferRoom {
+                        ctrl_heartbeat_ms, ..
+                    }
+                    | ClientMessage::ResumeWebTransferRoom {
+                        ctrl_heartbeat_ms, ..
+                    } => *ctrl_heartbeat_ms,
+                    _ => 0,
+                };
                 crate::web_transfer::serve_owner_first_message(
                     self.web_transfer.clone(),
                     &mut control,
                     msg,
                     self.web_transfer_ctrl_timeout,
+                    reaper(declared_ms),
                 )
                 .await?;
                 Ok(())

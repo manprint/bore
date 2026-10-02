@@ -6693,11 +6693,16 @@ where
 /// Dispatches the FIRST message of a native owner control stream. Version is
 /// verified before any allocation; a disabled service answers the existing
 /// generic protocol error so the client can map it. Returns the loop outcome.
+///
+/// `transport` is the server's transport reaper for a declared owner
+/// (`None` for a legacy owner, or in tests without a mux connection); the
+/// owner's own `ctrl_heartbeat_ms` decides whether the server heartbeats it.
 pub async fn serve_owner_first_message<S>(
     registry: Option<std::sync::Arc<WebTransferRegistry>>,
     control: &mut crate::shared::Delimited<S>,
     msg: crate::shared::ClientMessage,
     ctrl_timeout: Duration,
+    transport: Option<crate::liveness::TransportReaper>,
 ) -> anyhow::Result<OwnerControlOutcome>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -6716,7 +6721,12 @@ where
             member_token_hash,
             owner_token_hash,
             relay_only,
+            ctrl_heartbeat_ms,
         } => {
+            let liveness = OwnerLiveness {
+                server_heartbeats: ctrl_heartbeat_ms > 0,
+                transport,
+            };
             if version != WEB_TRANSFER_OWNER_PROTOCOL_VERSION {
                 control.send(ServerMessage::Error(format!(
                     "unsupported web-transfer version {version}: upgrade the client and server together"
@@ -6773,13 +6783,18 @@ where
                     relay_only: lease.room().relay_only,
                 })
                 .await?;
-            Ok(serve_owner_control(lease, control, ctrl_timeout).await?)
+            Ok(serve_owner_control(lease, control, ctrl_timeout, liveness).await?)
         }
         ClientMessage::ResumeWebTransferRoom {
             version,
             room_id,
             owner_token,
+            ctrl_heartbeat_ms,
         } => {
+            let liveness = OwnerLiveness {
+                server_heartbeats: ctrl_heartbeat_ms > 0,
+                transport,
+            };
             if version != WEB_TRANSFER_OWNER_PROTOCOL_VERSION {
                 control.send(ServerMessage::Error(format!(
                     "unsupported web-transfer version {version}: upgrade the client and server together"
@@ -6819,7 +6834,7 @@ where
                             owner_epoch: epoch,
                         })
                         .await?;
-                    serve_owner_control(lease, control, ctrl_timeout).await?
+                    serve_owner_control(lease, control, ctrl_timeout, liveness).await?
                 }
                 Err(_) => {
                     control
@@ -6858,20 +6873,43 @@ where
     }
 }
 
+/// How the server watches one owner control connection (plan 005, D8).
+pub struct OwnerLiveness {
+    /// The owner declared a heartbeat interval: heartbeat it on every reaper
+    /// tick, so it can tell a dead path from an idle room. A legacy owner
+    /// never asked, and gets exactly the old silent loop.
+    pub server_heartbeats: bool,
+    /// Reap the owner when nothing at all arrived on its connection for the
+    /// transport deadline. `None` = only the legacy `ctrl_timeout` applies.
+    pub transport: Option<crate::liveness::TransportReaper>,
+}
+
+impl OwnerLiveness {
+    /// The pre-plan-005 behaviour: no server heartbeats, no transport reap.
+    pub fn legacy() -> Self {
+        Self {
+            server_heartbeats: false,
+            transport: None,
+        }
+    }
+}
+
 /// Runs one owner control session: `Heartbeat` refreshes `last_recv`, a
 /// matching close destroys, anything else terminates the loop, EOF/detach
 /// unwinds through the lease `Drop`. Liveness is checked on the 500 ms tick
 /// against `last_recv` — never `timeout(recv)` — and every heartbeat send
-/// elsewhere uses the bounded `beat_once` shape.
+/// is bounded (P-9). A declared owner (`liveness`) is also heartbeated on
+/// that tick and reaped on transport silence.
 pub async fn serve_owner_control<S>(
     lease: OwnerLease,
     control: &mut crate::shared::Delimited<S>,
     ctrl_timeout: Duration,
+    liveness: OwnerLiveness,
 ) -> anyhow::Result<OwnerControlOutcome>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    use crate::shared::ClientMessage;
+    use crate::shared::{ClientMessage, ServerMessage};
 
     let mut last_recv = Instant::now();
     let mut heartbeats = 0u64;
@@ -6881,6 +6919,46 @@ where
         tokio::select! {
             _ = tick.tick() => {
                 if last_recv.elapsed() >= ctrl_timeout {
+                    return Ok(OwnerControlOutcome {
+                        closed_explicit: false,
+                        heartbeats,
+                        timed_out: true,
+                    });
+                }
+                if liveness.server_heartbeats {
+                    match tokio::time::timeout(
+                        crate::secret::ctrl_heartbeat_send_timeout(),
+                        control.send(ServerMessage::Heartbeat),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        // The owner's connection is gone: the same outcome
+                        // as its EOF.
+                        Ok(Err(_)) => {
+                            return Ok(OwnerControlOutcome {
+                                closed_explicit: false,
+                                heartbeats,
+                                timed_out: false,
+                            });
+                        }
+                        // An owner that stopped reading is a lost owner,
+                        // never a wedged loop (P-9).
+                        Err(_) => {
+                            return Ok(OwnerControlOutcome {
+                                closed_explicit: false,
+                                heartbeats,
+                                timed_out: true,
+                            });
+                        }
+                    }
+                }
+                if let Some(idle) = crate::liveness::reap_if_due(&liveness.transport) {
+                    tracing::warn!(
+                        room = %lease.id(),
+                        ?idle,
+                        "web-transfer owner connection silent; reaping (path dead)"
+                    );
                     return Ok(OwnerControlOutcome {
                         closed_explicit: false,
                         heartbeats,
@@ -7497,6 +7575,7 @@ mod owner_control_tests {
                 None,
                 &mut server,
                 ClientMessage::CreateWebTransferRoom {
+                    ctrl_heartbeat_ms: 0,
                     version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
                     room_id: RoomId::from_bytes([1u8; 16]),
                     member_token_hash: member_hash,
@@ -7504,6 +7583,7 @@ mod owner_control_tests {
                     relay_only: false,
                 },
                 Duration::from_secs(60),
+                None,
             )
             .await
         });
@@ -7534,6 +7614,7 @@ mod owner_control_tests {
                 Some(task_registry),
                 &mut server,
                 ClientMessage::CreateWebTransferRoom {
+                    ctrl_heartbeat_ms: 0,
                     version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION - 1,
                     room_id: RoomId::from_bytes([2u8; 16]),
                     member_token_hash: member_hash,
@@ -7541,6 +7622,7 @@ mod owner_control_tests {
                     relay_only: false,
                 },
                 Duration::from_secs(60),
+                None,
             )
             .await
         });
@@ -7574,6 +7656,7 @@ mod owner_control_tests {
                 None,
                 &mut server,
                 ClientMessage::CreateWebTransferRoom {
+                    ctrl_heartbeat_ms: 0,
                     version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
                     room_id: RoomId::from_bytes([3u8; 16]),
                     member_token_hash: member_hash,
@@ -7581,6 +7664,7 @@ mod owner_control_tests {
                     relay_only: false,
                 },
                 Duration::from_secs(60),
+                None,
             )
             .await
         });
@@ -7615,6 +7699,7 @@ mod owner_control_tests {
                 Some(Arc::new(registry)),
                 &mut server,
                 ClientMessage::CreateWebTransferRoom {
+                    ctrl_heartbeat_ms: 0,
                     version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
                     room_id: RoomId::from_bytes([4u8; 16]),
                     member_token_hash: member_hash,
@@ -7622,6 +7707,7 @@ mod owner_control_tests {
                     relay_only: false,
                 },
                 Duration::from_secs(60),
+                None,
             )
             .await
         });
@@ -7687,6 +7773,7 @@ mod owner_control_tests {
                     Some(server_registry),
                     &mut server,
                     ClientMessage::CreateWebTransferRoom {
+                        ctrl_heartbeat_ms: 0,
                         version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
                         room_id: requested,
                         member_token_hash: member_hash,
@@ -7694,6 +7781,7 @@ mod owner_control_tests {
                         relay_only: true,
                     },
                     Duration::from_secs(60),
+                    None,
                 )
                 .await
             }
@@ -7738,11 +7826,13 @@ mod owner_control_tests {
                 Some(Arc::new(registry)),
                 &mut server,
                 ClientMessage::ResumeWebTransferRoom {
+                    ctrl_heartbeat_ms: 0,
                     version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
                     room_id: id,
                     owner_token: owner,
                 },
                 Duration::from_secs(60),
+                None,
             )
             .await
         });
@@ -7751,6 +7841,136 @@ mod owner_control_tests {
         assert!(!json.contains(&owner_hex), "token in reply: {json}");
         drop(client);
         server_task.await.unwrap().unwrap();
+    }
+
+    /// Plan 005, D8: a declared owner is heartbeated on every reaper tick, so
+    /// it can tell a dead path from an idle room; a legacy owner never is.
+    #[tokio::test]
+    async fn owner_control_sends_heartbeats_only_when_declared() {
+        for (declared_ms, expect_beats) in [(2000u32, true), (0u32, false)] {
+            let (_owner, member_hash, owner_hash) = owner_pair();
+            let registry = test_registry();
+            let (mut client, mut server) = duplex_pair().await;
+            let server_task = tokio::spawn(async move {
+                serve_owner_first_message(
+                    Some(Arc::new(registry)),
+                    &mut server,
+                    ClientMessage::CreateWebTransferRoom {
+                        version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
+                        room_id: RoomId::from_bytes([0x31u8; 16]),
+                        member_token_hash: member_hash,
+                        owner_token_hash: owner_hash,
+                        relay_only: false,
+                        ctrl_heartbeat_ms: declared_ms,
+                    },
+                    Duration::from_secs(60),
+                    None,
+                )
+                .await
+            });
+            let (id, epoch) = match client.recv::<ServerMessage>().await.unwrap() {
+                Some(ServerMessage::WebTransferRoomCreated {
+                    room_id,
+                    owner_epoch,
+                    ..
+                }) => (room_id, owner_epoch),
+                other => panic!("expected Created, got {other:?}"),
+            };
+            let mut beats = 0;
+            let window = tokio::time::Instant::now() + Duration::from_millis(1200);
+            while let Ok(msg) =
+                tokio::time::timeout_at(window, client.recv::<ServerMessage>()).await
+            {
+                match msg.unwrap() {
+                    Some(ServerMessage::Heartbeat) => beats += 1,
+                    other => panic!("unexpected owner frame {other:?}"),
+                }
+            }
+            if expect_beats {
+                assert!(beats >= 2, "declared owner got {beats} heartbeats in 1.2 s");
+            } else {
+                assert_eq!(beats, 0, "a legacy owner was heartbeated");
+            }
+            client
+                .send(ClientMessage::CloseWebTransferRoom {
+                    room_id: id,
+                    owner_epoch: epoch,
+                })
+                .await
+                .unwrap();
+            let outcome = tokio::time::timeout(Duration::from_secs(5), server_task)
+                .await
+                .expect("the close ends the owner loop")
+                .unwrap()
+                .unwrap();
+            assert!(outcome.closed_explicit, "{outcome:?}");
+        }
+    }
+
+    /// Plan 005, D8: a declared owner whose connection carries nothing for the
+    /// transport deadline is reaped at once, and its room is detached (so the
+    /// owner, reconnecting from wherever its path now runs, can resume it).
+    #[tokio::test]
+    async fn owner_control_transport_reaps_silent_declared_owner() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (owner, member_hash, owner_hash) = owner_pair();
+        let registry = test_registry();
+        let task_registry = Arc::new(registry.clone());
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (client_opener, _client_acceptor) = crate::mux::client(a);
+        let (server_opener, mut server_acceptor) = crate::mux::server(b);
+        let mut client_stream = client_opener.open().await.unwrap();
+        client_stream
+            .write_all(&[crate::mux::STREAM_READY])
+            .await
+            .unwrap();
+        let mut server_stream = server_acceptor.accept().await.unwrap();
+        let mut marker = [0u8; 1];
+        server_stream.read_exact(&mut marker).await.unwrap();
+        let mut client = Delimited::new(client_stream);
+        let mut server = Delimited::new(server_stream);
+        let transport = crate::liveness::TransportReaper::new(
+            server_opener.activity(),
+            100,
+            Duration::from_millis(300),
+        );
+        assert!(transport.is_some(), "a declared owner gets a reaper");
+        let room_id = RoomId::from_bytes([0x32u8; 16]);
+        let server_task = tokio::spawn(async move {
+            serve_owner_first_message(
+                Some(task_registry),
+                &mut server,
+                ClientMessage::CreateWebTransferRoom {
+                    version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
+                    room_id,
+                    member_token_hash: member_hash,
+                    owner_token_hash: owner_hash,
+                    relay_only: false,
+                    ctrl_heartbeat_ms: 100,
+                },
+                Duration::from_secs(60),
+                transport,
+            )
+            .await
+        });
+        assert!(matches!(
+            client.recv::<ServerMessage>().await.unwrap(),
+            Some(ServerMessage::WebTransferRoomCreated { .. })
+        ));
+        // From here the owner sends nothing at all: the path is dead.
+        let outcome = tokio::time::timeout(Duration::from_secs(3), server_task)
+            .await
+            .expect("a silent declared owner must be reaped within the deadline")
+            .unwrap()
+            .unwrap();
+        assert!(outcome.timed_out, "{outcome:?}");
+        assert!(!outcome.closed_explicit, "{outcome:?}");
+        // The lease is released: the room is detached and resumable.
+        assert!(
+            OwnerLease::resume(&registry, room_id, &owner).is_ok(),
+            "the reaped owner's room must be resumable"
+        );
+        drop(client);
     }
 
     #[tokio::test]
@@ -7764,6 +7984,7 @@ mod owner_control_tests {
                 Some(Arc::new(registry)),
                 &mut server,
                 ClientMessage::CreateWebTransferRoom {
+                    ctrl_heartbeat_ms: 0,
                     version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
                     room_id: RoomId::from_bytes([5u8; 16]),
                     member_token_hash: member_hash,
@@ -7771,6 +7992,7 @@ mod owner_control_tests {
                     relay_only: false,
                 },
                 Duration::from_millis(300),
+                None,
             )
             .await
         });
@@ -7815,7 +8037,12 @@ mod owner_control_tests {
         // here for its whole deadline, while the tick reaper fires at 50 ms.
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            serve_owner_control(lease, &mut server, Duration::from_millis(50)),
+            serve_owner_control(
+                lease,
+                &mut server,
+                Duration::from_millis(50),
+                OwnerLiveness::legacy(),
+            ),
         )
         .await
         .expect("reaper must fire on its tick, not on a recv deadline")
@@ -7837,6 +8064,7 @@ mod owner_control_tests {
                 Some(task_registry),
                 &mut server,
                 ClientMessage::CreateWebTransferRoom {
+                    ctrl_heartbeat_ms: 0,
                     version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
                     room_id: RoomId::from_bytes([6u8; 16]),
                     member_token_hash: member_hash,
@@ -7844,6 +8072,7 @@ mod owner_control_tests {
                     relay_only: false,
                 },
                 Duration::from_secs(60),
+                None,
             )
             .await
         });
@@ -7898,6 +8127,7 @@ mod owner_control_tests {
                     owner_epoch: epoch,
                 },
                 Duration::from_secs(60),
+                None,
             ),
         )
         .await
@@ -7925,6 +8155,7 @@ mod owner_control_tests {
                 Some(task_registry),
                 &mut server,
                 ClientMessage::CreateWebTransferRoom {
+                    ctrl_heartbeat_ms: 0,
                     version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
                     room_id: RoomId::from_bytes([7u8; 16]),
                     member_token_hash: member_hash,
@@ -7932,6 +8163,7 @@ mod owner_control_tests {
                     relay_only: false,
                 },
                 Duration::from_secs(60),
+                None,
             )
             .await
         });

@@ -1867,6 +1867,12 @@ pub enum ClientMessage {
         /// back and the CLI refuses a room that did not confirm it.
         #[serde(default)]
         relay_only: bool,
+        /// Plan 005, D8: the owner's control heartbeat interval in ms; `0` =
+        /// declares nothing (an old CLI omits the field). A server that reads
+        /// a nonzero value heartbeats the owner, so the owner can notice a
+        /// dead path, and reaps the owner control on transport silence.
+        #[serde(default)]
+        ctrl_heartbeat_ms: u32,
     },
 
     /// Resumes a detached web-transfer room on a fresh control connection.
@@ -1880,6 +1886,10 @@ pub enum ClientMessage {
         room_id: crate::web_transfer::RoomId,
         /// Owner token proving the lease.
         owner_token: crate::web_transfer::OwnerToken,
+        /// Plan 005, D8: same meaning as on `CreateWebTransferRoom`; each
+        /// control connection declares for itself.
+        #[serde(default)]
+        ctrl_heartbeat_ms: u32,
     },
 
     /// Destroys a web-transfer room immediately (clean owner close).
@@ -3039,6 +3049,7 @@ mod tests {
         let room_id = crate::web_transfer::RoomId::from_bytes([0xabu8; 16]);
         let owner_token = crate::web_transfer::OwnerToken::from_bytes([0xcdu8; 32]);
         let create = ClientMessage::CreateWebTransferRoom {
+            ctrl_heartbeat_ms: 0,
             version: 2,
             room_id,
             member_token_hash: [1u8; 32],
@@ -3051,6 +3062,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&back).unwrap(), json);
 
         let resume = ClientMessage::ResumeWebTransferRoom {
+            ctrl_heartbeat_ms: 0,
             version: 2,
             room_id,
             owner_token,
@@ -3101,6 +3113,7 @@ mod tests {
     #[test]
     fn create_v2_round_trips_with_required_room_id() {
         let create = ClientMessage::CreateWebTransferRoom {
+            ctrl_heartbeat_ms: 0,
             version: 2,
             room_id: crate::web_transfer::RoomId::from_bytes([0xabu8; 16]),
             member_token_hash: [1u8; 32],
@@ -3114,8 +3127,62 @@ mod tests {
     }
 
     #[test]
+    fn owner_liveness_field_defaults_and_round_trips() {
+        // An old CLI omits `ctrl_heartbeat_ms`: it must read as 0 (declares
+        // nothing), on both owner open messages.
+        let room = "ab".repeat(16);
+        let create: ClientMessage = serde_json::from_str(&format!(
+            r#"{{"CreateWebTransferRoom":{{"version":2,"room_id":"{room}","member_token_hash":{h},"owner_token_hash":{h}}}}}"#,
+            h = serde_json::to_string(&[1u8; 32]).unwrap()
+        ))
+        .unwrap();
+        assert!(matches!(
+            create,
+            ClientMessage::CreateWebTransferRoom {
+                ctrl_heartbeat_ms: 0,
+                ..
+            }
+        ));
+        let resume: ClientMessage = serde_json::from_str(&format!(
+            r#"{{"ResumeWebTransferRoom":{{"version":2,"room_id":"{room}","owner_token":"{}"}}}}"#,
+            "cd".repeat(32)
+        ))
+        .unwrap();
+        assert!(matches!(
+            resume,
+            ClientMessage::ResumeWebTransferRoom {
+                ctrl_heartbeat_ms: 0,
+                ..
+            }
+        ));
+        // A declared value survives the round trip.
+        for msg in [
+            ClientMessage::CreateWebTransferRoom {
+                version: 2,
+                room_id: crate::web_transfer::RoomId::from_bytes([0xabu8; 16]),
+                member_token_hash: [1u8; 32],
+                owner_token_hash: [2u8; 32],
+                relay_only: false,
+                ctrl_heartbeat_ms: 2000,
+            },
+            ClientMessage::ResumeWebTransferRoom {
+                version: 2,
+                room_id: crate::web_transfer::RoomId::from_bytes([0xabu8; 16]),
+                owner_token: crate::web_transfer::OwnerToken::from_bytes([0xcdu8; 32]),
+                ctrl_heartbeat_ms: 2000,
+            },
+        ] {
+            let json = serde_json::to_string(&msg).unwrap();
+            assert!(json.contains(r#""ctrl_heartbeat_ms":2000"#), "{json}");
+            let back: ClientMessage = serde_json::from_str(&json).unwrap();
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        }
+    }
+
+    #[test]
     fn missing_room_id_does_not_deserialize() {
         let mut value = serde_json::to_value(ClientMessage::CreateWebTransferRoom {
+            ctrl_heartbeat_ms: 0,
             version: 2,
             room_id: crate::web_transfer::RoomId::from_bytes([0xabu8; 16]),
             member_token_hash: [1u8; 32],

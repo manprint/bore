@@ -28,8 +28,11 @@ use crate::web_transfer::{
 };
 use crate::web_transfer_protocol::{derive_room_link_material, encode_room_link_seed};
 
-/// Owner heartbeat period: the server reaps past its own (longer) deadline.
-pub const OWNER_HEARTBEAT: Duration = Duration::from_secs(20);
+/// Owner heartbeat period (plan 005, D8): the shared client heartbeat, so a
+/// server that knows it reaps a silent owner after 15 s, and a flick short
+/// enough for TCP to repair never costs the owner its lease. The live value
+/// honours `BORE_CTRL_HEARTBEAT_MS` ([`crate::liveness::ctrl_client_heartbeat`]).
+pub const OWNER_HEARTBEAT: Duration = crate::liveness::CTRL_CLIENT_HEARTBEAT;
 /// Bound on one graceful-close write.
 pub const OWNER_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Resume backoff ladder in milliseconds (then the ceiling holds).
@@ -290,20 +293,65 @@ async fn owner_connect(
     Ok((control, reply))
 }
 
+/// The owner's liveness knobs (plan 005, D8).
+#[derive(Clone, Copy, Debug)]
+struct OwnerKnobs {
+    /// How often the owner beats.
+    heartbeat: Duration,
+    /// How long a server that HAS heartbeated may stay silent before the
+    /// owner treats its path as dead; `None` disables the deadline.
+    silence: Option<Duration>,
+}
+
+impl OwnerKnobs {
+    /// The production values, honouring `BORE_CTRL_HEARTBEAT_MS` and
+    /// `BORE_CTRL_SERVER_SILENCE_MS`.
+    fn from_env() -> Self {
+        Self {
+            heartbeat: crate::liveness::ctrl_client_heartbeat(),
+            silence: crate::liveness::client_silence_deadline(),
+        }
+    }
+}
+
 /// Runs one heartbeat/read/lifecycle phase on a live session. Returns when
 /// the transport is lost (resume next) or a clean event closed the room.
+///
+/// A server that heartbeats the owner (it read our declared interval) proves
+/// its path every 500 ms, so once one `Heartbeat` has arrived, silence past
+/// `knobs.silence` means the path is dead and the owner resumes at once —
+/// instead of waiting for the kernel to give up on the connection (~15 min),
+/// long after the owner grace ended the room. A server that never
+/// heartbeats (it predates the field) never arms the deadline: the old
+/// behaviour, unchanged.
 async fn heartbeat_phase<S: AsyncRead + AsyncWrite + Unpin>(
     session: &mut OwnerSession<S>,
     lifecycle_rx: &mut mpsc::Receiver<OwnerLifecycle>,
+    knobs: OwnerKnobs,
 ) -> Result<HeartbeatEnd> {
-    let mut beat = tokio::time::interval(OWNER_HEARTBEAT);
+    let mut beat = tokio::time::interval(knobs.heartbeat);
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The first tick fires immediately; skip it so beats wait a full period.
     beat.tick().await;
+    let mut liveness = crate::liveness::LivenessTicker::new(knobs.silence);
+    let mut last_server_msg = Instant::now();
+    let mut server_beats_seen = false;
     loop {
         tokio::select! {
             _ = beat.tick() => {
                 if !beat_action(beat_once(&mut session.control).await) {
                     tracing::warn!(room = %session.room_id, "owner control lost, resuming");
+                    return Ok(HeartbeatEnd::Lost);
+                }
+            }
+            _ = liveness.tick() => {
+                let idle = last_server_msg.elapsed();
+                if server_beats_seen && knobs.silence.is_some_and(|deadline| idle >= deadline) {
+                    tracing::warn!(
+                        room = %session.room_id,
+                        ?idle,
+                        "no data from the server on the owner control (connection lost), resuming"
+                    );
                     return Ok(HeartbeatEnd::Lost);
                 }
             }
@@ -320,7 +368,11 @@ async fn heartbeat_phase<S: AsyncRead + AsyncWrite + Unpin>(
                     Ok(Some(ServerMessage::Error(err))) => {
                         bail!("server error for room {}: {err}", session.room_id);
                     }
-                    Ok(Some(_)) => {}
+                    Ok(Some(ServerMessage::Heartbeat)) => {
+                        last_server_msg = Instant::now();
+                        server_beats_seen = true;
+                    }
+                    Ok(Some(_)) => last_server_msg = Instant::now(),
                 }
             }
             event = lifecycle_rx.recv() => {
@@ -375,6 +427,7 @@ where
             version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
             room_id,
             owner_token,
+            ctrl_heartbeat_ms: crate::liveness::ctrl_heartbeat_declared_ms(),
         }),
     )
     .await;
@@ -439,6 +492,7 @@ where
             version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
             room_id,
             owner_token,
+            ctrl_heartbeat_ms: crate::liveness::ctrl_heartbeat_declared_ms(),
         })
         .await
         {
@@ -460,6 +514,10 @@ where
                     session.close_bounded().await;
                     bail!(OWNER_PROTOCOL_MISMATCH_ERROR);
                 }
+                // The counterpart of the `warn!` that announced the loss: an
+                // operator reading the log must be able to tell a room that
+                // came back from one still retrying.
+                tracing::info!(room = %room_id, "owner control resumed");
                 return Ok(ResumeEnd::Resumed(OwnerSession {
                     control,
                     room_id,
@@ -507,6 +565,7 @@ where
         member_token_hash: member_hash,
         owner_token_hash: owner_hash,
         relay_only: config.relay_only,
+        ctrl_heartbeat_ms: crate::liveness::ctrl_heartbeat_declared_ms(),
     })
     .await?;
     let (room_id, epoch, base_url) = match reply {
@@ -582,7 +641,7 @@ where
     };
     let mut first_loss: Option<Instant> = None;
     loop {
-        match heartbeat_phase(&mut session, lifecycle_rx).await? {
+        match heartbeat_phase(&mut session, lifecycle_rx, OwnerKnobs::from_env()).await? {
             HeartbeatEnd::Done => return Ok(OwnerShutdown::CleanClose),
             HeartbeatEnd::Lost => {}
         }
@@ -881,7 +940,7 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_uses_bounded_beat_once() {
-        assert_eq!(OWNER_HEARTBEAT, Duration::from_secs(20));
+        assert_eq!(OWNER_HEARTBEAT, Duration::from_secs(2));
         assert_eq!(
             crate::secret::ctrl_heartbeat_send_timeout(),
             Duration::from_secs(10)
@@ -895,6 +954,80 @@ mod tests {
             server.recv::<ClientMessage>().await.unwrap(),
             Some(ClientMessage::Heartbeat)
         ));
+    }
+
+    /// A duplex owner session plus the fake server's end, for the
+    /// heartbeat-phase tests.
+    fn owner_session_pair() -> (
+        OwnerSession<tokio::io::DuplexStream>,
+        Delimited<tokio::io::DuplexStream>,
+    ) {
+        let (a, b) = tokio::io::duplex(65536);
+        (
+            OwnerSession {
+                control: Delimited::new(a),
+                room_id: RoomId::from_bytes([7u8; 16]),
+                epoch: 0,
+            },
+            Delimited::new(b),
+        )
+    }
+
+    const TEST_KNOBS: OwnerKnobs = OwnerKnobs {
+        heartbeat: Duration::from_millis(100),
+        silence: Some(Duration::from_millis(400)),
+    };
+
+    /// Plan 005, D8: a server that heartbeated the owner and then went silent
+    /// lost its path; the owner resumes within the deadline instead of
+    /// waiting for the kernel (~15 min, long after the owner grace).
+    #[tokio::test]
+    async fn heartbeat_phase_trips_after_server_beats_stop() {
+        let (mut session, mut server) = owner_session_pair();
+        let (_lifecycle_tx, mut lifecycle_rx) = mpsc::channel::<OwnerLifecycle>(1);
+        let server_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                server.send(ServerMessage::Heartbeat).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            // Silent from here, but still reading: the link is open, the
+            // server just says nothing — exactly a dead return path.
+            while let Ok(Some(_)) = server.recv::<ClientMessage>().await {}
+        });
+        let end = tokio::time::timeout(
+            Duration::from_millis(1500),
+            heartbeat_phase(&mut session, &mut lifecycle_rx, TEST_KNOBS),
+        )
+        .await
+        .expect("the owner must give up on a server that stopped heartbeating")
+        .unwrap();
+        assert!(matches!(end, HeartbeatEnd::Lost));
+        server_task.abort();
+    }
+
+    /// Plan 005, D8 compat: a server that never heartbeats (it predates the
+    /// field) never arms the deadline, however long it stays quiet.
+    #[tokio::test]
+    async fn heartbeat_phase_never_trips_without_server_beats() {
+        let (mut session, mut server) = owner_session_pair();
+        let (_lifecycle_tx, mut lifecycle_rx) = mpsc::channel::<OwnerLifecycle>(1);
+        let server_task = tokio::spawn(async move {
+            let mut beats = 0u32;
+            while let Ok(Some(ClientMessage::Heartbeat)) = server.recv::<ClientMessage>().await {
+                beats += 1;
+            }
+            beats
+        });
+        let still_running = tokio::time::timeout(
+            Duration::from_millis(1500),
+            heartbeat_phase(&mut session, &mut lifecycle_rx, TEST_KNOBS),
+        )
+        .await
+        .is_err();
+        assert!(still_running, "the owner tripped against a legacy server");
+        drop(session);
+        let beats = server_task.await.unwrap();
+        assert!(beats >= 5, "the owner must keep beating: {beats}");
     }
 
     #[test]
@@ -923,6 +1056,7 @@ mod tests {
         let room = RoomId::from_bytes([1u8; 16]);
         let token = OwnerToken::from_bytes([2u8; 32]);
         let resume = ClientMessage::ResumeWebTransferRoom {
+            ctrl_heartbeat_ms: 0,
             version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
             room_id: room,
             owner_token: token,
@@ -932,6 +1066,7 @@ mod tests {
             ClientMessage::ResumeWebTransferRoom { .. }
         ));
         let create = ClientMessage::CreateWebTransferRoom {
+            ctrl_heartbeat_ms: 0,
             version: WEB_TRANSFER_OWNER_PROTOCOL_VERSION,
             room_id: room,
             member_token_hash: [3u8; 32],

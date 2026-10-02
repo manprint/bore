@@ -192,6 +192,7 @@ async fn t_web_native_wire() -> Result<()> {
     let (_opener, mut control) = raw_owner_control(port).await?;
     control
         .send(ClientMessage::CreateWebTransferRoom {
+            ctrl_heartbeat_ms: 0,
             version: 2,
             room_id: requested_room_id,
             member_token_hash: member_hash,
@@ -232,6 +233,7 @@ async fn t_web_native_wire() -> Result<()> {
     let (_opener, mut control) = raw_owner_control(port).await?;
     control
         .send(ClientMessage::ResumeWebTransferRoom {
+            ctrl_heartbeat_ms: 0,
             version: 2,
             room_id,
             owner_token: owner,
@@ -270,6 +272,7 @@ async fn t_web_native_wire() -> Result<()> {
     let (_opener, mut control) = raw_owner_control(port).await?;
     control
         .send(ClientMessage::CreateWebTransferRoom {
+            ctrl_heartbeat_ms: 0,
             version: 2,
             room_id: RoomId::from_bytes([0x42u8; 16]),
             member_token_hash: member_hash,
@@ -290,6 +293,7 @@ async fn t_web_native_wire() -> Result<()> {
     let (_opener, mut control) = raw_owner_control(port).await?;
     control
         .send(ClientMessage::CreateWebTransferRoom {
+            ctrl_heartbeat_ms: 0,
             version: 1,
             room_id: RoomId::from_bytes([0x43u8; 16]),
             member_token_hash: member_hash,

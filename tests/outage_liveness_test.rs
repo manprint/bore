@@ -1344,3 +1344,82 @@ async fn one_shot_transfer_listener_registers_again_while_waiting() -> Result<()
     assert_eq!(outcome.regular_files, 1);
     Ok(())
 }
+
+// ─── Web-transfer owner (plan 005, D8) ───────────────────────────────────────
+
+/// A web-transfer owner whose path dies for good (an ISP IP change: the old
+/// connection is blackholed forever, new ones work) resumes its room on a
+/// fresh connection within seconds. Both halves are needed: the server must
+/// release the dead lease (it refuses to resume an attached room) and the
+/// owner must give up on the dead connection. Before plan 005 neither
+/// happened before the owner grace ended the room.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn web_transfer_owner_resumes_after_an_ip_change() -> Result<()> {
+    use bore_cli::web_transfer_cli::{
+        run_owner_lease, OwnerClientConfig, OwnerLifecycle, OwnerShutdown,
+    };
+    let _serial = SERIAL.lock().await;
+    let _env = LivenessEnv::set(200, 800);
+    const CONTROL: u16 = 18795;
+    wait_port(CONTROL, false).await;
+    let mut server = Server::new(18796..=18796, None).transport_reap_floor(Duration::from_secs(1));
+    server.set_control_port(CONTROL);
+    let args = bore_cli::web_transfer::WebTransferServerArgs {
+        base_url: Some("http://127.0.0.1:8080/".to_string()),
+        ..Default::default()
+    };
+    let config = bore_cli::web_transfer::resolve_server_config(&args, false, CONTROL)?
+        .expect("loopback web-transfer config resolves");
+    server.set_web_transfer(config)?;
+    let registry = server.web_transfer().expect("registry enabled");
+    tokio::spawn(server.listen());
+    wait_port(CONTROL, true).await;
+    let proxy = BlackholeProxy::start(control_addr(CONTROL)).await?;
+
+    let (created_tx, created_rx) = tokio::sync::oneshot::channel();
+    let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::channel(1);
+    let lease = tokio::spawn(run_owner_lease(
+        OwnerClientConfig {
+            endpoint: proxy.to(),
+            ..OwnerClientConfig::default()
+        },
+        created_tx,
+        lifecycle_rx,
+    ));
+    let created = time::timeout(Duration::from_secs(10), created_rx)
+        .await
+        .expect("the room was never created")?;
+    let room = registry.room(created.room_id).expect("room installed");
+    assert_eq!(room.epoch.load(Ordering::SeqCst), 0);
+    // Healthy and idle: nothing resumes on its own.
+    time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        room.epoch.load(Ordering::SeqCst),
+        0,
+        "a healthy owner resumed"
+    );
+
+    // The IP change: every existing connection is dead from now on.
+    for conn in proxy.conns() {
+        conn.set_blackhole(true);
+    }
+    let resumed = eventually(Duration::from_secs(8), || async {
+        (room.epoch.load(Ordering::SeqCst) >= 1).then_some(())
+    })
+    .await;
+    let (took, ()) = resumed.expect(
+        "the owner never resumed its room after an IP change; before plan 005 \
+         it noticed only when the kernel gave up (~15 min), after the grace",
+    );
+    assert!(took < Duration::from_secs(8), "took {took:?}");
+    assert!(!room.is_destroyed(), "the room must survive the IP change");
+
+    // The resumed session is live: a clean close goes through it.
+    lifecycle_tx.send(OwnerLifecycle::Interrupt).await?;
+    let shutdown = time::timeout(Duration::from_secs(5), lease)
+        .await
+        .expect("the owner must close promptly")??;
+    assert!(matches!(shutdown, OwnerShutdown::CleanClose));
+    assert!(room.is_destroyed(), "the clean close must destroy the room");
+    Ok(())
+}

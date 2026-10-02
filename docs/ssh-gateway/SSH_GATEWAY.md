@@ -34,7 +34,7 @@ Punti fermi:
 | 3. Tutto su 443? | **Sì.** Demux a byte-peek su TCP 443 (SSH / TLS / HTTP / yamux) + QUIC su UDP 443. §2.3. |
 | 4. UDP? | **No sul tratto OpenSSH** — il protocollo SSH è TCP-only. Per jump con provider bore nativo, server→provider può usare QUIC diretto sullo stesso UDP 443, con TCP caldo come fallback. §2.4/§6.15. |
 | 5. Parametri via SSH? | Sì, 3 canali: stringa comando `exec`, variabili `SetEnv/SendEnv`, opzioni per-chiave nel file authorized_keys. Tabella completa flag→meccanismo in §3. |
-| 6/11. Stabilità? | Sì: keepalive SSH bidirezionale (client `ServerAlive*`, server keepalive interno 20 s + reaper 60 s in parità con gli invarianti secret esistenti) + `autossh`/systemd + policy di takeover alla riconnessione. §2.6/§2.11. |
+| 6/11. Stabilità? | Sì: keepalive SSH bidirezionale (client `ServerAlive*`, server keepalive interno 1 s + reaper 15 s, stesso deadline dei client nativi) + `autossh`/systemd + policy di takeover alla riconnessione. §2.6/§2.11. |
 | 7. Comandi d'esempio coerenti? | **Due su quattro sono sintatticamente invalidi** per OpenSSH; correzioni in §2.7. |
 | 8. Parametri SSH client? | Sì, tutti — sono lato client, il gateway deve solo rispondere ai keepalive. §2.8. |
 | 9/10. Auth chiavi + password con hot-reload? | Sì per entrambe; il reload è "by construction" (lettura a ogni tentativo di auth). §2.9/§2.10. |
@@ -321,8 +321,9 @@ possono esistere senza il client bore — il gateway li rifiuta rumorosamente co
 1. **TCP keepalive**: `shared::tune_tcp` (SO_KEEPALIVE 15 s + TCP_NODELAY) su ogni socket
    accettato — invariante bore esistente, si applica anche alle connessioni SSH.
 2. **Keepalive SSH lato server (interno)**: il gateway manda `keepalive@openssh.com` (global
-   request con want_reply) ogni **20 s** e chiude+reappa la connessione dopo **60 s** senza
-   traffico — parità deliberata con `CTRL_CLIENT_HEARTBEAT`/`SECRET_CTRL_TIMEOUT` e con
+   request con want_reply) ogni **1 s** (`SSH_KEEPALIVE_INTERVAL`) e chiude+reappa la
+   connessione dopo **15 s** senza traffico (`SSH_CTRL_TIMEOUT`, piano 005 D9) — lo stesso
+   deadline che il server applica ai client nativi (`liveness::TRANSPORT_REAP_FLOOR`), e
    l'invariante del "zombie-entry reaper": una connessione SSH half-open non deve mai lasciare
    entry fantasma nei registry (vhost/secret/admin). Le registrazioni sono RAII come oggi:
    il drop del handler SSH rilascia subdomain/secret-id/porta.
@@ -355,7 +356,7 @@ come override anti-ambiguità):
 
 ```bash
 # Opzioni di stabilità comuni (o in ~/.ssh/config, vedi sotto)
-OPTS='-o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3
+OPTS='-o ExitOnForwardFailure=yes -o ServerAliveInterval=2 -o ServerAliveCountMax=7
       -o ConnectTimeout=10 -o TCPKeepAlive=yes'
 
 # VHOST: mysub.bore.mydomain.tld → localhost:8080
@@ -384,10 +385,9 @@ Host bore-vhost
   Port 443
   RemoteForward mysub:80 localhost:8080
   ExitOnForwardFailure yes
-  ServerAliveInterval 15
-  ServerAliveCountMax 3
+  ServerAliveInterval 2
+  ServerAliveCountMax 7
   ConnectTimeout 10
-  SessionType none          # = -N (OpenSSH ≥ 8.7)
 ```
 
 Unità systemd (alternativa robusta ad autossh):
@@ -421,9 +421,13 @@ Note ulteriori:
 implementati interamente dal client OpenSSH: il gateway li "supporta" gratis. Unico requisito
 server-side: **rispondere** alle global request di keepalive (qualunque risposta, anche
 failure, azzera il contatore ServerAlive del client — russh lo gestisce). Profilo consigliato
-per tunnel non presidiati: `ServerAliveInterval=15`, `CountMax=3` (rilevazione morte ≤ 45 s,
-sotto il reaper server di 60 s), `BatchMode=yes` (mai prompt interattivi), `Compression` solo
-per payload comprimibili (per stream già compressi/cifrati è CPU sprecata).
+per tunnel non presidiati: `ServerAliveInterval=2`, `CountMax=7` (rilevazione server morto
+≈ 14 s), `BatchMode=yes` (mai prompt interattivi), `Compression` solo per payload
+comprimibili (per stream già compressi/cifrati è CPU sprecata). L'intervallo deve restare
+corto per non trasformare un flick in una riconnessione: il primo probe del client dopo un
+flick, se perso, viene ritrasmesso da TCP sulla scala ~0.2, 0.6, 1.4, 3, 6, 12.6 s, quindi
+arriva fino a `intervallo + 12.6 s` dopo l'ultimo byte — con 2 s (14.6 s) resta sotto il
+reaper server di 15 s, con 5 s (17.6 s) no.
 
 ### 2.9 Autenticazione a chiavi pubbliche con hot-reload
 
@@ -468,8 +472,8 @@ Coperto in §2.6 (4 strati + takeover). Aggiunte specifiche:
 
 - **Glitch brevi (< keepalive)**: TCP assorbe; i canali SSH riprendono da soli. Nessuna
   azione.
-- **Half-open (NAT reboot, cavo staccato)**: rilevato dal lato client in ≤ 45 s
-  (ServerAlive 15×3) e dal lato server in ≤ 60 s (reaper). Il reaper server è
+- **Half-open (NAT reboot, cavo staccato, cambio IP)**: rilevato dal lato client in ≈ 14 s
+  (ServerAlive 2×7) e dal lato server in 15 s (reaper). Il reaper server è
   indispensabile per liberare subdomain/secret-id/porta pubblica: senza, un client
   morto silenziosamente terrebbe occupato il nome fino al timeout TCP del kernel (ore) —
   stessa lezione del reaper secret esistente.
@@ -538,8 +542,8 @@ Coperto in §2.6 (4 strati + takeover). Aggiunte specifiche:
 | Docs | `docs/ssh-gateway/SSH_GATEWAY.md` (questo file → guida utente), compose | Esempi, security notes |
 
 Invarianti da sancire nel piano: **I-SSH1** (flag off ⇒ byte-identico), **I-SSH2** (parametri
-non supportati via SSH ⇒ warn esplicito, mai silenzio), **I-SSH3** (keepalive 20 s/reaper 60 s
-in parità con i tunnel secret; nessuna entry fantasma), **I-SSH4** (STREAM_READY mai sul
+non supportati via SSH ⇒ warn esplicito, mai silenzio), **I-SSH3** (keepalive 1 s/reaper 15 s,
+stesso deadline dei client nativi; nessuna entry fantasma), **I-SSH4** (STREAM_READY mai sul
 canale SSH), **I-SSH5** (takeover solo a parità di identità).
 
 ---
@@ -667,8 +671,8 @@ Host bore
     User tunnel
     IdentityFile ~/.ssh/id_ed25519_bore
     IdentitiesOnly yes
-    ServerAliveInterval 20
-    ServerAliveCountMax 3
+    ServerAliveInterval 2
+    ServerAliveCountMax 7
     ExitOnForwardFailure yes
 ```
 
@@ -780,7 +784,7 @@ Type=simple
 Environment=AUTOSSH_GATETIME=0
 Environment=AUTOSSH_POLL=30
 ExecStart=/usr/bin/autossh -M 0 \
-    -o "ServerAliveInterval=20" -o "ServerAliveCountMax=3" \
+    -o "ServerAliveInterval=2" -o "ServerAliveCountMax=7" \
     -o "ExitOnForwardFailure=yes" -o "StrictHostKeyChecking=yes" \
     -i /etc/bore/client_key -p 7835 \
     -R vhost/myapp:0:localhost:8080 tunnel@bore.example.com
@@ -829,7 +833,7 @@ riconnessione verifica contro quella riga fissa, non contro un nuovo TOFU.
 | `alice@host: Permission denied (publickey,hostbased,keyboard-interactive)` | chiave non in nessun file di `--ssh-authorized-keys-dir`, o password errata/non nel formato `label:$argon2id$...` | verificare che il file authorized_keys contenga la pubkey esatta; rigenerare l'hash con `bore hash-password` |
 | `bore ssh-gateway: <flag>: not available via SSH ingress; use the native bore client` | uno tra `udp`/`carriers`/`stun-server`/`upnp`/`try-port-prediction`/`nat-udp-preferred-port`/`auto-reconnect` passato via `exec`/env — non disponibile sul tratto SSH (§2.2/I-SSH2) | usare il client bore nativo per quella funzionalità, oppure ignorare l'avviso se il default va bene |
 | `bore ssh-gateway: <key>: unknown parameter` | typo in un parametro `exec`/env, o parametro non ancora supportato | controllare l'elenco parametri in §3/CLAUDE.md |
-| Il tunnel si blocca dopo ~60s di silenzio di rete e il forward sparisce dall'admin | comportamento CORRETTO — reaper keepalive (I-SSH3, `SSH_CTRL_TIMEOUT`=60s); non un bug | usare `autossh`/`ServerAliveInterval` lato client per mantenerlo vivo attraverso interruzioni di rete transitorie |
+| Il tunnel si blocca dopo ~15 s di silenzio di rete e il forward sparisce dall'admin | comportamento CORRETTO — reaper keepalive (I-SSH3, `SSH_CTRL_TIMEOUT`=15 s): la sessione non ha risposto a nessun keepalive per 15 s; non un bug | far girare il client sotto `autossh`/systemd perché si riconnetta da solo; `ServerAliveInterval=2 ServerAliveCountMax=7` — un intervallo più lungo fa costare una riconnessione anche a un flick breve |
 | `bore ssh-gateway: interactive shells are not supported; ... This channel stays open either way.` | informativo, NON un errore fatale (§6.4a) — comparso perché niente è ancora registrato su questa connessione: o una sessione interattiva genuina (nessun `-R`/`-L`), o un secret *consumer* (`-L`) la cui prima connessione proxata non è ancora arrivata (il server non ha modo di saperlo prima) | se intendevi creare un tunnel controlla il comando; altrimenti nessuna azione richiesta — il canale NON viene chiuso, la connessione resta viva |
 | `ssh: connect to host ... port 443: Connection refused` con `ProxyCommand openssl s_client` | il server non ha TLS configurato su quella porta, o `--ssh-gateway` non è abilitato | verificare `--cert-file`/`--key-file` sul server e che la porta sia quella del control port |
 | Nessun banner SSH entro qualche secondo su una connessione raw (diagnostica) | il gateway non è abilitato su quella porta, o si sta parlando con la porta sbagliata | connettersi al control port corretto; senza `--ssh-gateway` il comportamento è quello bore nativo (nessun demux) |

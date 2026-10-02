@@ -202,7 +202,11 @@ docker compose -f docker/docker-compose.server.prod.yml up -d
 For an SSH-gateway **client** container (no `bore` binary, just OpenSSH + autossh), see
 [`compose.ssh.yml`](compose.ssh.yml) at the repo root — a fully documented, env-var-driven
 `autossh` wrapper image (`ghcr.io/manprint/bore-ssh-client`) with one example service per
-tunnel mode (vhost/public/secret provider/secret consumer).
+tunnel mode (vhost/public/secret provider/secret consumer). The image already runs with
+`ServerAliveInterval=2`, `ServerAliveCountMax=7` and `AUTOSSH_GATETIME=0` (override with
+`SERVER_ALIVE_INTERVAL`/`SERVER_ALIVE_COUNT_MAX`), so it reconnects within seconds of a network
+outage or an IP change — see
+[Connection liveness and outage recovery](#connection-liveness-and-outage-recovery).
 
 Server-side UDP, relay, Docker networking, carrier, and file-descriptor tuning notes are in
 [`docs/server/SERVER_UDP_OPTIMIZATION.md`](docs/server/SERVER_UDP_OPTIMIZATION.md).
@@ -943,6 +947,34 @@ cross the server, so a silent server alone does not end it: the link logs one wa
 keeps running, and reconnects when the direct path itself fails. A hub always reconnects,
 because its spokes reach it through the server.
 
+**Browser transfer rooms.** The `bore transfer web` CLI that holds a room watches its
+connection the same way: it beats every 2 s, the server answers with its own heartbeat,
+and each side gives up on 15 s of silence. A room whose owner lost its path to an IP change
+is therefore released by the server and resumed by the owner — same URL, same room —
+within a backoff step (at most 5 s) of the network returning, well inside the default 60 s
+`--web-transfer-owner-grace`. Before, the dead connection outlived any grace and the room was
+lost. Against an older server, which sends no heartbeat, the owner never arms its deadline.
+
+The **browser tabs** in a room are watched in both directions too. The server sends a
+WebSocket Ping every second; the browser answers it inside its network stack, without
+running page script, so even a throttled background tab answers on time. A tab that has
+answered once and then goes silent for **20 s** is closed and leaves the room, so the ghost
+peer (and its offers) a tab leaves behind after an IP change is gone in seconds, not after
+a minute. The page itself sends a `ping` every 5 s and, when nothing at all has come back
+for 20 s, drops the socket and reconnects with backoff (250 ms up to 5 s) instead of
+waiting for the browser to notice a dead TCP connection, which can take minutes. A
+throttled background tab whose own timers stalled never counts that stall as silence.
+
+**SSH gateway sessions.** A stock OpenSSH client (`ssh -R`/`-L`, autossh) cannot run bore's
+heartbeat, so the gateway probes it instead: an SSH keepalive every **1 s**, and a session
+that has answered nothing for **15 s** is closed and its subdomain, port, secret id or jump
+alias released. On the client side use `ServerAliveInterval=2` and `ServerAliveCountMax=7`:
+the client then drops a dead server after about 14 s and autossh (or systemd) reconnects,
+and its own first probe after a flick still reaches the server before the 15 s deadline. A
+longer interval, such as 5 s, would put the retransmission of a probe lost in a 12 s flick
+*after* that deadline and turn a flick into a reconnect. The
+[SSH gateway examples](#examples-for-every-mode) use exactly these options.
+
 **Tuning.** Both knobs are environment variables of the *client* (`bore local`, `proxy`,
 `vhost`, `sshjhost`, `vpn`), read for every connection, so they work unchanged in Docker Compose:
 
@@ -1375,7 +1407,7 @@ forward. The `jump/` prefix is mandatory:
 ```shell
 ssh -T -p 443 -i ~/.ssh/id_ed25519_bore_provider \
   -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes \
-  -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+  -o ServerAliveInterval=2 -o ServerAliveCountMax=7 \
   -R 'jump/vm-test-01:22:localhost:22' \
   vm-provider@bore.tld -- 'notes="AWS eu-south-1"'
 ```
@@ -1413,8 +1445,10 @@ separate relay/direct byte totals. Pure-OpenSSH providers never advertise QUIC.
 
 Native aliases are first-wins. Pure-OpenSSH reconnects may replace only a registration
 owned by the same exact classic username; cross-user and cross-transport collisions are
-rejected. Native providers heartbeat every 20 seconds and the server reaps an abandoned
-control connection after 60 seconds, checked on the 500 ms control tick.
+rejected. Native providers heartbeat every 2 seconds and the server reaps a provider whose
+connection has been silent for 15 seconds, checked on the 500 ms control tick; a pure
+OpenSSH provider is probed with an SSH keepalive every second and reaped after the same
+15 seconds (see [Connection liveness and outage recovery](#connection-liveness-and-outage-recovery)).
 
 The server emits structured `allow`, `deny`, `open` and `close` events with the outer peer,
 operator principal, alias, requested port, provider type/owner class and selected path.
@@ -1697,9 +1731,16 @@ Secret consumer (`-L`, always secret; the trailing port is an ignored placeholde
 Common stability options (client-side OpenSSH, all "free" on the gateway):
 
 ```shell
-OPTS='-o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3
+OPTS='-o ExitOnForwardFailure=yes -o ServerAliveInterval=2 -o ServerAliveCountMax=7
       -o ConnectTimeout=10 -o TCPKeepAlive=yes'
 ```
+
+The gateway probes every session with an SSH keepalive every second and closes one that has
+answered nothing for 15 s, releasing its name. `ServerAliveInterval=2`/`ServerAliveCountMax=7`
+is the matching client side: a dead server is dropped after about 14 s, so autossh reconnects
+promptly after an outage or an IP change, while a flick of up to about 12 s is repaired by TCP
+without a reconnect. Do not raise `ServerAliveInterval` to 5 s or more: a probe lost in a
+flick would then be retransmitted only after the gateway's 15 s deadline.
 
 **VHOST** — `mysub.bore.example.com` → `localhost:8080`:
 
@@ -1927,11 +1968,10 @@ Host bore
     User tunnel
     IdentityFile ~/.ssh/id_ed25519_bore
     IdentitiesOnly yes
-    ServerAliveInterval 15
-    ServerAliveCountMax 3
+    ServerAliveInterval 2
+    ServerAliveCountMax 7
     ConnectTimeout 10
     ExitOnForwardFailure yes
-    SessionType none
 ```
 
 ```shell
@@ -1959,7 +1999,7 @@ Type=simple
 Environment=AUTOSSH_GATETIME=0
 Environment=AUTOSSH_POLL=30
 ExecStart=/usr/bin/autossh -M 0 \
-    -o "ServerAliveInterval=15" -o "ServerAliveCountMax=3" \
+    -o "ServerAliveInterval=2" -o "ServerAliveCountMax=7" \
     -o "ExitOnForwardFailure=yes" -o "StrictHostKeyChecking=yes" \
     -i /etc/bore/client_key -p 443 \
     -R vhost/myapp:0:localhost:8080 tunnel@bore.example.com -- 'notes="prod"'
@@ -1993,7 +2033,7 @@ CA-issued certificate (it also accepts self-signed, handy for testing only).
 
 A **new** session with the **same** key/identity that already holds a name evicts the
 previous one instead of being rejected — this makes `autossh`/network-restart reconnects
-deterministic (no flapping while waiting for the 60s reaper to free the name):
+deterministic (no flapping while waiting for the 15 s reaper to free the name):
 
 ```shell
 $ ssh -i id_ed25519_bore -p 443 -R vhost/mysub:0:localhost:18080 bore.example.com
@@ -2047,7 +2087,7 @@ port, the server answers with a placeholder (usually `1`). Purely cosmetic, igno
 | `Permission denied (publickey,hostbased,keyboard-interactive)` | Key not in the directory, or wrong password/hash format | Verify the pubkey is in the file; regenerate the hash with `bore hash-password` |
 | `<flag>: not available via SSH ingress; use the native bore client` | Client-transport-only parameter passed via exec/env | Use the native bore client, or ignore if the default is fine |
 | `<key>: unknown parameter` | Typo, or unsupported parameter | See the full parameter table above |
-| Tunnel disappears after ~60s of network silence | Keepalive reaper (expected behaviour, not a bug) | `ServerAliveInterval`/autossh client-side to survive brief interruptions |
+| Tunnel disappears after ~15 s of network silence | Keepalive reaper (expected behaviour, not a bug): the session answered no keepalive for 15 s | Run under autossh/systemd so it reconnects; use `ServerAliveInterval=2 ServerAliveCountMax=7` — a larger interval makes a brief flick cost a reconnect |
 | `connect to host ... port 443: Connection refused` with `ProxyCommand openssl s_client` | Server has no TLS on that port, or `--ssh-gateway` disabled | Check `--cert-file`/`--key-file` and the control port |
 
 Full architecture/analysis doc (including invariants I-SSH1..11):
@@ -2775,7 +2815,10 @@ launched, so a pipe reading stdout is never beaten by the browser.
   gone. Ctrl+C during a drop still ends the room: the owner makes ONE bounded (1 s) attempt
   to resume and close it; only when the server cannot be reached at all does the room live
   on until the grace runs out. A close is accepted only from the owner's own session, never
-  as the first frame of a new connection.
+  as the first frame of a new connection. A drop the kernel never reports (the path died,
+  the IP changed) is noticed within 15 s by the owner and within 20 s by every open tab,
+  each of which then reconnects on its own — see "Browser transfer rooms" under
+  [Connection liveness and outage recovery](#connection-liveness-and-outage-recovery).
 - **A page whose room is gone says so.** While the owner is away the tab reconnects with
   backoff; once the room is really gone the tab stops and reports the room unavailable,
   instead of showing "reconnecting" about something that can never come back. Open the link
@@ -3956,10 +3999,13 @@ healed, against 5 seconds now.
 ### Control liveness (abandoned registration reaper)
 
 Native `bore local` (public), `bore vhost`, `bore proxy` and `bore sshjhost` clients all
-send a control heartbeat every 20 seconds on their control substream. The server tracks
-the last frame received and, checked on its own 500 ms control tick, drops a registration
-that has been silent for 60 seconds — freeing the **subdomain** for a vhost provider and
-the **public port** for a `bore local` tunnel.
+send a control heartbeat every 2 seconds on their control substream and declare that
+interval. Checked on its own 500 ms control tick, the server drops a registration whose
+connection has carried no byte for 15 seconds (3 × the declared interval, never less than
+15 s) — freeing the **subdomain** for a vhost provider and the **public port** for a
+`bore local` tunnel. The older 60-second check on control frames stays in place as a
+backstop. The client applies the mirror-image deadline to the server; both are described in
+[Connection liveness and outage recovery](#connection-liveness-and-outage-recovery).
 
 This matters because the control substream is multiplexed over the tunnel's TCP
 connection: a client whose host was suspended, whose process is wedged, or whose
@@ -3971,8 +4017,8 @@ a narrow `--min-port`/`--max-port` range, because a handful of zombies exhaust i
 
 Two consequences worth knowing:
 
-- **A healthy but idle tunnel is never reaped.** The heartbeat interval (20 s) is far
-  below the deadline (60 s), so a tunnel that simply carries no traffic keeps its
+- **A healthy but idle tunnel is never reaped.** The heartbeat interval (2 s) is far
+  below the deadline (15 s), so a tunnel that simply carries no traffic keeps its
   subdomain or port.
 - **A client older than this feature is never reaped.** The capability is declared on
   the wire during registration; a client that does not declare it keeps the previous
@@ -3983,8 +4029,9 @@ Two consequences worth knowing:
   an older `bore local` is exactly this case.)
 
 Providers registered through the SSH gateway (`ssh -R vhost/...`) are not covered by this
-reaper and do not need to be: the gateway has its own bounded channel-open plus
-wedged-session eviction, which releases the label in 20–40 seconds.
+reaper and do not need to be: the gateway probes each session with an SSH keepalive every
+second and closes one that has answered nothing for 15 seconds, and a peer that keeps its TCP
+connection alive while ignoring channel opens is evicted after two timed-out opens.
 
 **Mixed versions are safe in both directions.** The heartbeat write itself is bounded
 (10 seconds, `BORE_CTRL_HEARTBEAT_SEND_TIMEOUT_MS`). A *new* client talking to a server old

@@ -15,7 +15,8 @@
 # you need, adjust env, delete the rest. Only tunnel-vhost is enabled by default.
 #
 # Reliability stack (defaults already set in the image, nothing else needed):
-#   - OpenSSH keepalives (ServerAliveInterval=15 x3 + TCPKeepAlive) detect dead links in <60s
+#   - OpenSSH keepalives (ServerAliveInterval=2 x7 + TCPKeepAlive) drop a dead link in ~14 s,
+#     just before the gateway's own 15 s reaper frees the name, so a reconnect finds it free
 #   - ExitOnForwardFailure=yes makes a half-working session exit instead of lingering
 #   - autossh -M0 (AUTOSSH_GATETIME=0) reconnects immediately, forever
 #   - the gateway's same-identity takeover (I-SSH5) lets a reconnect evict its own
@@ -75,8 +76,10 @@
 #                            Production: mount known_hosts + set "yes".
 #
 # --- stability knobs (defaults already tuned; override only if needed) -------
-# SERVER_ALIVE_INTERVAL      seconds between keepalive probes          [15]
-# SERVER_ALIVE_COUNT_MAX     missed probes before disconnect            [3]
+# SERVER_ALIVE_INTERVAL      seconds between keepalive probes           [2]
+#                            (keep it short: 5 s or more turns a brief
+#                            network flick into a reconnect)
+# SERVER_ALIVE_COUNT_MAX     missed probes before disconnect            [7]
 # CONNECT_TIMEOUT            TCP connect timeout, seconds              [10]
 # EXIT_ON_FORWARD_FAILURE    yes|no                                   [yes]
 # TCP_KEEPALIVE              yes|no                                   [yes]

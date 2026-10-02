@@ -480,7 +480,13 @@ socket. No fallback KDF, storage recovery or server lookup is permitted.
 ## 8. Bounds reference
 
 Timings/sizes live as `WEB_TRANSFER_*` constants in `src/web_transfer.rs`:
-protocol 1; heartbeat 20 s, liveness 60 s, reaper tick 500 ms, direct
+protocol 1; legacy heartbeat 20 s, liveness 60 s, reaper tick 500 ms;
+browser transport liveness (O-1): server WebSocket Ping every 1 s
+(`WEB_TRANSFER_PEER_WS_PING`), a session that has answered one is reaped
+after 20 s of silence (`WEB_TRANSFER_PEER_TRANSPORT_TIMEOUT`), one that never
+has keeps 60 s; the page sends `ping` every 5 s and redials after 20 s with
+no inbound frame (`control.js` `PING_INTERVAL_MS`/`PONG_DEADLINE_MS`); a
+declaring owner CLI beats every 2 s and is reaped after 15 s; direct
 deadline 10 s, relay attach 30 s, control send 10 s, relay admit 30 s
 (`WEB_TRANSFER_RELAY_ADMIT_TIMEOUT`), relay ticket 30 s
 (`WEB_TRANSFER_RELAY_TICKET_SECS`), terminal record 5 min
@@ -578,7 +584,7 @@ itself; none of them waits for a peer to be polite.
 | Event | Released |
 |-------|----------|
 | a control socket closes | that peer, its offers, its metadata budget, its live transfers (the counterpart is told), its rate buckets |
-| a peer stops answering | same, after `WEB_TRANSFER_CTRL_TIMEOUT` (60 s), decided on the reaper tick against `last_recv` — never a `timeout(recv)` |
+| a peer stops answering | same, after `WEB_TRANSFER_PEER_TRANSPORT_TIMEOUT` (20 s) once the session has answered a server WebSocket Ping, else after `WEB_TRANSFER_CTRL_TIMEOUT` (60 s); decided on the reaper tick against `last_recv` — never a `timeout(recv)` |
 | the owner lease is DROPPED (the shell died, the process was killed) | nothing immediately: the room DETACHES and lives out the owner grace, so a reconnect resumes it |
 | the owner closes explicitly | the room, its peers and its offers, at once — a later `hello` is refused, not told the room is gone. Honoured only inside the owner's own session (after a create or a token-checked resume): a `CloseWebTransferRoom` sent as the FIRST message of a connection proves nothing — the room id is public — and is ignored |
 | the owner grace expires | as above |

@@ -133,9 +133,16 @@ Consumer secret (`-L`, sempre secret, la porta finale è un placeholder ignorato
 Opzioni di stabilità comuni (client OpenSSH, tutte "gratis" lato gateway):
 
 ```bash
-OPTS='-o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3
+OPTS='-o ExitOnForwardFailure=yes -o ServerAliveInterval=2 -o ServerAliveCountMax=7
       -o ConnectTimeout=10 -o TCPKeepAlive=yes'
 ```
+
+Il gateway sonda ogni sessione con un keepalive SSH ogni secondo e chiude quella che non ha
+risposto a nulla per 15 s, liberandone il nome. `ServerAliveInterval=2`/`ServerAliveCountMax=7`
+è il lato client corrispondente: un server morto viene abbandonato dopo ≈ 14 s, quindi autossh
+si riconnette subito dopo un'interruzione o un cambio IP, mentre un flick fino a ≈ 12 s viene
+riparato da TCP senza riconnessione. Non alzare `ServerAliveInterval` a 5 s o più: un probe
+perso in un flick verrebbe ritrasmesso solo dopo il deadline di 15 s del gateway.
 
 ### 4.1 VHOST — `mysub.bore.example.com` → `localhost:8080`
 
@@ -462,11 +469,10 @@ Host bore
     User tunnel
     IdentityFile ~/.ssh/id_ed25519_bore
     IdentitiesOnly yes
-    ServerAliveInterval 15
-    ServerAliveCountMax 3
+    ServerAliveInterval 2
+    ServerAliveCountMax 7
     ConnectTimeout 10
     ExitOnForwardFailure yes
-    SessionType none
 ```
 
 ```bash
@@ -495,7 +501,7 @@ Type=simple
 Environment=AUTOSSH_GATETIME=0
 Environment=AUTOSSH_POLL=30
 ExecStart=/usr/bin/autossh -M 0 \
-    -o "ServerAliveInterval=15" -o "ServerAliveCountMax=3" \
+    -o "ServerAliveInterval=2" -o "ServerAliveCountMax=7" \
     -o "ExitOnForwardFailure=yes" -o "StrictHostKeyChecking=yes" \
     -i /etc/bore/client_key -p 443 \
     -R vhost/myapp:0:localhost:8080 tunnel@bore.example.com -- 'notes="prod"'
@@ -532,7 +538,7 @@ produzione con certificato CA-emesso (accetta anche self-signed, comodo solo per
 
 Una NUOVA sessione con la STESSA chiave/identità che detiene già un nome sfratta la
 precedente invece di essere rifiutata — questo rende `autossh`/riavvii di rete deterministici
-(niente flap in attesa che il reaper da 60s liberi il nome):
+(niente flap in attesa che il reaper da 15 s liberi il nome):
 
 ```bash
 $ ssh -i id_ed25519_bore -p 443 -R vhost/mysub:0:localhost:18080 bore.example.com
@@ -614,7 +620,7 @@ restrizioni per-chiave (`permit=`), N tunnel su una sola sessione SSH, compressi
 | `Permission denied (publickey,hostbased,keyboard-interactive)` | chiave non nel dir, o password/formato hash errato | verificare pubkey nel file; rigenerare hash con `bore hash-password` |
 | `<flag>: not available via SSH ingress; use the native bore client` | parametro client-transport-only (§5.5) passato via exec/env | usare il client bore nativo, o ignorare se il default va bene |
 | `<key>: unknown parameter` | typo, o parametro non supportato | vedi tabella §5.4 |
-| Tunnel sparisce dopo ~60s di silenzio di rete | reaper keepalive (comportamento corretto, non un bug) | `ServerAliveInterval`/autossi lato client per attraversare interruzioni brevi |
+| Tunnel sparisce dopo ~15 s di silenzio di rete | reaper keepalive (comportamento corretto, non un bug): la sessione non ha risposto a nessun keepalive per 15 s | far girare il client sotto autossh/systemd perché si riconnetta; `ServerAliveInterval=2 ServerAliveCountMax=7` — un intervallo più lungo fa costare una riconnessione anche a un flick breve |
 | `connect to host ... port 443: Connection refused` con `ProxyCommand openssl s_client` | server senza TLS su quella porta, o `--ssh-gateway` disabilitato | verificare `--cert-file`/`--key-file` e la porta del control port |
 
 Guida di analisi/architettura completa (incl. invarianti I-SSH1..5): `docs/ssh-gateway/SSH_GATEWAY.md`.

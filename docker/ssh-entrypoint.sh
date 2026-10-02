@@ -48,8 +48,13 @@ EXEC_PARAMS="${EXEC_PARAMS:-}"             # exec string after `--`
 # ---------------------------------------------------------------------------
 # SSH stability options (defaults tuned for long-lived unattended tunnels)
 # ---------------------------------------------------------------------------
-SERVER_ALIVE_INTERVAL="${SERVER_ALIVE_INTERVAL:-15}"
-SERVER_ALIVE_COUNT_MAX="${SERVER_ALIVE_COUNT_MAX:-3}"
+# 2 s x 7: a dead server is dropped after ~14 s, just before the gateway's own
+# 15 s reaper frees the name, so autossh reconnects promptly after an outage or
+# an IP change. Keep the interval short: TCP retransmits a probe lost in a flick
+# on the ~0.2/0.6/1.4/3/6/12.6 s ladder, so it reaches the gateway up to
+# interval + 12.6 s after the last byte — under 15 s at 2 s, over it at 5 s.
+SERVER_ALIVE_INTERVAL="${SERVER_ALIVE_INTERVAL:-2}"
+SERVER_ALIVE_COUNT_MAX="${SERVER_ALIVE_COUNT_MAX:-7}"
 CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-10}"
 EXIT_ON_FORWARD_FAILURE="${EXIT_ON_FORWARD_FAILURE:-yes}"
 TCP_KEEPALIVE="${TCP_KEEPALIVE:-yes}"
@@ -70,7 +75,7 @@ SSH_KEY_FILE="${SSH_KEY_FILE:-}"
 SSH_PASSWORD="${SSH_PASSWORD:-}"
 SSH_PASSWORD_FILE="${SSH_PASSWORD_FILE:-}"
 
-RUNTIME_DIR=/tmp/bore-ssh
+RUNTIME_DIR="${BORE_SSH_RUNTIME_DIR:-/tmp/bore-ssh}"
 mkdir -p "$RUNTIME_DIR"
 chmod 700 "$RUNTIME_DIR"
 

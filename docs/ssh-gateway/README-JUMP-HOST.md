@@ -234,7 +234,7 @@ ssh -T -p 443 \
   -i ~/.ssh/id_ed25519_bore_provider \
   -o IdentitiesOnly=yes \
   -o ExitOnForwardFailure=yes \
-  -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+  -o ServerAliveInterval=2 -o ServerAliveCountMax=7 \
   -R 'jump/vm-test-01:22:localhost:22' \
   vm-provider@bore.tld -- 'notes="VM eu-south-1"'
 ```
@@ -264,7 +264,7 @@ Servizio permanente con `autossh`:
 AUTOSSH_GATETIME=0 autossh -M 0 -T -p 443 \
   -i ~/.ssh/id_ed25519_bore_provider \
   -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes \
-  -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+  -o ServerAliveInterval=2 -o ServerAliveCountMax=7 \
   -R 'jump/vm-test-01:22:localhost:22' \
   vm-provider@bore.tld -- 'notes="VM eu-south-1"'
 ```
@@ -544,8 +544,8 @@ Host bore.tld
     IdentityFile ~/.ssh/id_ed25519_bore_gateway
     IdentitiesOnly yes
     StrictHostKeyChecking yes
-    ServerAliveInterval 15
-    ServerAliveCountMax 3
+    ServerAliveInterval 2
+    ServerAliveCountMax 7
     ForwardAgent no
 
 Host *.ssh.bore.tld
@@ -654,7 +654,7 @@ al gateway e al target.
 | Revocare un operatore | Rimuovere il file/la riga. Ha effetto sulle autenticazioni successive; chiudere le sessioni in corso se necessario. |
 | Chiudere un alias | `Ctrl-C` sul processo `bore sshjhost`, oppure terminare la sessione `ssh -R`/`autossh`, oppure fermare il container. La registrazione sparisce. |
 | Riconnessione dopo caduta rete | `--auto-reconnect` (nativo) o `autossh` (OpenSSH). Lo stesso identico username riprende il proprio alias; uno username diverso viene rifiutato. |
-| Provider morto senza chiusura pulita | Il server se ne accorge da solo (heartbeat 20 s, reaper 60 s) e libera l'alias. Nessuna riga fantasma nel pannello. |
+| Provider morto senza chiusura pulita | Il server se ne accorge da solo e libera l'alias dopo 15 s di silenzio (provider nativo: heartbeat ogni 2 s; provider OpenSSH: keepalive SSH ogni 1 s). Nessuna riga fantasma nel pannello. |
 
 Chi possiede un alias:
 

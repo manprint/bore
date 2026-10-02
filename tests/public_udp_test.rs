@@ -172,6 +172,8 @@ async fn public_udp_direct_round_trip() -> Result<()> {
         None,
         false,
         bore_cli::shared::TunnelOptions {
+            ctrl_heartbeat_ms: 0,
+            preferred_port: None,
             https: false,
             force_https: false,
             basic_auth: None,
@@ -226,6 +228,8 @@ async fn public_udp_many_concurrent_streams() -> Result<()> {
         None,
         false,
         bore_cli::shared::TunnelOptions {
+            ctrl_heartbeat_ms: 0,
+            preferred_port: None,
             https: false,
             force_https: false,
             basic_auth: None,
@@ -291,6 +295,8 @@ async fn public_udp_carriers() -> Result<()> {
         None,
         false,
         bore_cli::shared::TunnelOptions {
+            ctrl_heartbeat_ms: 0,
+            preferred_port: None,
             https: false,
             force_https: false,
             basic_auth: None,
@@ -361,6 +367,8 @@ async fn public_udp_large_payload() -> Result<()> {
         None,
         false,
         bore_cli::shared::TunnelOptions {
+            ctrl_heartbeat_ms: 0,
+            preferred_port: None,
             https: false,
             force_https: false,
             basic_auth: None,
@@ -432,6 +440,8 @@ async fn public_udp_falls_back_to_relay_when_server_lacks_udp() -> Result<()> {
         None,
         false,
         bore_cli::shared::TunnelOptions {
+            ctrl_heartbeat_ms: 0,
+            preferred_port: None,
             https: false,
             force_https: false,
             basic_auth: None,
@@ -491,6 +501,8 @@ async fn public_tcp_still_works_without_udp() -> Result<()> {
         None,
         false,
         bore_cli::shared::TunnelOptions {
+            ctrl_heartbeat_ms: 0,
+            preferred_port: None,
             https: false,
             force_https: false,
             basic_auth: None,
@@ -555,6 +567,8 @@ async fn a_reregistered_tunnel_keeps_its_carrier_when_the_previous_one_closes() 
     let echo_port = spawn_echo_service().await?;
 
     let opts = || bore_cli::shared::TunnelOptions {
+        ctrl_heartbeat_ms: 0,
+        preferred_port: None,
         https: false,
         force_https: false,
         basic_auth: None,

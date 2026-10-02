@@ -1042,6 +1042,7 @@ async fn silent_native_provider_is_reaped_and_alias_can_be_reclaimed() -> Result
     let mut control = Delimited::new(opener.open().await?);
     control
         .send(ClientMessage::HelloSshJump {
+            ctrl_heartbeat_ms: 0,
             alias: "silent-vm".to_string(),
             ssh_port: 2222,
             notes: Some("silent raw provider".to_string()),

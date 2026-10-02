@@ -3572,6 +3572,7 @@ async fn live_raw_control(control_port: u16) -> Result<(mux::Opener, Delimited<m
 /// `HelloVhost` for `subdomain`, declaring the heartbeat capability or not.
 fn hello_vhost_live(subdomain: &str, ctrl_heartbeat: bool) -> ClientMessage {
     ClientMessage::HelloVhost {
+        ctrl_heartbeat_ms: 0,
         subdomain: subdomain.to_string(),
         client_id: "liveness".to_string(),
         notes: None,

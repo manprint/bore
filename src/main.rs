@@ -2216,6 +2216,9 @@ async fn dispatch(command: Command) -> Result<()> {
                         // starts the heartbeat task: the two must never diverge,
                         // so the CLI does not get a say (DEC-VE2).
                         ctrl_heartbeat: false,
+                        ctrl_heartbeat_ms: 0,
+                        // Filled per attempt by the connect closure (D7).
+                        preferred_port: None,
                     };
                     let connect = move || {
                         let (local_host, to, secret, options, access_logger) = (

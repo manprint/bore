@@ -220,6 +220,7 @@ impl TryFrom<&ClientMessage> for SshJumpRegistration {
             auto_reconnect,
             local_host,
             local_port,
+            ctrl_heartbeat_ms: _,
         } = message
         else {
             bail!("client message is not an SSH jump registration");

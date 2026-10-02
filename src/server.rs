@@ -2468,6 +2468,7 @@ impl Server {
                 self.serve_carrier(control, opener, token).await
             }
             Some(ClientMessage::HelloSecret {
+                ctrl_heartbeat_ms: _,
                 id,
                 notes,
                 basic_auth,
@@ -2518,6 +2519,7 @@ impl Server {
                 .await
             }
             Some(ClientMessage::ConnectSecret {
+                ctrl_heartbeat_ms: _,
                 id,
                 notes,
                 carriers,
@@ -2566,6 +2568,7 @@ impl Server {
                 .await
             }
             Some(ClientMessage::HelloVhost {
+                ctrl_heartbeat_ms: _,
                 subdomain,
                 client_id,
                 notes,

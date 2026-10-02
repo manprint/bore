@@ -1244,6 +1244,8 @@ impl Proxy {
                 upnp: gather.port_map,
                 try_port_prediction: gather.port_prediction,
                 carrier: false,
+                // The consumer's main connection beats (plan 005, D3, D10).
+                ctrl_heartbeat_ms: crate::liveness::ctrl_heartbeat_declared_ms(),
             })
             .await?;
         if let Some(secret) = secret {
@@ -1940,6 +1942,8 @@ async fn open_consumer_carrier(
             // This is an extra relay carrier of an existing consumer: the server
             // must NOT register an admin entry for it and must NOT reap it (I-2).
             carrier: true,
+            // Carriers send no heartbeat, so they declare none.
+            ctrl_heartbeat_ms: 0,
         })
         .await?;
     if let Some(secret) = secret {

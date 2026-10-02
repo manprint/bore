@@ -26,8 +26,8 @@ Read this first in every session. Updated 2026-10-02 by claude-opus-5-5.
 - Active scope: plan (all phases) — user: "implementa il piano, testa tutto, committa su Dev e segui la ci".
 - Scope result: RUNNING.
 - Type / ID / attempt: none.
-- Next action: open 1.1 (wire fields).
-- Next eligible plan unit: 1.1.
+- Next action: open 1.2 (server transport reapers).
+- Next eligible plan unit: 1.2.
 - Unit base: f7b0745; branch: dev.
 - Repo state: HEAD f7b0745 plus the untracked plan folder.
 
@@ -122,7 +122,7 @@ None. Environment note: ports 19000/19001 are held by a foreign node process on 
 | 0.2 | phase_01.md | none | DONE | 1 | G-U02 6 liveness tests pass |
 | 0.3 | phase_01.md | none | DONE | 1 | G-U03 8/0 (sequence [1,2,4,8,8,8] + default_cap_is_eight_seconds) |
 | 0.4 | phase_01.md | 0.3 | DONE | 1 | README backoff text 1,2,4,8; anchor to liveness section (added in 1.6) |
-| 1.1 | phase_02.md | P0 | TODO | 1 | — |
+| 1.1 | phase_02.md | P0 | DONE | 1 | G-U11 70/0 (7 new serde tests) |
 | 1.2 | phase_02.md | 1.1 | TODO | 1 | — |
 | 1.3 | phase_02.md | 1.1 | TODO | 1 | — |
 | 1.4 | phase_02.md | 1.1 | TODO | 1 | — |
@@ -155,7 +155,7 @@ None. Environment note: ports 19000/19001 are held by a foreign node process on 
 | mux activity/terminate (5) | 0.1 | G-U01 | PASS | 15 passed; red-check terminate arm → timeout |
 | liveness tables | 0.2 | G-U02 | PASS | 6 tests incl. LivenessTicker |
 | backoff cap | 0.3 | G-U03 | PASS | 8 passed |
-| serde defaults | 1.1/2.1/3.1 | G-U11 | TODO | — |
+| serde defaults | 1.1/2.1/3.1 | G-U11 | PASS (1.1) | 7 new in shared::tests |
 | outage_liveness_test | 1.2–1.5 | G-U12 | TODO | — |
 | vpn liveness/teardown | 2.2–2.4 | G-U2 | TODO | — |
 | owner + sshgw | 3.1/3.2 | G-U3 | TODO | — |

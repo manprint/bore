@@ -725,6 +725,7 @@ async fn admin_registry_reflects_connections() -> Result<()> {
 /// minimal consumer (exactly the bare zombie rows seen in the field).
 fn connect_secret(id: &str) -> ClientMessage {
     ClientMessage::ConnectSecret {
+        ctrl_heartbeat_ms: 0,
         id: id.into(),
         notes: None,
         carriers: 0,
@@ -857,6 +858,7 @@ async fn secret_provider_reaped_when_control_wedges() -> Result<()> {
     let (_opener, mut control) = raw_control().await?;
     control
         .send(ClientMessage::HelloSecret {
+            ctrl_heartbeat_ms: 0,
             id: "svc-prov-reap".into(),
             notes: None,
             basic_auth: false,
@@ -1007,6 +1009,7 @@ async fn secret_consumer_carriers_make_one_admin_entry() -> Result<()> {
 /// consumer, which must create no admin entry and never be reaped.
 fn connect_secret_carrier(id: &str) -> ClientMessage {
     ClientMessage::ConnectSecret {
+        ctrl_heartbeat_ms: 0,
         id: id.into(),
         notes: None,
         carriers: 0,

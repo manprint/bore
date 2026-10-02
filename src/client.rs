@@ -454,6 +454,9 @@ impl Client {
         // declaring without beating is the one combination that reaps a healthy
         // idle tunnel.
         options.ctrl_heartbeat = true;
+        // ...and its interval, which is what lets a current server free the
+        // port quickly once this connection dies (plan 005, D3).
+        options.ctrl_heartbeat_ms = crate::liveness::ctrl_heartbeat_declared_ms();
         control.send(ClientMessage::Hello(port, options)).await?;
         if let Some(secret) = secret {
             Authenticator::new(secret)
@@ -643,6 +646,9 @@ impl Client {
                 max_conns,
                 local_host: Some(local_host.to_string()),
                 local_port,
+                // This provider beats (`sends_ctrl_heartbeat: true` below), so
+                // the server may transport-reap it (plan 005, D3).
+                ctrl_heartbeat_ms: crate::liveness::ctrl_heartbeat_declared_ms(),
             })
             .await?;
         if let Some(secret) = secret {
@@ -969,6 +975,8 @@ impl Client {
                 // exactly and this stays `false`, so the server never sends a
                 // message this client would not expect.
                 auto_carriers: carriers == 0,
+                // Same lockstep as `ctrl_heartbeat` (plan 005, D3).
+                ctrl_heartbeat_ms: crate::liveness::ctrl_heartbeat_declared_ms(),
             })
             .await?;
 
@@ -1254,6 +1262,9 @@ impl Client {
                 auto_reconnect: registration.auto_reconnect,
                 local_host: registration.local_host.clone(),
                 local_port: registration.local_port,
+                // This provider beats (`sends_ctrl_heartbeat: true` below), so
+                // the server may transport-reap it (plan 005, D3).
+                ctrl_heartbeat_ms: crate::liveness::ctrl_heartbeat_declared_ms(),
             })
             .await?;
         if let Some(secret) = secret {

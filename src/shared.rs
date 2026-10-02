@@ -419,6 +419,18 @@ pub struct TunnelOptions {
     /// `Client::sends_ctrl_heartbeat`.
     #[serde(default)]
     pub ctrl_heartbeat: bool,
+    /// The client's control heartbeat interval in milliseconds (plan 005, D3).
+    /// `0` = undeclared: never transport-reaped. See
+    /// `ClientMessage::HelloVhost::ctrl_heartbeat_ms`.
+    #[serde(default)]
+    pub ctrl_heartbeat_ms: u32,
+    /// The public port this client held before reconnecting, asked for again
+    /// when it requests port `0` (plan 005, D7), so a reconnect after an outage
+    /// gets the same address back when it is still free. `None` = no
+    /// preference. Ignored for an explicit port or one outside the server's
+    /// range; a port that is taken falls back to a random one.
+    #[serde(default)]
+    pub preferred_port: Option<u16>,
 }
 
 /// Options negotiated by two `bore test-udp` peers once the server pairs them.
@@ -1429,6 +1441,17 @@ pub enum ClientMessage {
         /// The provider's local service port. `0` = unknown. Display-only.
         #[serde(default)]
         local_port: u16,
+        /// The client's control heartbeat interval in milliseconds, i.e. a
+        /// promise that it sends [`ClientMessage::Heartbeat`] at least this
+        /// often (plan 005, D3). A server uses it to reap the registration once
+        /// the connection has delivered no byte for
+        /// [`crate::liveness::transport_reap_deadline`] — so the name a dead
+        /// connection held is free by the time its client reconnects. `0` (an
+        /// old client, or a connection that does not beat, like a carrier)
+        /// means "never transport-reaped". `#[serde(default)]` keeps the wire
+        /// backward-compatible in both directions.
+        #[serde(default)]
+        ctrl_heartbeat_ms: u32,
     },
 
     /// Connect as a consumer of a named secret tunnel; data substreams opened on
@@ -1481,6 +1504,17 @@ pub enum ClientMessage {
         /// legacy behaviour of registering a per-connection entry).
         #[serde(default)]
         carrier: bool,
+        /// The client's control heartbeat interval in milliseconds, i.e. a
+        /// promise that it sends [`ClientMessage::Heartbeat`] at least this
+        /// often (plan 005, D3). A server uses it to reap the registration once
+        /// the connection has delivered no byte for
+        /// [`crate::liveness::transport_reap_deadline`] — so the name a dead
+        /// connection held is free by the time its client reconnects. `0` (an
+        /// old client, or a connection that does not beat, like a carrier)
+        /// means "never transport-reaped". `#[serde(default)]` keeps the wire
+        /// backward-compatible in both directions.
+        #[serde(default)]
+        ctrl_heartbeat_ms: u32,
     },
 
     /// Offer this peer's UDP hole-punch candidate addresses to the server, which
@@ -1600,6 +1634,17 @@ pub enum ClientMessage {
         /// error on its control loop rather than a skipped field.
         #[serde(default)]
         auto_carriers: bool,
+        /// The client's control heartbeat interval in milliseconds, i.e. a
+        /// promise that it sends [`ClientMessage::Heartbeat`] at least this
+        /// often (plan 005, D3). A server uses it to reap the registration once
+        /// the connection has delivered no byte for
+        /// [`crate::liveness::transport_reap_deadline`] — so the name a dead
+        /// connection held is free by the time its client reconnects. `0` (an
+        /// old client, or a connection that does not beat, like a carrier)
+        /// means "never transport-reaped". `#[serde(default)]` keeps the wire
+        /// backward-compatible in both directions.
+        #[serde(default)]
+        ctrl_heartbeat_ms: u32,
     },
 
     /// Ask the server to issue a fresh vhost-UDP nonce so the provider can
@@ -1724,6 +1769,17 @@ pub enum ClientMessage {
         /// Provider-local target port; equal to `ssh_port` in v1.
         #[serde(default)]
         local_port: u16,
+        /// The client's control heartbeat interval in milliseconds, i.e. a
+        /// promise that it sends [`ClientMessage::Heartbeat`] at least this
+        /// often (plan 005, D3). A server uses it to reap the registration once
+        /// the connection has delivered no byte for
+        /// [`crate::liveness::transport_reap_deadline`] — so the name a dead
+        /// connection held is free by the time its client reconnects. `0` (an
+        /// old client, or a connection that does not beat, like a carrier)
+        /// means "never transport-reaped". `#[serde(default)]` keeps the wire
+        /// backward-compatible in both directions.
+        #[serde(default)]
+        ctrl_heartbeat_ms: u32,
     },
 
     /// Ask the server for a fresh direct-path nonce for one SSH jump provider.
@@ -2884,6 +2940,7 @@ mod tests {
 
         // Round-trip a fully-populated ConnectSecret survives.
         let full = ClientMessage::ConnectSecret {
+            ctrl_heartbeat_ms: 0,
             id: "db".into(),
             notes: Some("n".into()),
             carriers: 4,
@@ -3075,6 +3132,7 @@ mod tests {
     fn hello_vhost_backend_tls_serde_roundtrip() {
         // The new fields survive a full serialize/deserialize round-trip.
         let full = ClientMessage::HelloVhost {
+            ctrl_heartbeat_ms: 0,
             subdomain: "app".into(),
             client_id: "c".into(),
             notes: None,
@@ -3141,6 +3199,7 @@ mod tests {
 
         // And the capability survives a round-trip when it IS declared.
         let full = ClientMessage::HelloVhost {
+            ctrl_heartbeat_ms: 0,
             subdomain: "app".into(),
             client_id: "c".into(),
             notes: None,
@@ -3198,6 +3257,8 @@ mod tests {
 
         // Round-trip with the new field set survives.
         let full = TunnelOptions {
+            ctrl_heartbeat_ms: 0,
+            preferred_port: None,
             https: true,
             force_https: true,
             basic_auth: None,
@@ -3217,6 +3278,99 @@ mod tests {
         assert!(back.auto_reconnect);
         assert_eq!(back.carriers, 4);
         assert!(back.ctrl_heartbeat);
+    }
+
+    /// Plan 005 (D3/D7) wire contract: every new liveness field reads as
+    /// "undeclared" when an older peer omits it, and survives a round trip.
+    /// Reading a missing `ctrl_heartbeat_ms` as anything but 0 would make every
+    /// legacy client transport-reapable, killing healthy idle tunnels.
+    #[test]
+    fn tunnel_options_new_fields_default_when_absent() {
+        let legacy: TunnelOptions = serde_json::from_str(
+            r#"{"https":false,"force_https":false,"basic_auth":null,"notes":null,"ctrl_heartbeat":true}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.ctrl_heartbeat_ms, 0);
+        assert_eq!(legacy.preferred_port, None);
+
+        let full = TunnelOptions {
+            ctrl_heartbeat_ms: 5_000,
+            preferred_port: Some(40_123),
+            ..TunnelOptions::default()
+        };
+        let back: TunnelOptions =
+            serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        assert_eq!(back.ctrl_heartbeat_ms, 5_000);
+        assert_eq!(back.preferred_port, Some(40_123));
+    }
+
+    /// Extract `ctrl_heartbeat_ms` from any registration that carries it.
+    fn declared_ms(msg: &ClientMessage) -> u32 {
+        match msg {
+            ClientMessage::HelloVhost {
+                ctrl_heartbeat_ms, ..
+            }
+            | ClientMessage::HelloSecret {
+                ctrl_heartbeat_ms, ..
+            }
+            | ClientMessage::ConnectSecret {
+                ctrl_heartbeat_ms, ..
+            }
+            | ClientMessage::HelloSshJump {
+                ctrl_heartbeat_ms, ..
+            } => *ctrl_heartbeat_ms,
+            other => panic!("not a registration: {other:?}"),
+        }
+    }
+
+    /// Legacy JSON (no `ctrl_heartbeat_ms`) for each registration, as an
+    /// older client writes it.
+    const LEGACY_REGISTRATIONS: &[&str] = &[
+        r#"{"HelloVhost":{"subdomain":"app","client_id":"c","notes":null,"basic_auth":false}}"#,
+        r#"{"HelloSecret":{"id":"db","notes":null,"basic_auth":false}}"#,
+        r#"{"ConnectSecret":{"id":"db","notes":null}}"#,
+        r#"{"HelloSshJump":{"alias":"box","ssh_port":22,"notes":null}}"#,
+    ];
+
+    #[test]
+    fn hello_vhost_ctrl_heartbeat_ms_defaults_zero() {
+        let msg: ClientMessage = serde_json::from_str(LEGACY_REGISTRATIONS[0]).unwrap();
+        assert_eq!(declared_ms(&msg), 0);
+    }
+
+    #[test]
+    fn hello_secret_ctrl_heartbeat_ms_defaults_zero() {
+        let msg: ClientMessage = serde_json::from_str(LEGACY_REGISTRATIONS[1]).unwrap();
+        assert_eq!(declared_ms(&msg), 0);
+    }
+
+    #[test]
+    fn connect_secret_ctrl_heartbeat_ms_defaults_zero() {
+        let msg: ClientMessage = serde_json::from_str(LEGACY_REGISTRATIONS[2]).unwrap();
+        assert_eq!(declared_ms(&msg), 0);
+    }
+
+    #[test]
+    fn hello_ssh_jump_ctrl_heartbeat_ms_defaults_zero() {
+        let msg: ClientMessage = serde_json::from_str(LEGACY_REGISTRATIONS[3]).unwrap();
+        assert_eq!(declared_ms(&msg), 0);
+    }
+
+    /// A declared interval survives the wire for every registration, and an
+    /// OLD peer that ignores unknown fields still reads the rest (no
+    /// `deny_unknown_fields` anywhere on these types).
+    #[test]
+    fn registration_ctrl_heartbeat_ms_roundtrips() {
+        for legacy in LEGACY_REGISTRATIONS {
+            let mut value: serde_json::Value = serde_json::from_str(legacy).unwrap();
+            let body = value.as_object_mut().unwrap().values_mut().next().unwrap();
+            body["ctrl_heartbeat_ms"] = serde_json::json!(5_000);
+            let msg: ClientMessage = serde_json::from_value(value).unwrap();
+            assert_eq!(declared_ms(&msg), 5_000, "{legacy}");
+            let back: ClientMessage =
+                serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+            assert_eq!(declared_ms(&back), 5_000, "{legacy}");
+        }
     }
 
     #[test]
@@ -3628,6 +3782,7 @@ fn control_frame_summary_includes_test_udp_plan() {
 #[test]
 fn hello_vhost_round_trips_and_fits_frame() {
     let msg = ClientMessage::HelloVhost {
+        ctrl_heartbeat_ms: 0,
         subdomain: "myapp".to_string(),
         client_id: "client-a".to_string(),
         notes: Some("test note".to_string()),
@@ -3967,6 +4122,7 @@ fn ssh_jump_wire_roundtrip_bounds_and_redaction() {
     let notes = "🦀".repeat(MAX_NOTES_LEN);
     let local_host = "h".repeat(crate::ssh_jump::MAX_LOCAL_HOST_LEN);
     let hello = ClientMessage::HelloSshJump {
+        ctrl_heartbeat_ms: 0,
         alias: "a".repeat(crate::ssh_jump::MAX_ALIAS_LEN),
         ssh_port: 2222,
         notes: Some(notes.clone()),
@@ -3987,6 +4143,7 @@ fn ssh_jump_wire_roundtrip_bounds_and_redaction() {
     assert_eq!(validated.ssh_port, 2222);
     assert_eq!(validated.local_port, 2222);
     let ClientMessage::HelloSshJump {
+        ctrl_heartbeat_ms: _,
         alias,
         ssh_port,
         notes: decoded_notes,
@@ -4044,6 +4201,7 @@ fn ssh_jump_unknown_to_legacy_peer_never_falls_back_to_another_mode() {
     }
 
     let hello = ClientMessage::HelloSshJump {
+        ctrl_heartbeat_ms: 0,
         alias: "vm-test-01".to_string(),
         ssh_port: 22,
         notes: None,
@@ -4219,6 +4377,7 @@ fn tunnel_options_default_policy_none() {
 #[test]
 fn hello_vhost_serde_omits_default_policy() {
     let msg = ClientMessage::HelloVhost {
+        ctrl_heartbeat_ms: 0,
         subdomain: "test".to_string(),
         client_id: "id".to_string(),
         notes: None,

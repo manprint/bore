@@ -14,6 +14,7 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::{interval, MissedTickBehavior};
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{info, warn};
 
 use crate::admin::{AdminRegistry, NewEntry, Role};
@@ -47,6 +48,10 @@ pub struct HubShared {
     pub event_tx: mpsc::Sender<HubPeerEvent>,
     /// Max concurrent spokes (`HelloVpn.max_clients`).
     pub max_clients: u16,
+    /// Cancelled when the hub listener's handler ends, on every exit path
+    /// (plan 005, D6d): each spoke loop watches it and closes, so a spoke is
+    /// never left paired with a hub that no longer exists.
+    pub cancel: CancellationToken,
 }
 
 /// Hub address/peer tracking (protected by std::sync::Mutex, no awaits inside).
@@ -227,6 +232,11 @@ pub struct VpnPairMsg {
     pub listener_ready: ServerMessage,
     /// Shared nonce (same for both sides; listener re-uses it for UDP punch).
     pub nonce: [u8; UDP_NONCE_LEN],
+    /// The pairing's teardown signal (plan 005, D6d). After pairing the
+    /// registry no longer holds the listener, so neither side can be paired
+    /// again while the other lives on: each handler keeps a drop guard of
+    /// this token and watches it, and whichever ends first ends the other.
+    pub cancel: CancellationToken,
 }
 
 /// Pure /30 and hub subnet allocator, no I/O.
@@ -633,6 +643,8 @@ pub async fn serve_vpn_listener(
 
     // Hub mode requires pool addressing.
     let mut _hub_lease: Option<VpnHubLeaseGuard> = None;
+    // Cancels every spoke of this hub when this handler ends (D6d).
+    let mut _hub_teardown: Option<DropGuard> = None;
     let pair_rx: Option<oneshot::Receiver<VpnPairMsg>>;
     let mut event_rx_opt: Option<mpsc::Receiver<HubPeerEvent>> = None;
     let hub_opt: Option<HubShared>;
@@ -673,7 +685,9 @@ pub async fn serve_vpn_listener(
             state: Arc::new(std::sync::Mutex::new(hub_state)),
             event_tx,
             max_clients: effective_max_clients,
+            cancel: CancellationToken::new(),
         };
+        _hub_teardown = Some(hub_shared.cancel.clone().drop_guard());
         _hub_lease = Some(VpnHubLeaseGuard::new(pool_arc, u32::from(subnet.network())));
         hub_opt = Some(hub_shared);
         event_rx_opt = Some(event_rx);
@@ -972,6 +986,12 @@ pub async fn serve_vpn_listener(
             }
         };
 
+        // Plan 005, D6d: from here on, this handler ending (any path, `?`
+        // included) closes the paired connector, and the connector ending
+        // closes this listener.
+        let pair_cancel = pair_msg.cancel.clone();
+        let _pair_teardown = pair_cancel.clone().drop_guard();
+
         // Record the assigned overlay on the admin entry, then deliver VpnReady.
         // The connector's handler built it; whether THIS side beats is this
         // side's own declaration.
@@ -1028,6 +1048,10 @@ pub async fn serve_vpn_listener(
                         warn!(%id, ?idle, "vpn listener connection silent; reaping (path dead)");
                         break;
                     }
+                }
+                _ = pair_cancel.cancelled() => {
+                    info!(%id, "vpn connector left; closing the paired listener");
+                    break;
                 }
                 Some(offer) = to_provider_rx.recv() => {
                     // The connector offered candidates: forward the punch so the
@@ -1490,6 +1514,10 @@ pub async fn serve_vpn_connector(
                         break;
                     }
                 }
+                _ = hub_clone.cancel.cancelled() => {
+                    info!(%id, %peer_id, "vpn hub left; closing its spoke");
+                    break;
+                }
                 msg = control.recv::<ClientMessage>() => {
                     match msg {
                         Ok(Some(ClientMessage::UdpCandidateOffer(mut offer))) => {
@@ -1665,20 +1693,36 @@ pub async fn serve_vpn_connector(
         ctrl_heartbeat: declared,
     };
 
+    // Plan 005, D6d: the pairing's teardown signal. The guard exists before
+    // the first await, so every exit path of this handler closes the paired
+    // listener.
+    let pair_cancel = CancellationToken::new();
+    let _pair_teardown = pair_cancel.clone().drop_guard();
+
     // Send VpnReady to connector
     control.send(connector_ready).await?;
 
     // Send listener's VpnReady via the pair channel
-    // Extract the entry and send the pair_tx (consuming it)
-    if let Some((_, entry)) = vpn_providers.remove(&id) {
-        // This fails silently if the listener disconnected.
-        if let Some(pair_tx) = entry.pair_tx {
-            let _ = pair_tx.send(VpnPairMsg {
-                listener_ready,
-                nonce,
-            });
-        }
-        // Note: entry is not re-inserted; it's consumed after pairing
+    // Extract the entry and send the pair_tx (consuming it). The entry is not
+    // re-inserted; it's consumed after pairing.
+    let paired = match vpn_providers.remove(&id) {
+        Some((_, entry)) => entry.pair_tx.is_some_and(|pair_tx| {
+            pair_tx
+                .send(VpnPairMsg {
+                    listener_ready,
+                    nonce,
+                    cancel: pair_cancel.clone(),
+                })
+                .is_ok()
+        }),
+        None => false,
+    };
+    if !paired {
+        // The listener left between lookup and pairing: there is nothing to
+        // relay to. Closing makes the connector reconnect and find the
+        // listener's next registration, instead of idling paired to nothing.
+        warn!(%id, "vpn listener left before pairing completed; closing the connector");
+        return Ok(());
     }
 
     // Admin entry
@@ -1885,6 +1929,10 @@ pub async fn serve_vpn_connector(
                     warn!(%id, ?idle, "vpn connector connection silent; reaping (path dead)");
                     break;
                 }
+            }
+            _ = pair_cancel.cancelled() => {
+                info!(%id, "vpn listener left; closing the paired connector");
+                break;
             }
             msg = control.recv::<ClientMessage>() => {
                 match msg {

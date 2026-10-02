@@ -564,3 +564,130 @@ async fn declared_hub_spoke_is_transport_reaped() -> Result<()> {
     );
     Ok(())
 }
+
+// ─── Pairing teardown (2.3) ──────────────────────────────────────────────────
+
+/// Whether `c`'s control stream ends (EOF or error) within `within`,
+/// skipping the heartbeats a live handler keeps sending.
+async fn closes_within(c: &mut Delimited<bore_cli::mux::Stream>, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        match time::timeout(left, c.recv::<ServerMessage>()).await {
+            Ok(Ok(Some(_))) => continue,
+            Ok(Ok(None)) | Ok(Err(_)) => return true,
+            Err(_) => return false,
+        }
+    }
+}
+
+/// After pairing the registry no longer holds the listener, so a connector
+/// whose listener is gone could never be paired again: the server must
+/// close it, so it reconnects and finds the listener's next registration.
+///
+/// RED-CHECK: without the `pair_cancel.cancelled()` arm in the connector
+/// loop the connector stays open for the whole budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vpn_pair_teardown_listener_exit_closes_connector() -> Result<()> {
+    const CONTROL: u16 = 18910;
+    let admin = spawn_server(CONTROL).await?;
+
+    let mut listener = ctrl(control_addr(CONTROL)).await?;
+    let mut connector = ctrl(control_addr(CONTROL)).await?;
+    pair(&mut listener, 0, &mut connector, 0, "td-l").await?;
+    assert!(
+        !closes_within(&mut connector, Duration::from_millis(700)).await,
+        "a paired connector must stay open while its listener lives"
+    );
+
+    drop(listener);
+    assert!(
+        closes_within(&mut connector, Duration::from_secs(3)).await,
+        "the connector of a listener that left was never closed"
+    );
+    eventually(Duration::from_secs(3), || {
+        count_role(&admin, Role::VpnConnector) == 0 && count_role(&admin, Role::VpnListener) == 0
+    })
+    .await
+    .expect("the torn-down link left admin rows behind");
+    Ok(())
+}
+
+/// The reverse: a listener whose connector is gone is closed, so it
+/// re-registers and can be paired again.
+///
+/// RED-CHECK: without the `pair_cancel.cancelled()` arm in the paired
+/// listener loop the listener stays open for the whole budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vpn_pair_teardown_connector_exit_closes_listener() -> Result<()> {
+    const CONTROL: u16 = 18911;
+    let admin = spawn_server(CONTROL).await?;
+
+    let mut listener = ctrl(control_addr(CONTROL)).await?;
+    let mut connector = ctrl(control_addr(CONTROL)).await?;
+    pair(&mut listener, 0, &mut connector, 0, "td-c").await?;
+    assert!(
+        !closes_within(&mut listener, Duration::from_millis(700)).await,
+        "a paired listener must stay open while its connector lives"
+    );
+
+    drop(connector);
+    assert!(
+        closes_within(&mut listener, Duration::from_secs(3)).await,
+        "the listener of a connector that left was never closed"
+    );
+    eventually(Duration::from_secs(3), || {
+        count_role(&admin, Role::VpnConnector) == 0 && count_role(&admin, Role::VpnListener) == 0
+    })
+    .await
+    .expect("the torn-down link left admin rows behind");
+    // The id is free again: the listener's reconnect is not refused.
+    assert!(listener_registers(CONTROL, "td-c").await?);
+    Ok(())
+}
+
+/// A hub that leaves closes every spoke.
+///
+/// RED-CHECK: without the `hub_clone.cancel.cancelled()` arm in the spoke
+/// loop both spokes stay open for the whole budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vpn_hub_exit_closes_spokes() -> Result<()> {
+    const CONTROL: u16 = 18912;
+    let admin = spawn_server(CONTROL).await?;
+    let wait = Duration::from_secs(3);
+
+    let mut hub = ctrl(control_addr(CONTROL)).await?;
+    hub.send(hello("td-hub", 4, 0)).await?;
+    ready_flag(next_non_heartbeat(&mut hub, wait).await, "hub");
+    let mut spokes = Vec::new();
+    for i in 0..2 {
+        let mut spoke = ctrl(control_addr(CONTROL)).await?;
+        spoke.send(connect("td-hub", 0)).await?;
+        ready_flag(
+            next_non_heartbeat(&mut spoke, wait).await,
+            &format!("spoke {i}"),
+        );
+        spokes.push(spoke);
+    }
+    assert_eq!(count_role(&admin, Role::VpnConnector), 2);
+    for spoke in &mut spokes {
+        assert!(
+            !closes_within(spoke, Duration::from_millis(500)).await,
+            "a spoke must stay open while its hub lives"
+        );
+    }
+
+    drop(hub);
+    for (i, spoke) in spokes.iter_mut().enumerate() {
+        assert!(
+            closes_within(spoke, wait).await,
+            "spoke {i} of a hub that left was never closed"
+        );
+    }
+    eventually(wait, || count_role(&admin, Role::VpnConnector) == 0)
+        .await
+        .expect("the closed spokes left admin rows behind");
+    Ok(())
+}

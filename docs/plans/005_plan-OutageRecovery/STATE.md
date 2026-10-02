@@ -26,10 +26,10 @@ Read this first in every session. Updated 2026-10-02 by claude-opus-5-5.
 - Active scope: plan (all phases) — user: "implementa il piano, testa tutto, committa su Dev e segui la ci".
 - Scope result: RUNNING.
 - Type / ID / attempt: none.
-- Next action: 2.3 (pairing teardown: `VpnPairMsg.cancel`, `HubShared.cancel`, drop guards, cancel arms) in the main tree; the worktree `scratchpad/wt` is obsolete (remove it).
-- Next eligible plan unit: 2.3.
+- Next action: 2.4 (client: `spawn_ctrl_actor(ctrl, activity, beats, on_direct)`, hub actor deadline, `await_vpn_ready`, declare `ctrl_heartbeat_ms` with beating, remove `CTRL_HEARTBEAT_TIMEOUT`).
+- Next eligible plan unit: 2.4.
 - Unit base: f7b0745; branch: dev.
-- Repo state: plan commits on dev after f7b0745 (latest: 2.2, matched by `PEV-Unit: 2.2`).
+- Repo state: plan commits on dev after f7b0745 (latest: 2.3, matched by `PEV-Unit: 2.3`).
 
 ## 2. Feature context and readiness
 
@@ -139,7 +139,7 @@ None. Environment note: ports 19000/19001 are held by a foreign node process on 
 | 1.7 | phase_02.md (rev 1e) | 1.3 | DONE | 1 | G-U12 21/0 (2 new: persistent + one-shot-waiting listener register again after a 3 s blackhole); red-check: old `bail!`/`return Err` on a finished provider task → both FAIL; transfer_test 43/0, transfer_stdin_cli_test 14/0, transfer_link_test 22/0. Scope: re-registration applies to BOTH modes while waiting (a one-shot listener that has not received its sender has not done its job); a transfer in progress keeps failing as before (resume state kept). README transfer flags + liveness section updated |
 | 2.1 | phase_03.md | P1 | DONE | 1 | `HelloVpn`/`ConnectVpn.ctrl_heartbeat_ms` + `VpnReady.ctrl_heartbeat`, all `#[serde(default)]`; clients still declare 0 and the server still answers `false` (wired in 2.2/2.4). `shared::vpn_liveness_fields_default_and_roundtrip` pass (shared 72/0); red-check: dropping the `#[serde(default)]` on `VpnReady.ctrl_heartbeat` → FAIL. vpn_server_test 57/0, vpn_relay_link_test 3/0; fmt + both clippy clean |
 | 2.2 | phase_03.md | 2.1 | DONE | 1 | NEW `tests/vpn_liveness_test.rs` 9/0: the 4 contract tests (`waiting_listener_gets_heartbeats_only_when_declared` ≥ 2 beats in 1.5 s vs none for legacy, `waiting_listener_accepts_client_heartbeats_when_declared` incl. a duplicate refused `already in use`, `declared_waiting_listener_is_transport_reaped`, `vpn_ready_carries_ctrl_heartbeat_flag` both directions) + `legacy_waiting_listener_is_never_transport_reaped` (DEC-VE2) + reaps of a paired listener, paired connector, hub listener and hub spoke (the hub outlives its reaped spoke). Red-checks: every `reap_if_due` → `None` = 5 FAIL; `declared = false` = 5 FAIL; listener flag patch removed = flag test FAIL; waiting `Heartbeat` arm returns = 2 FAIL. vpn_server_test 57/0, vpn_relay_link_test 3/0, `--lib vpn` 128/0; fmt + both clippy clean. Note: a declared fake client must beat, or the server reaps it after the floor — that is the contract, not a test flake |
-| 2.3 | phase_03.md | 2.1 | TODO | 1 | — |
+| 2.3 | phase_03.md | 2.1 | DONE | 1 | `VpnPairMsg.cancel` + `HubShared.cancel` (`tokio_util` `CancellationToken`); the connector's drop guard exists before its first await after building the pairing, the listener's right after receiving it, the hub's at `HubShared` creation (held for the handler's life); cancel arms in the paired listener, 1:1 connector and spoke loops. Also: a connector whose listener left between lookup and pairing (`remove` → `None` / `pair_tx.send` → `Err`) now closes instead of idling paired to nothing. vpn_liveness_test 12/0 (3 new: `vpn_pair_teardown_listener_exit_closes_connector`, `vpn_pair_teardown_connector_exit_closes_listener` incl. the id free again, `vpn_hub_exit_closes_spokes`; each also asserts the link stays open while both sides live and no admin row is left). Red-check: each cancel arm replaced by `pending()` → exactly its test FAIL. vpn_server_test 57/0, vpn_relay_link_test 3/0, `--lib vpn` 128/0; fmt + both clippy clean |
 | 2.4 | phase_03.md | 2.2 | TODO | 1 | — |
 | 2.5 | phase_03.md | 2.2–2.4 | TODO | 1 | — |
 | 3.1 | phase_04.md | P1 | TODO | 1 | — |
@@ -166,7 +166,7 @@ None. Environment note: ports 19000/19001 are held by a foreign node process on 
 | backoff cap | 0.3 | G-U03 | PASS | 8 passed |
 | serde defaults | 1.1/2.1/3.1 | G-U11 | PASS (1.1, 2.1) | 7 new in shared::tests |
 | outage_liveness_test | 1.2–1.5 | G-U12 | PASS (1.7: 21/0) | server reapers vhost/public/secret provider/consumer + I-5; client trips public/vhost/secret provider+consumer, flick survival, carrier termination, consumer direct survival, provider linger, sticky public port |
-| vpn liveness/teardown | 2.2–2.4 | G-U2 | PASS (2.2: 9/0) | vpn_liveness_test server side |
+| vpn liveness/teardown | 2.2–2.4 | G-U2 | PASS (2.3: 12/0) | vpn_liveness_test server side + pairing teardown |
 | owner + sshgw | 3.1/3.2 | G-U3 | TODO | — |
 | T-OUT-* | 4.1 | G-NETNS-OUT | TODO | — |
 

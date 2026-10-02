@@ -294,6 +294,17 @@ client that still closes early is not made correct by it — the rule is that
 `FINAL` is the signal on BOTH transports, exactly as the direct path already
 treated it.
 
+**A source never writes into a leg the server has closed.** When the server
+ends a leg early (the recipient cancelled, a peer was reaped) the browser
+turns the socket `CLOSING` before it delivers the `close` event, and a write
+in that window is discarded by the engine — it only grows `bufferedAmount`
+and logs `WebSocket is already in CLOSING or CLOSED state.` (MEASURED on
+chromium: 45 of them for one cancelled transfer). The source's relay sink
+refuses such a write the way its DataChannel sink refuses a write to a
+closed channel, ending the attempt, and the `close` event decides the
+verdict — so a `FINAL` discarded by a closing leg can never be mistaken for
+one that was sent.
+
 ## 4. Canonical JSON
 
 Signing, hashing and digest inputs use canonical JSON:

@@ -352,6 +352,32 @@ describe("web-transfer sender", () => {
     assert.equal(h.sender.transfers().has(TRANSFER), false);
   });
 
+  it("relay_send_on_a_closing_leg_abandons_the_attempt_instead_of_writing", async () => {
+    // The server closes the leg (a cancel, a reaped peer) and the browser
+    // turns it CLOSING before it delivers `close`. Every write in between is
+    // discarded by the engine with a console error — 45 of them on chromium
+    // CI for one cancelled transfer — and a FINAL among them would set
+    // `finalSent` and make the close read as an orderly end.
+    const h = harness();
+    await h.publish();
+    assert.equal(h.sender.handleControl(incoming()), true);
+    await tick();
+    assert.equal(h.sender.handleControl(ticket()), true);
+    const socket = h.sockets[0];
+    socket.onopen();
+    const attached = socket.sent.length;
+    socket.readyState = 2; // CLOSING: closed by the server, no event yet
+    assert.equal(h.sender.handleControl(commit()), true);
+    await tick(20);
+    assert.equal(socket.sent.length, attached, "a frame was written into a closing leg");
+    assert.deepEqual(h.events.errors, [], "the verdict belongs to the close event");
+    assert.notEqual(h.sender.transfers().get(TRANSFER)?.finalSent, true);
+    socket.readyState = 3;
+    socket.onclose();
+    assert.deepEqual(h.events.errors, [[TRANSFER, "FAILED"]]);
+    assert.equal(h.sender.transfers().has(TRANSFER), false);
+  });
+
   it("sender_auto_accepts_only_valid_local_offer", async () => {
     // Unknown offer: reject, no ready, nothing tracked.
     {

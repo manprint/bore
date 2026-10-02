@@ -75,6 +75,9 @@ export const PROGRESS_MIN_MS = 500;
 export const PROGRESS_MIN_BYTES = 1024 * 1024;
 /** Backpressure poll step while the socket drains. */
 export const DRAIN_POLL_MS = 30;
+/** `WebSocket.readyState` values a relay write must never reach. */
+const WS_CLOSING = 2;
+const WS_CLOSED = 3;
 
 function randomRequestId() {
   const bytes = new Uint8Array(16);
@@ -173,6 +176,23 @@ export function createSender({
         return socket.bufferedAmount ?? 0;
       },
       send(bytes) {
+        // A leg the server has closed (the recipient cancelled, the peer was
+        // reaped) turns CLOSING before its `close` event — the event that
+        // ends the attempt — is delivered, and a write in that window is
+        // DISCARDED: the engine only adds it to `bufferedAmount` and logs
+        // "WebSocket is already in CLOSING or CLOSED state." (MEASURED on
+        // chromium CI: 45 of them for one cancelled transfer). It is
+        // reported the way the DataChannel sink reports a closed channel,
+        // as an `AbortError` — this attempt is over and `onclose` decides
+        // the verdict. Discarding it silently also let a FINAL written into
+        // a closing leg set `finalSent`, which `onclose` then read as an
+        // orderly end of the transfer.
+        if (
+          socket.readyState === WS_CLOSING ||
+          socket.readyState === WS_CLOSED
+        ) {
+          throw new DOMException("relay leg is closing", "AbortError");
+        }
         socket.send(bytes);
       },
       async waitLow(signal) {

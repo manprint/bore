@@ -26,8 +26,8 @@ Read this first in every session. Updated 2026-10-02 by claude-opus-5-5.
 - Active scope: plan (all phases) — user: "implementa il piano, testa tutto, committa su Dev e segui la ci".
 - Scope result: RUNNING.
 - Type / ID / attempt: none.
-- Next action: P3 — G-P3 (G-P1 + `cargo test --features ssh-gateway`), release build `cargo build --release --features vpn,ssh-gateway` as the user, `sudo -n $PWD/scripts/ssh_gateway_test.sh` (serial; T-SSH-N1 now bounds the half-open reap at 20 s), self-review, closure commit.
-- Next eligible plan unit: P3.
+- Next action: 4.1 — run `sudo -n $PWD/scripts/outage_netns_test.sh` on the release build (`--features vpn,ssh-gateway`), iterate to green, then red-check on a baseline f7b0745 release build (`BORE=` override); record both runs in §7.
+- Next eligible plan unit: 4.1.
 - Unit base: f7b0745; branch: dev.
 - Repo state: plan commits on dev after f7b0745 (latest: P2, matched by `PEV-Unit: P2`).
 
@@ -95,6 +95,8 @@ None.
 | G-U02 | `cargo test --lib liveness` | PASS | 6 new | 0.2 diff | 2026-10-02 |
 | G-U12 (1.3) | `cargo test --test outage_liveness_test` | PASS | 10 passed (5 new client-side) | 1.3 diff | 2026-10-02 |
 | full `cargo test` (1.3) | `cargo test` | PASS (env-only red) | 1095 pass; only `vhost_entry_redirect_overrides_both` (port 19000 foreign pid 3179752, §9) | 1.3 diff | 2026-10-02 |
+| G-PHASE P3 (G-P3) | main tree at 91243d6 (uncommitted: only the 4.1/4.2 harness + workflow, not compiled): fmt; clippy default, `vpn,ssh-gateway`, all-features; all-features `--no-fail-fast` lib/bins/examples/tests (skip `t_ssh_`/`t_dmx_`); doc; ssh serial; web serial; no-default `transfer_link_test`; `cargo test --features ssh-gateway --no-fail-fast`; root `npm test`; `web/transfer` `npm run test:unit` | PASS (env-only red) | all-features 1415 passed, 1 failed = `vhost_entry_redirect_overrides_both` (port 19000, §9); doc 1/0; ssh serial 48/0; web serial 41/0; no-default 22/0; `--features ssh-gateway` 1294 passed, the same 1 env-only failure; npm 125/0; web unit 227/0; fmt + 3 clippy clean. (A first run was void: the root filesystem that holds /tmp hit ENOSPC mid-run (what filled it was not identified; ~36 GB of /tmp belongs to other projects' sessions) and every log came back empty; rerun after freeing this plan's own 14 GB isolated target) | HEAD 91243d6 | 2026-10-02 |
+| G-NETNS-SSH (P3) | `sudo -n $PWD/scripts/ssh_gateway_test.sh` (release `--features vpn,ssh-gateway` at 91243d6, serial) | PASS | 21 passed, 0 failed; T-SSH-N1 cleared the half-open session's admin row after 15 s (bound 20 s; the pre-plan 60 s reaper cannot pass it) | HEAD 91243d6 | 2026-10-02 |
 | G-U3 (3.4) | isolated tree holding exactly the commit: fmt; clippy default + all-features; `--lib web_transfer`; web_transfer_deploy_test + web_transfer_fuzz; web_transfer_test `--test-threads=1`; `npm run test:unit`; `npx playwright test --project=chromium` with `BORE_E2E_BIN`/`BORE_E2E_OWNER_BIN` = that tree's all-features debug build | PASS | lib 208/0; deploy 3/0; fuzz 4/0; web serial 41/0 (1 ignored = bench); npm unit 227/0; Playwright chromium 67 passed, 1 skipped (engine-conditional `test.skip`), 0 failed; dist rebuilt and byte-identical to `npm run build` | 3.4 diff on 53f8e31 | 2026-10-02 |
 | G-PHASE P2 | `cargo fmt --check`; clippy default + `vpn,ssh-gateway`; `cargo test --features vpn --no-fail-fast` — on an isolated worktree holding exactly the P2 commit | PASS (env-only red) | 1375 passed, 1 failed = `vhost_entry_redirect_overrides_both` (port 19000, §9); `--lib vpn` 142/0 (2 new `PumpGuard` tests), vpn_liveness_test 12/0 | HEAD 8454a73 + revision 1g | 2026-10-02 |
 | G-NETNS-VPN (P2) | `sudo -n $PWD/scripts/vpn_netns_test.sh` (release `--features vpn`, serial) | PASS | 169 passed, 0 failed, 1 SKIP = T-PINMTU (its stimulus — shrinking the path — did not move the UNPINNED control TUN, 1414 -> 1414, so the pinned arm cannot discriminate and is not run; on the CI baseline the same test was already red, 171/1, before this plan). Before revision 1g the same run was red on T-new-2/T-new-3 (a second `bore1` beside the still-open `bore0`) | HEAD 8454a73 + revision 1g | 2026-10-02 |
@@ -103,6 +105,7 @@ None.
 
 | Review | Reviewer | Plan revision / reviewed change | Invariants/assertions checked | Verdict |
 |--------|----------|---------------------------------|------------------------------|---------|
+| P3 self-review | claude-opus-5-5 (agent-1, supervisor) | revisions 1f, 1h, 1i, 1j; 3.1–3.4 | owner: a legacy server (no heartbeat) never arms the owner's deadline and a legacy owner (declares 0) is never transport-reaped — the pair is byte-identical (DEC-VE2); the owner's explicit close path is unchanged; SSH: russh resets the keepalive counter on ANY received byte, so 15 s counts from the last byte and a busy session is never reaped, and KEEP1 holds an idle session for 2× the deadline on keepalives alone; browser: wire unchanged (RFC 6455 Ping/Pong), a client that never answers a Ping keeps the legacy 60 s, every new write is bounded (P-9), the first Ping never races the welcome/snapshot frames; the bore-ssh-client image defaults now match the documented 2 x 7 | PASS |
 | P2 self-review | claude-opus-5-5 (agent-1, supervisor) | revisions 1d(a), 1g; 2.1–2.5 + bridge/hub teardown | I-MC1: hub stays a separate branch (`run_listen_hub`), the 1:1 path only gained the cancel/await teardown; legacy waiting path sends nothing until the server's first `Heartbeat` (I-9, `await_vpn_ready_legacy_server`); 1:1 on DIRECT warns instead of tripping, explicit close still ends it; pairing teardown leaves no admin row; every pump of a bridge is aborted AND awaited before `run` returns (no second `boreN` beside an open one, T-new-2/3 netns), and an unorderly drop is covered by `PumpGuard` (red-checked: no-op `Drop` → FAIL) | PASS |
 | P1 self-review | claude-opus-5-5 (agent-1, supervisor) | revisions 1b–1e; f7b0745..52e0428 | every reap path returns/breaks so the RAII registration drops (no zombie row); reap checked on the heartbeat tick, never `timeout(recv)` (DEC-VE3); undeclared clients get `None` (DEC-VE2, `undeclared_client_is_never_transport_reaped`); consumer carriers get no reaper (BUG-S2) and provider carriers go through `serve_carrier`; a client never declares `ctrl_heartbeat_ms` without beating (`Client::new`/`Proxy` set both); beats use `beat_once` (P-9); explicit server close always ends the client; transfer one-shot in-progress failure path unchanged (resume state kept) | PASS |
 
@@ -165,7 +168,7 @@ None. Environment note: ports 19000/19001 are held by a foreign node process on 
 | 0 | phase_01.md | P0 | DONE | self-review: no callers of terminate yet; heartbeat 5 s only speeds beats; PEV-Unit P0 |
 | 1 | phase_02.md | P1 | DONE | G-P1 + self-review (§7); PEV-Unit P1 |
 | 2 | phase_03.md | P2 | DONE | G-PHASE P2 + G-NETNS-VPN + self-review (§7); revision 1g; PEV-Unit P2 |
-| 3 | phase_04.md | P3 | TODO | — |
+| 3 | phase_04.md | P3 | DONE | G-P3 + G-NETNS-SSH + self-review (§7); revisions 1f, 1h, 1i, 1j; PEV-Unit P3 |
 | 4 | phase_05.md | P4 | TODO | — |
 
 ### Tests
@@ -177,7 +180,7 @@ None. Environment note: ports 19000/19001 are held by a foreign node process on 
 | serde defaults | 1.1/2.1/3.1 | G-U11 | PASS (1.1, 2.1) | 7 new in shared::tests |
 | outage_liveness_test | 1.2–1.5 | G-U12 | PASS (1.7: 21/0) | server reapers vhost/public/secret provider/consumer + I-5; client trips public/vhost/secret provider+consumer, flick survival, carrier termination, consumer direct survival, provider linger, sticky public port |
 | vpn liveness/teardown | 2.2–2.4 | G-U2 | PASS (2.4: lib vpn 140/0, vpn_liveness_test 12/0) | vpn_liveness_test server side + pairing teardown; `vpn::tests` ctrl actor / `await_vpn_ready` / `silence_verdict`; `vpn::hub::tests` hub ctrl actor |
-| owner + sshgw + browser | 3.1/3.2/3.4 | G-U3 | PASS | 3.1: outage_liveness_test 22/0 + web lib; 3.2: `--lib sshgw` 63/0 + ssh serial 43/0; 3.4: web lib 208/0 + web serial 41/0 + npm unit 227/0 |
+| owner + sshgw + browser + ssh image | 3.1/3.2/3.3/3.4 | G-U3 | PASS | 3.1: outage_liveness_test 22/0 + web lib; 3.2: `--lib sshgw` 63/0 + ssh serial 43/0; 3.4: web lib 208/0 + web serial 41/0 + npm unit 227/0 |
 | T-OUT-* | 4.1 | G-NETNS-OUT | TODO | — |
 
 ### Documentation

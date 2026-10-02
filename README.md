@@ -879,8 +879,10 @@ local`/`proxy`.
 
 Both `bore local` and `bore proxy` accept `--auto-reconnect`. When the connection fails to
 establish or drops, the client reconnects on its own with a capped exponential backoff of 1,
-2, 4, 8, 16, 32 seconds, then every 32 seconds indefinitely; a successful connection resets
-the backoff.
+2, 4, 8 seconds, then every 8 seconds indefinitely; a successful connection resets the
+backoff. The same backoff drives `bore vhost`, `bore vpn` and `bore transfer-link`. How fast
+a dead connection is *noticed* in the first place is described in
+[Connection liveness and outage recovery](#connection-liveness-and-outage-recovery).
 
 ### HTTPS on the tunnel port
 

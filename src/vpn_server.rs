@@ -596,7 +596,13 @@ pub async fn serve_vpn_listener(
     nat_masquerade: bool,
     route_policy: Option<String>,
     nat_udp_preferred_port: u16,
+    transport: Option<crate::liveness::TransportReaper>,
 ) -> Result<()> {
+    // Plan 005, D6: a listener that declared a heartbeat is heartbeated while
+    // it waits, may beat back, and is reaped on transport silence. `None` is
+    // the legacy path, byte-identical (an old client bails on any message
+    // other than `VpnReady` while it waits).
+    let declared = transport.is_some();
     // Bound attacker-chosen wire strings/lists before any allocating work.
     if let Err(e) = validate_link_params(&id, &advertised) {
         warn!(%id, error = %e, "rejecting vpn listener: invalid link params");
@@ -798,7 +804,7 @@ pub async fn serve_vpn_listener(
                 tuning: udp_tuning,
                 admin_v2: true,
                 carriers,
-                ctrl_heartbeat: false,
+                ctrl_heartbeat: declared,
             })
             .await?;
 
@@ -813,6 +819,10 @@ pub async fn serve_vpn_listener(
                 _ = hb.tick() => {
                     if control.send(ServerMessage::Heartbeat).await.is_err() {
                         info!(%id, "vpn hub listener disconnected");
+                        break;
+                    }
+                    if let Some(idle) = crate::liveness::reap_if_due(&transport) {
+                        warn!(%id, ?idle, "vpn hub listener connection silent; reaping (path dead)");
                         break;
                     }
                 }
@@ -913,31 +923,67 @@ pub async fn serve_vpn_listener(
         let mut pair_rx = pair_rx.unwrap(); // safe: 1:1 mode always has pair_rx
 
         // Wait for a connector to pair us (or control channel to close).
-        let pair_msg = tokio::select! {
-            result = &mut pair_rx => {
-                match result {
-                    Ok(msg) => msg,
-                    Err(_) => {
-                        warn!(%id, "vpn listener: pair channel dropped before connector arrived");
-                        return Ok(());
+        let mut pair_msg = if declared {
+            // A declared listener can wait for hours: heartbeat it, accept its
+            // beats, and free its id the moment its path dies.
+            let mut hb = interval(Duration::from_millis(500));
+            hb.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    result = &mut pair_rx => match result {
+                        Ok(msg) => break msg,
+                        Err(_) => {
+                            warn!(%id, "vpn listener: pair channel dropped before connector arrived");
+                            return Ok(());
+                        }
+                    },
+                    _ = hb.tick() => {
+                        if control.send(ServerMessage::Heartbeat).await.is_err() {
+                            return Ok(());
+                        }
+                        if let Some(idle) = crate::liveness::reap_if_due(&transport) {
+                            warn!(%id, ?idle, "waiting vpn listener connection silent; reaping (path dead)");
+                            return Ok(());
+                        }
                     }
+                    result = control.recv::<ClientMessage>() => match result {
+                        Ok(Some(ClientMessage::Heartbeat)) => {}
+                        // Client disconnected (or spoke out of turn) before pairing.
+                        _ => return Ok(()),
+                    },
                 }
             }
-            result = control.recv::<ClientMessage>() => {
-                // Client disconnected before pairing.
-                let _ = result;
-                return Ok(());
+        } else {
+            tokio::select! {
+                result = &mut pair_rx => {
+                    match result {
+                        Ok(msg) => msg,
+                        Err(_) => {
+                            warn!(%id, "vpn listener: pair channel dropped before connector arrived");
+                            return Ok(());
+                        }
+                    }
+                }
+                result = control.recv::<ClientMessage>() => {
+                    // Client disconnected before pairing.
+                    let _ = result;
+                    return Ok(());
+                }
             }
         };
 
         // Record the assigned overlay on the admin entry, then deliver VpnReady.
+        // The connector's handler built it; whether THIS side beats is this
+        // side's own declaration.
         if let ServerMessage::VpnReady {
             assigned,
             prefix,
             carriers,
+            ctrl_heartbeat,
             ..
-        } = &pair_msg.listener_ready
+        } = &mut pair_msg.listener_ready
         {
+            *ctrl_heartbeat = declared;
             admin_reg.set_overlay(format!("{assigned}/{prefix}"));
             // Refresh to the effective negotiated carrier count (the connector
             // handler computed min(listener, connector, server-max)).
@@ -976,6 +1022,10 @@ pub async fn serve_vpn_listener(
                 _ = hb.tick() => {
                     if let Err(_e) = control.send(ServerMessage::Heartbeat).await {
                         info!(%id, "vpn listener disconnected");
+                        break;
+                    }
+                    if let Some(idle) = crate::liveness::reap_if_due(&transport) {
+                        warn!(%id, ?idle, "vpn listener connection silent; reaping (path dead)");
                         break;
                     }
                 }
@@ -1073,8 +1123,12 @@ pub async fn serve_vpn_connector(
     nat_masquerade: bool,
     route_policy: Option<String>,
     nat_udp_preferred_port: u16,
+    transport: Option<crate::liveness::TransportReaper>,
 ) -> Result<()> {
     info!(%id, "vpn connector connecting");
+    // Plan 005, D6: a connector that declared a heartbeat may beat and is
+    // reaped on transport silence; `None` is the legacy path.
+    let declared = transport.is_some();
     // Bound attacker-chosen wire strings/lists before any allocating work.
     if let Err(e) = validate_link_params(&id, &advertised) {
         warn!(%id, error = %e, "rejecting vpn connector: invalid link params");
@@ -1195,7 +1249,7 @@ pub async fn serve_vpn_connector(
                 tuning: udp_tuning,
                 admin_v2: true,
                 carriers: effective_carriers,
-                ctrl_heartbeat: false,
+                ctrl_heartbeat: declared,
             })
             .await?;
 
@@ -1431,6 +1485,10 @@ pub async fn serve_vpn_connector(
                     if control.send(ServerMessage::Heartbeat).await.is_err() {
                         break;
                     }
+                    if let Some(idle) = crate::liveness::reap_if_due(&transport) {
+                        warn!(%id, %peer_id, ?idle, "vpn hub spoke connection silent; reaping (path dead)");
+                        break;
+                    }
                 }
                 msg = control.recv::<ClientMessage>() => {
                     match msg {
@@ -1591,6 +1649,7 @@ pub async fn serve_vpn_connector(
         tuning: udp_tuning,
         admin_v2: true,
         carriers: effective_carriers,
+        // Patched by the listener handler to ITS declaration (plan 005, D6).
         ctrl_heartbeat: false,
     };
 
@@ -1603,7 +1662,7 @@ pub async fn serve_vpn_connector(
         tuning: udp_tuning,
         admin_v2: true,
         carriers: effective_carriers,
-        ctrl_heartbeat: false,
+        ctrl_heartbeat: declared,
     };
 
     // Send VpnReady to connector
@@ -1820,6 +1879,10 @@ pub async fn serve_vpn_connector(
             _ = heartbeat.tick() => {
                 // Heartbeat; if connector is gone, exit
                 if control.send(ServerMessage::Heartbeat).await.is_err() {
+                    break;
+                }
+                if let Some(idle) = crate::liveness::reap_if_due(&transport) {
+                    warn!(%id, ?idle, "vpn connector connection silent; reaping (path dead)");
                     break;
                 }
             }

@@ -2830,8 +2830,7 @@ impl Server {
                 nat_masquerade,
                 route_policy,
                 nat_udp_preferred_port,
-                // Plan 005, D6: honoured once the server reaps (2.2).
-                ctrl_heartbeat_ms: _,
+                ctrl_heartbeat_ms,
             }) => {
                 #[cfg(feature = "vpn")]
                 if self.vpn_enabled {
@@ -2859,11 +2858,13 @@ impl Server {
                         nat_masquerade,
                         route_policy,
                         nat_udp_preferred_port,
+                        reaper(ctrl_heartbeat_ms),
                     )
                     .await;
                 }
                 #[cfg(not(feature = "vpn"))]
                 let _ = (
+                    ctrl_heartbeat_ms,
                     carriers,
                     max_clients,
                     relay_only,
@@ -2897,8 +2898,7 @@ impl Server {
                 nat_masquerade,
                 route_policy,
                 nat_udp_preferred_port,
-                // Plan 005, D6: honoured once the server reaps (2.2).
-                ctrl_heartbeat_ms: _,
+                ctrl_heartbeat_ms,
             }) => {
                 #[cfg(feature = "vpn")]
                 if self.vpn_enabled {
@@ -2929,11 +2929,13 @@ impl Server {
                         nat_masquerade,
                         route_policy,
                         nat_udp_preferred_port,
+                        reaper(ctrl_heartbeat_ms),
                     )
                     .await;
                 }
                 #[cfg(not(feature = "vpn"))]
                 let _ = (
+                    ctrl_heartbeat_ms,
                     carriers,
                     relay_only,
                     pin_mtu,

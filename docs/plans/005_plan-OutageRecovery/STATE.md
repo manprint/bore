@@ -26,8 +26,8 @@ Read this first in every session. Updated 2026-10-02 by claude-opus-5-5.
 - Active scope: plan (all phases) — user: "implementa il piano, testa tutto, committa su Dev e segui la ci".
 - Scope result: RUNNING.
 - Type / ID / attempt: none.
-- Next action: 4.3 — CLAUDE.md O-1 bullet + I-SSH3/secret heartbeat numbers (already applied, uncommitted: verify the diff), README final pass (troubleshooting row "Tunnel down for minutes after a network drop or an IP change", VPN grace in "Automatic reconnection"); STATE; commit. Then P4: G-FINAL, push dev, watch CI to green.
-- Next eligible plan unit: 4.3.
+- Next action: P4 — G-FINAL (fmt; clippy default, `--features vpn,ssh-gateway`, `--no-default-features`; `cargo test` default, `--features vpn`, `--features ssh-gateway`; T-OUT + regression harnesses already green at 1c5ac1a, no src change since), self-review, closure commit, push dev, watch CI to green.
+- Next eligible plan unit: P4.
 - Unit base: f7b0745; branch: dev.
 - Repo state: plan commits on dev after f7b0745 (latest: P2, matched by `PEV-Unit: P2`).
 
@@ -74,6 +74,7 @@ Read this first in every session. Updated 2026-10-02 by claude-opus-5-5.
 | Type | ID / attempt | Plan revision | Agent | Changes | Evidence/review | Commit |
 |------|--------------|---------------|-------|---------|-----------------|--------|
 | plan | 005 / 1 | 1 | claude-opus-5-5 | plan folder | self-validated | committed with 0.1 |
+| unit | 4.3 / 1 | 1k | claude-opus-5-5 | CLAUDE.md O-1 invariant + stale numbers; README troubleshooting + VPN grace | symbols/constants cross-checked | PEV-Unit 4.3 |
 | unit | 4.2 / 1 | 1k | claude-opus-5-5 | .github/workflows/e2e_netns.yml gate entry | G-NETNS-REG (§7) | PEV-Unit 4.2 |
 | unit | 4.1 / 1 | 1k | claude-opus-5-5 | NEW scripts/outage_netns_test.sh; src/vpn.rs `LinkProgress` + `VPN_PEER_RETURN_GRACE` (rev 1k); README/VPN.md/VPN_USER_FULL_GUIDE.md backoff text | G-NETNS-OUT 69/0 new, 12 FAIL on baseline (§7) | PEV-Unit 4.1 |
 | unit | 0.1 / 1 | 1 | claude-opus-5-5 | src/mux.rs ConnActivity/ActivityIo/terminate | self-review: drop path = yamux drop_all_streams | PEV-Unit 0.1 |
@@ -166,7 +167,7 @@ None. Environment note: ports 19000/19001 are held by a foreign node process on 
 | 3.4 | phase_04.md (rev 1h) | P1 | DONE | 1 | On an isolated tree holding exactly the commit: fmt + clippy default/all-features clean; `--lib web_transfer` 208/0 (new `peer_session_expiry_is_gated_on_an_answered_ping`); web_transfer_deploy_test 3/0, web_transfer_fuzz 4/0; web_transfer_test serial 41/0 (1 ignored = bench; new `a_browser_that_stops_answering_pings_leaves_on_the_transport_deadline`); `npm run test:unit` 227/0; Playwright chromium (see §7). Rust red-checks 4/4 bite: R1 server never pings (`WEB_TRANSFER_PEER_WS_PING` 3600 s) → e2e FAIL; R2 Pong never recorded → e2e FAIL (B stays on the 60 s window); R3 expiry not gated on an answered Ping → unit FAIL; R4 Pong does not refresh `last_recv` → e2e FAIL (the answering peer A is reaped). JS red-checks J1–J6 all FAIL fast (no hang: afterEach stops every session, each async test has a 5 s timeout). Found by the gate and fixed in the same unit: (a) the first Ping now waits one period (`interval_at`) — an immediate tick could race the welcome/snapshot frames and make `pong_seen` depend on scheduling; (b) the test helpers `next_text`/`close_code`/`next_msg`/`answer_one_ping_then_go_silent` bound the WHOLE call by a deadline — a per-frame timeout longer than the 1 s Ping never expires (hung the new test); (c) `t_web_peers` quiet reap: S is no longer READ while waiting (reading answers Pings, and a session that answers is alive by design) and A/B ping every 10 s instead of sleeping 20 s against the 20 s transport deadline |
 | 4.1 | phase_05.md (rev 1k) | P2, P3 | DONE | 1 | G-NETNS-OUT 69/0 on the new build, 12 FAIL on baseline f7b0745 (§7); rev 1k VPN backoff fix + unit gate red-checked; fmt + clippy default/`vpn,ssh-gateway` clean; `--lib vpn` 143/0, vpn_liveness 12/0, vpn_relay_link 3/0, vpn_server 57/0 |
 | 4.2 | phase_05.md | 4.1 | DONE | 1 | `outage_netns_test` added to the e2e_netns.yml gate matrix (1200 s, gate: true); G-NETNS-REG all green (§7): local_proxy 16/0, secret 34/0, vhost 16/0, vpn 172/0, ssh_gateway 21/0 |
-| 4.3 | phase_05.md | 4.2 | TODO | 1 | — |
+| 4.3 | phase_05.md | 4.2 | DONE | 1 | CLAUDE.md: new O-1 invariant bullet (D1–D9, revisions 1b/1f/1g/1h/1k, rejected alternatives D-R1..3, gates) + stale numbers fixed (secret heartbeat 20 s -> 2 s twice, I-SSH3 20 s / 60 s -> 1 s / 15 s); every symbol and test it names checked to exist. README: troubleshooting row "Tunnel down for minutes after a network drop or an IP change", VPN grace in "Automatic reconnection"; liveness section re-read against the shipped constants (`CTRL_CLIENT_HEARTBEAT` 2 s, `CLIENT_SILENCE_DEADLINE`/`TRANSPORT_REAP_FLOOR` 15 s, backoff 1..8 s, `SSH_KEEPALIVE_INTERVAL` 1 s / `SSH_CTRL_TIMEOUT` 15 s, Ping 1 s / 20 s, page 5 s / 20 s / 250 ms..5 s, owner 2 s / `RESUME_BACKOFF_MAX_MS` 5 s, `VPN_PEER_RETURN_GRACE` 60 s) and the measured recoveries |
 
 ### Phases
 | ID | File | Closure unit | Status | Review / commit reference |
@@ -197,7 +198,7 @@ None. Environment note: ports 19000/19001 are held by a foreign node process on 
 | README liveness section | 1.6 | DONE | README "Connection liveness and outage recovery" + transfer paragraph (1.7) |
 | README VPN | 2.5 | DONE | README liveness section "VPN links" paragraph + VPN Cleanup paragraph; docs/vpn/VPN.md + VPN_USER_FULL_GUIDE.md (liveness, pairing teardown, direct tolerance; stale 32 s backoff → 8 s); superseded notes in the two historical VPN assessments; CLAUDE.md B5 line; stale `secret.rs` doc comments (60 s VPN parity, 5 s heartbeat) |
 | README web-transfer + SSH, SSH_GATEWAY.md | 3.3 | DONE | README liveness section (owner, browser tabs, SSH sessions) + SSH examples/troubleshooting; SSH_GATEWAY.md, README-SSH-GATEWAY.md, README-JUMP-HOST.md, WEB_TRANSFER_PROTOCOL.md; `compose.ssh.yml` stability knobs |
-| CLAUDE.md invariant + README final | 4.3 | TODO | — |
+| CLAUDE.md invariant + README final | 4.3 | DONE | CLAUDE.md O-1 bullet + I-SSH3/secret numbers; README troubleshooting row + VPN grace |
 
 ### Audits
 | Report | Verdict | Current unresolved findings | Evidence |

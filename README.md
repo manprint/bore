@@ -885,7 +885,9 @@ local`/`proxy`.
 Both `bore local` and `bore proxy` accept `--auto-reconnect`. When the connection fails to
 establish or drops, the client reconnects on its own with a capped exponential backoff of 1,
 2, 4, 8 seconds, then every 8 seconds indefinitely; a successful connection resets the
-backoff. The same backoff drives `bore vhost`, `bore vpn` and `bore transfer-link`. How fast
+backoff. The same backoff drives `bore vhost`, `bore vpn` and `bore transfer-link`; a VPN link
+that had paired retries every 1 s for the first 60 s after it is lost, because its peer is
+redialling too ([VPN links](#connection-liveness-and-outage-recovery)). How fast
 a dead connection is *noticed* in the first place is described in
 [Connection liveness and outage recovery](#connection-liveness-and-outage-recovery).
 
@@ -4411,6 +4413,7 @@ matching credential label; existing gateway modes remain username-agnostic. See
 | `tcp-secret-id '<id>' already in use` | A provider with that id already exists | An id has one provider at a time: pick a different id or stop the existing provider (multiple **consumers** are fine). |
 | Basic-auth credentials travel in the clear | Tunnel/control not encrypted | Use a TLS server and `--https` on the public tunnel. |
 | Connections refused under load | `--max-conns` reached | Raise `--max-conns` (server and/or provider). |
+| Tunnel down for minutes after a network drop or an IP change, then comes back on its own | Client or server older than the liveness change: a silently dead connection lived until the kernel gave up (~15 min) and the server kept the old subdomain/port/id meanwhile | Upgrade the server **and** the clients, and run the clients with `--auto-reconnect`; every mode is then back within a few seconds of the network returning, and about 15-20 s after an instant IP change (the 15 s are the time it takes to tell a dead connection from a quiet one). For OpenSSH clients use `ServerAliveInterval=2 ServerAliveCountMax=7` under autossh. See [Connection liveness and outage recovery](#connection-liveness-and-outage-recovery). |
 | SSH gateway issues | — | See [Troubleshooting the SSH gateway](#troubleshooting-the-ssh-gateway) above. |
 | Browser-to-browser room issues (`Link incompleto`, `Room non disponibile`, quota, relay busy) | — | See [Troubleshooting a room](#troubleshooting-a-room). |
 

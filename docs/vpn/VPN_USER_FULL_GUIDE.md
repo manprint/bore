@@ -674,9 +674,7 @@ bash /tmp/vpn_setup.sh
 | 1 | 1 |
 | 2 | 2 |
 | 3 | 4 |
-| 4 | 8 |
-| 5 | 16 |
-| 6+ | 32 (fixed) |
+| 4+ | 8 (fixed) |
 
 ```bash
 sudo bore vpn connect \
@@ -695,6 +693,13 @@ sudo bore vpn connect \
   server re-allocates); use static addressing if you need stable addresses.
 - The direct-path upgrade is re-attempted on every reconnect (fresh nonce).
 - An attempt that stayed up >60 s resets the backoff to 1 second.
+- A server the client has not heard from for 15 s ends the link and starts a
+  reconnect (`BORE_CTRL_SERVER_SILENCE_MS`), so a silent path loss such as an ISP
+  IP change costs seconds, not the kernel's ~15 minutes. A 1:1 link on the
+  direct path keeps running through server silence (one warning) and reconnects
+  when the direct path fails. When one side of a link leaves the server, the
+  server closes the other side too, so both pair again. Details:
+  [VPN.md → Automatic Reconnection](VPN.md#automatic-reconnection).
 - **Fatal configuration errors exit instead of looping**: overlap, addressing
   mode mismatch, static mismatch, pool exhausted, no server pool, max-links,
   missing root or `ip` binary. Two exceptions are retried because they are

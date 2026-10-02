@@ -115,6 +115,13 @@ reconnect (fresh key) and asserts global `(key, counter)` uniqueness. Plus
   60 s `CTRL_HEARTBEAT_TIMEOUT` (server heartbeats every 500 ms ⇒ 120-beat
   margin, no false positives), matching the hub.
 
+  > **Superseded (plan 005, 2026-10-02).** `SO_KEEPALIVE` does NOT bound this: the
+  > server's 500 ms heartbeats keep data unacknowledged on a dead path, and keepalive
+  > probes only run on an idle socket, so detection fell to `tcp_retries2` (~15 min)
+  > and the 60 s timeout was the real bound. Both VPN ctrl actors now watch inbound
+  > activity against a 15 s client deadline, a waiting listener included; see
+  > [VPN.md → Automatic Reconnection](VPN.md#automatic-reconnection).
+
 ## C. Hub multi-client
 
 - **C1/C2 (SAFE).** The router (`run_router_uplink_*`) routes by dst IPv4 to a

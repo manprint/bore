@@ -74,6 +74,10 @@ advertised) into one.
   legitimately waits indefinitely for a peer to connect; a fixed timeout would break
   normal slow pairing. The post-pairing life is already covered by the ctrl-actor 60 s
   heartbeat timeout. Left as-is by design (see Known limitations).
+  *Superseded (plan 005, 2026-10-02): the wait is now bounded by server LIVENESS, not by
+  a pairing timeout — a declared waiting listener receives server heartbeats and drops a
+  server silent for 15 s, so slow pairing still waits indefinitely while a dead path does
+  not; the 60 s timeout became a 15 s activity deadline.*
 
 ## Skipped (speculative, risk > reward on a documented-sensitive hot path)
 

@@ -391,7 +391,7 @@ On exit, only the TUN interface is removed; the manually-applied routes and rule
 ## Automatic Reconnection
 
 With `--auto-reconnect`, the client retries on link failure with exponential
-backoff (1, 2, 4, 8, 16, 32 seconds, then every 32 seconds). Each attempt is a
+backoff (1, 2, 4, 8 seconds, then every 8 seconds). Each attempt is a
 **full teardown + rebuild** (DEC-5): the TUN is destroyed and re-created, and
 `NetConfig` is reverted and re-applied — `ip route replace` keeps the re-apply
 idempotent even if a previous teardown was incomplete. With pool addressing the
@@ -401,6 +401,28 @@ every reconnect with a fresh nonce.
 
 An attempt that stayed up for more than 60 seconds resets the backoff to 1 s,
 so a long-lived link that drops reconnects promptly.
+
+**Control-connection liveness.** The server heartbeats every client every
+500 ms, including a listener still waiting for its peer. The client counts any
+byte received on the control connection and drops a server it has not heard
+from for 15 s (`BORE_CTRL_SERVER_SILENCE_MS`, `0` disables), which is what lets
+a link recover from a silent path loss such as an ISP IP change in seconds
+instead of the kernel's ~15 minutes. The client beats back every 2 s
+(`BORE_CTRL_HEARTBEAT_MS`), but only once the server has shown it understands
+the beat (`VpnReady.ctrl_heartbeat`, or a heartbeat on the waiting stream), so
+an older server never receives a frame it cannot decode. A server that knows
+the client beats releases a silent side after 3 × its declared interval, never
+less than 15 s; an older client declares nothing and is never reaped this way.
+
+- **Pairing teardown.** When either side of a 1:1 link leaves the server, the
+  server closes the other side's control connection too, so both reconnect and
+  pair again; a hub that leaves closes its spokes the same way.
+- **Direct path.** A 1:1 link on the direct path does not need the server for
+  its data, so server silence alone logs one warning and keeps the link; it
+  reconnects when the direct path fails (on fallback to the relay, the deadline
+  applies again) or when the server explicitly closes the control stream. A hub
+  link always reconnects on server silence: its spokes reach it through the
+  server.
 
 **Fatal errors stop the loop** — retrying a configuration mistake would fail
 identically forever: missing root/`CAP_NET_ADMIN`, missing `ip` binary,

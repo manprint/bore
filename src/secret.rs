@@ -49,14 +49,15 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 /// `recv` and the RAII admin `Registration` never drops — a zombie entry. The
 /// client sends [`ClientMessage::Heartbeat`] every
 /// [`crate::liveness::CTRL_CLIENT_HEARTBEAT`] so a healthy idle tunnel always
-/// beats this. Parity with the VPN
-/// `CTRL_HEARTBEAT_TIMEOUT` (60 s). Overridable per-server (see
-/// [`crate::server::Server::secret_ctrl_timeout`]) so tests can reap fast.
+/// beats this. A client that declares its heartbeat interval is also reaped by
+/// the shorter transport deadline ([`crate::liveness::TransportReaper`]).
+/// Overridable per-server (see [`crate::server::Server::secret_ctrl_timeout`])
+/// so tests can reap fast.
 pub(crate) const SECRET_CTRL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How often a secret/vhost provider (or secret consumer) *client* sends
 /// [`ClientMessage::Heartbeat`] up the control substream: owned by
-/// [`crate::liveness`] since plan 005 (5 s, was 20 s), kept here under its old
+/// [`crate::liveness`] since plan 005 (2 s, was 20 s), kept here under its old
 /// name for existing callers.
 pub(crate) fn ctrl_client_heartbeat() -> Duration {
     crate::liveness::ctrl_client_heartbeat()

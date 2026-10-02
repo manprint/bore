@@ -931,8 +931,20 @@ A consumer on the direct path keeps serving and reconnects only when the direct 
 closes. A provider that loses the server reconnects, so new consumers can find it, while the
 direct connections it already serves keep running until they end.
 
+**VPN links.** `bore vpn listen`/`connect` follow the same rules on their control
+connection: the client drops a server it has not heard from for 15 s and `--auto-reconnect`
+rebuilds the link, and the server releases a silent side's link id (or hub) after 15 s. A
+listener that is still **waiting** for its peer is watched too, so it registers again after
+an outage instead of waiting on a dead connection. When one side of a link leaves the
+server — reaped, exited or reconnecting — the server closes the other side as well, so both
+reconnect and pair again instead of one end waiting on a peer that is gone; a hub that leaves
+takes its spokes with it the same way. A 1:1 link already on the **direct** path does not
+cross the server, so a silent server alone does not end it: the link logs one warning and
+keeps running, and reconnects when the direct path itself fails. A hub always reconnects,
+because its spokes reach it through the server.
+
 **Tuning.** Both knobs are environment variables of the *client* (`bore local`, `proxy`,
-`vhost`, `sshjhost`), read for every connection, so they work unchanged in Docker Compose:
+`vhost`, `sshjhost`, `vpn`), read for every connection, so they work unchanged in Docker Compose:
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -3661,10 +3673,12 @@ dropped, TUN interface removed. State after exit is identical to before the link
 
 When several gateway links run on the **same host**, `ip_forward` is reference-counted
 (`/run/bore-vpn-*.fwdref`): each link restores it only once the last gateway link exits, so
-tearing one link down never disables forwarding under another still-running one. Server
-liveness is detected within ~15s on a broken socket (TCP keepalive) and within 60s even for a
-wedged-but-connected server (control-stream heartbeat timeout), after which
-`--auto-reconnect` re-establishes the link with its forwarding/routes intact.
+tearing one link down never disables forwarding under another still-running one. A server
+the client has not heard from for 15 s — a broken socket, a silently dropped path after an
+IP change, or a wedged-but-connected server — ends the link, and `--auto-reconnect`
+re-establishes it with its forwarding/routes intact (see
+[Connection liveness and outage recovery](#connection-liveness-and-outage-recovery) for the
+direct-path and pairing rules).
 
 See **[`docs/vpn/VPN_USER_FULL_GUIDE.md`](docs/vpn/VPN_USER_FULL_GUIDE.md)** for the complete
 flag reference and use-case guide, and

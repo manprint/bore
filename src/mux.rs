@@ -15,14 +15,16 @@ use std::future::poll_fn;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::task::Poll;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures_util::task::AtomicWaker;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+use tokio_util::sync::CancellationToken;
 use yamux::{Config, Connection, Mode};
 
 /// A multiplexed substream exposing Tokio's async I/O traits.
@@ -125,6 +127,133 @@ impl futures_util::io::AsyncWrite for TrackedStream {
 pub trait Transport: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Transport for T {}
 
+/// When this connection last heard from its peer, and the switch that kills it.
+///
+/// Liveness is measured at the TRANSPORT, below yamux: every byte the socket
+/// yields stamps it, whatever substream (or yamux control frame) it belongs to.
+/// That is the property that makes a liveness deadline safe on a busy tunnel. A
+/// control frame queues behind bulk data in the peer's socket buffer (≈4 MiB at
+/// 1 Mbit/s is ≈32 s), so a deadline on control MESSAGES would kill a healthy
+/// congested tunnel; a deadline on BYTES cannot, because a path that is moving
+/// data is by definition delivering bytes. A dead path delivers none.
+///
+/// Field report (2026-10-02): after a ~20 s outage with an ISP IP change a vhost
+/// client stayed down ~16 minutes. Nothing in bore noticed the dead connection;
+/// the kernel did, after `tcp_retries2` (≈924 s) — the client's own heartbeats
+/// kept unacked data in flight, so SO_KEEPALIVE never fired.
+#[derive(Debug)]
+struct Activity {
+    base: tokio::time::Instant,
+    /// Milliseconds since `base` at the last non-empty read. `Relaxed` is
+    /// enough: it is a monotonic hint, nothing is published through it.
+    last_inbound_ms: AtomicU64,
+    /// Cancelling it ends the driver task WITHOUT the graceful close: the
+    /// `yamux::Connection` is dropped, which closes and wakes every substream
+    /// (yamux 0.13 `Active::drop_all_streams`), and the socket is released.
+    cancel: CancellationToken,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            base: tokio::time::Instant::now(),
+            last_inbound_ms: AtomicU64::new(0),
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    fn stamp(&self) {
+        let now = u64::try_from(self.base.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_inbound_ms.store(now, Ordering::Relaxed);
+    }
+}
+
+/// Liveness handle for one multiplexed connection; cheap to clone.
+///
+/// Obtained from [`Opener::activity`] or [`Acceptor::activity`].
+#[derive(Clone, Debug)]
+pub struct ConnActivity(Arc<Activity>);
+
+impl ConnActivity {
+    /// Time since the peer last delivered ANY byte on this connection (or since
+    /// the connection was set up, if it never did).
+    pub fn inbound_idle(&self) -> Duration {
+        let last = Duration::from_millis(self.0.last_inbound_ms.load(Ordering::Relaxed));
+        self.0.base.elapsed().saturating_sub(last)
+    }
+
+    /// Whether a liveness deadline has been reached. `None` never fires — the
+    /// "this peer never promised to talk" case, which must keep the legacy path.
+    pub fn reap_due(&self, deadline: Option<Duration>) -> bool {
+        deadline.is_some_and(|deadline| self.inbound_idle() >= deadline)
+    }
+
+    /// Tear the connection down NOW: every substream ends promptly and the
+    /// socket is released. Reserved for liveness trips — a path already proven
+    /// dead, whose graceful close would park on a socket that never drains.
+    /// Clean exits keep the graceful close. Idempotent.
+    pub fn terminate(&self) {
+        self.0.cancel.cancel();
+    }
+
+    /// Whether [`terminate`](Self::terminate) has been called.
+    pub fn is_terminated(&self) -> bool {
+        self.0.cancel.is_cancelled()
+    }
+}
+
+/// The socket as the driver sees it: unchanged, except that every read that
+/// delivers bytes stamps the connection's [`Activity`].
+struct ActivityIo<S> {
+    inner: S,
+    activity: Arc<Activity>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for ActivityIo<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(polled, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            self.activity.stamp();
+        }
+        polled
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for ActivityIo<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// Readiness marker the substream opener writes immediately after opening.
 ///
 /// `yamux` opens substreams lazily: the peer is not notified until the opener
@@ -175,9 +304,15 @@ pub struct Opener {
     /// Keeps the connection's driver alive: a pool that holds only an opener
     /// (the server's `CarrierPool` does exactly that) still owns a connection.
     _alive: ConnRef,
+    activity: ConnActivity,
 }
 
 impl Opener {
+    /// Liveness handle of the connection this opener belongs to.
+    pub fn activity(&self) -> ConnActivity {
+        self.activity.clone()
+    }
+
     /// Open a new outbound substream to the peer.
     pub async fn open(&self) -> io::Result<Stream> {
         let (tx, rx) = oneshot::channel();
@@ -296,9 +431,15 @@ pub struct Acceptor {
     inbound: mpsc::Receiver<Stream>,
     /// Keeps the connection's driver alive; see [`Liveness`].
     _alive: ConnRef,
+    activity: ConnActivity,
 }
 
 impl Acceptor {
+    /// Liveness handle of the connection this acceptor belongs to.
+    pub fn activity(&self) -> ConnActivity {
+        self.activity.clone()
+    }
+
     /// Wait for the next inbound substream, or `None` once the connection closes.
     pub async fn accept(&mut self) -> Option<Stream> {
         self.inbound.recv().await
@@ -307,7 +448,16 @@ impl Acceptor {
 
 /// Start multiplexing as the connection initiator (dialer).
 pub fn client<S: Transport>(socket: S) -> (Opener, Acceptor) {
-    spawn_driver(Connection::new(socket.compat(), config(), Mode::Client))
+    let activity = Arc::new(Activity::new());
+    let io = ActivityIo {
+        inner: socket,
+        activity: Arc::clone(&activity),
+    };
+    spawn_driver_inner(
+        Connection::new(io.compat(), config(), Mode::Client),
+        activity,
+        None,
+    )
 }
 
 /// Start a client connection whose yamux driver belongs to a transfer-link
@@ -317,55 +467,70 @@ pub(crate) fn client_scoped<S: Transport>(
     socket: S,
     scope: Arc<crate::client::ClientScope>,
 ) -> (Opener, Acceptor) {
-    spawn_driver_scoped(
-        Connection::new(socket.compat(), config(), Mode::Client),
-        scope,
+    let activity = Arc::new(Activity::new());
+    let io = ActivityIo {
+        inner: socket,
+        activity: Arc::clone(&activity),
+    };
+    spawn_driver_inner(
+        Connection::new(io.compat(), config(), Mode::Client),
+        activity,
+        Some(scope),
     )
 }
 
 /// Start multiplexing as the connection responder (listener).
 pub fn server<S: Transport>(socket: S) -> (Opener, Acceptor) {
-    spawn_driver(Connection::new(socket.compat(), config(), Mode::Server))
-}
-
-fn spawn_driver<S: Transport>(conn: Connection<Compat<S>>) -> (Opener, Acceptor) {
-    spawn_driver_inner(conn, None)
-}
-
-fn spawn_driver_scoped<S: Transport>(
-    conn: Connection<Compat<S>>,
-    scope: Arc<crate::client::ClientScope>,
-) -> (Opener, Acceptor) {
-    spawn_driver_inner(conn, Some(scope))
+    let activity = Arc::new(Activity::new());
+    let io = ActivityIo {
+        inner: socket,
+        activity: Arc::clone(&activity),
+    };
+    spawn_driver_inner(
+        Connection::new(io.compat(), config(), Mode::Server),
+        activity,
+        None,
+    )
 }
 
 fn spawn_driver_inner<S: Transport>(
-    conn: Connection<Compat<S>>,
+    conn: Connection<Compat<ActivityIo<S>>>,
+    activity: Arc<Activity>,
     scope: Option<Arc<crate::client::ClientScope>>,
 ) -> (Opener, Acceptor) {
     let (open_tx, open_rx) = mpsc::channel(32);
     let (inbound_tx, inbound_rx) = mpsc::channel(32);
     let liveness: Arc<Liveness> = Arc::default();
+    let handle = ConnActivity(Arc::clone(&activity));
     // Both handles are counted BEFORE the driver starts, so the driver can
     // never observe a zero count in the gap between spawning and returning.
     let opener = Opener {
         requests: open_tx,
         _alive: ConnRef::new(&liveness),
+        activity: handle.clone(),
     };
     let acceptor = Acceptor {
         inbound: inbound_rx,
         _alive: ConnRef::new(&liveness),
+        activity: handle,
     };
     let scope_for_spawn = scope.clone();
+    let terminate = activity.cancel.clone();
     let task = async move {
+        // `terminate` drops `drive` (and with it the `yamux::Connection`)
+        // mid-flight: no graceful close, every substream is closed and woken.
         if let Some(scope) = scope {
             let cancel = scope.token();
             tokio::select! {
                 _ = cancel.cancelled() => {}
+                _ = terminate.cancelled() => {}
                 _ = drive(conn, open_rx, inbound_tx, liveness) => {}
             }
         } else {
-            drive(conn, open_rx, inbound_tx, liveness).await;
+            tokio::select! {
+                _ = terminate.cancelled() => {}
+                _ = drive(conn, open_rx, inbound_tx, liveness) => {}
+            }
         }
     };
     // A scoped connection is always registered before the task is started. The
@@ -716,6 +881,159 @@ mod tests {
             .unwrap();
         assert_eq!(&buf, b"pong");
         peer.await.unwrap();
+    }
+
+    // Transport activity group (O-1).
+    //
+    // The liveness deadlines of plan 005 read `ConnActivity`, so these pin the
+    // two things they rely on: ANY byte from the peer refreshes it (a data
+    // substream as much as a control frame — the property that keeps a busy
+    // tunnel from tripping a deadline its heartbeats are queued behind), and
+    // `terminate` really releases the connection and every substream on it.
+
+    /// A connected `(client, server)` pair over real loopback sockets.
+    async fn activity_pair() -> ((Opener, Acceptor), (Opener, Acceptor)) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let client_side = client(TcpStream::connect(addr).await.unwrap());
+        let server_side = server(accept.await.unwrap());
+        (client_side, server_side)
+    }
+
+    #[tokio::test]
+    async fn inbound_idle_grows_while_the_peer_is_silent_and_resets_on_a_frame() {
+        let ((c_open, _c_acc), (_s_open, mut s_acc)) = activity_pair().await;
+        let activity = s_acc.activity();
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            activity.inbound_idle() >= Duration::from_millis(250),
+            "nothing arrived, yet idle reads {:?}",
+            activity.inbound_idle()
+        );
+
+        // yamux opens lazily: the SYN rides the first data frame.
+        let mut stream = c_open.open().await.unwrap();
+        stream.write_all(b"x").await.unwrap();
+        stream.flush().await.unwrap();
+        let _inbound = timeout(Duration::from_secs(5), s_acc.accept())
+            .await
+            .unwrap()
+            .expect("inbound substream");
+        assert!(
+            activity.inbound_idle() < Duration::from_millis(200),
+            "a frame arrived, yet idle reads {:?}",
+            activity.inbound_idle()
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_idle_is_refreshed_by_data_substream_bytes() {
+        let ((c_open, _c_acc), (_s_open, mut s_acc)) = activity_pair().await;
+        let activity = s_acc.activity();
+
+        let mut tx = c_open.open().await.unwrap();
+        tx.write_all(b"x").await.unwrap();
+        tx.flush().await.unwrap();
+        let mut rx = timeout(Duration::from_secs(5), s_acc.accept())
+            .await
+            .unwrap()
+            .expect("inbound substream");
+        let drain = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            while matches!(rx.read(&mut buf).await, Ok(n) if n > 0) {}
+        });
+
+        // Only DATA flows for ~800 ms; idle must stay far below that.
+        let mut worst = Duration::ZERO;
+        for _ in 0..8 {
+            tx.write_all(&[7u8; 512]).await.unwrap();
+            tx.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            worst = worst.max(activity.inbound_idle());
+        }
+        assert!(
+            worst < Duration::from_millis(350),
+            "data bytes did not refresh the activity stamp (worst idle {worst:?})"
+        );
+
+        // And once the data stops, idle grows again.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(activity.inbound_idle() >= Duration::from_millis(300));
+        drop(tx);
+        drain.abort();
+    }
+
+    /// RED-CHECK: without the `terminate` arm in the driver task, the peer's
+    /// `accept()` never returns (the client still holds every handle, so the
+    /// M-1 count never reaches zero) and this times out.
+    #[tokio::test]
+    async fn terminate_closes_live_substreams_promptly() {
+        let ((c_open, c_acc), (_s_open, mut s_acc)) = activity_pair().await;
+        let mut stream = c_open.open().await.unwrap();
+        stream.write_all(b"x").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut inbound = timeout(Duration::from_secs(5), s_acc.accept())
+            .await
+            .unwrap()
+            .expect("inbound substream");
+        let mut first = [0u8; 1];
+        inbound.read_exact(&mut first).await.unwrap();
+
+        let activity = c_open.activity();
+        assert!(!activity.is_terminated());
+        activity.terminate();
+        activity.terminate(); // idempotent
+        assert!(activity.is_terminated());
+        assert!(
+            c_acc.activity().is_terminated(),
+            "one connection, one switch"
+        );
+
+        // The local substream ends promptly — never parks.
+        let mut buf = [0u8; 8];
+        let local = timeout(Duration::from_secs(3), stream.read(&mut buf))
+            .await
+            .expect("a live substream parked after terminate");
+        assert!(!matches!(local, Ok(n) if n > 0));
+
+        // The socket is released, so the PEER sees the connection end too,
+        // although the client still holds its opener, acceptor and stream.
+        let peer_read = timeout(Duration::from_secs(3), inbound.read(&mut buf))
+            .await
+            .expect("the peer's substream never ended");
+        assert!(!matches!(peer_read, Ok(n) if n > 0));
+        let peer_accept = timeout(Duration::from_secs(3), s_acc.accept())
+            .await
+            .expect("the peer never saw the connection close");
+        assert!(peer_accept.is_none());
+
+        // Nothing can be opened on a terminated connection.
+        assert!(timeout(Duration::from_secs(3), c_open.open())
+            .await
+            .expect("open parked on a terminated connection")
+            .is_err());
+        drop(c_acc);
+    }
+
+    #[tokio::test]
+    async fn reap_due_none_never_fires() {
+        let ((c_open, _c_acc), _server) = activity_pair().await;
+        let activity = c_open.activity();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!activity.reap_due(None));
+        assert!(activity.reap_due(Some(Duration::ZERO)));
+    }
+
+    #[tokio::test]
+    async fn reap_due_fires_at_deadline() {
+        let ((c_open, _c_acc), _server) = activity_pair().await;
+        let activity = c_open.activity();
+        assert!(!activity.reap_due(Some(Duration::from_millis(150))));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(activity.reap_due(Some(Duration::from_millis(150))));
+        assert!(!activity.reap_due(Some(Duration::from_secs(10))));
     }
 
     #[tokio::test]

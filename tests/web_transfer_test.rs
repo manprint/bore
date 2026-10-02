@@ -1255,12 +1255,34 @@ async fn t_web_peers() -> Result<()> {
         }
     }
     // S has now been silent ~40 s (snapshot read to here); the reaper fires
-    // at 60 s quiet, so poll up to 30 s more. A/B stay healthy throughout.
-    // S is never READ while waiting: reading would answer the server's
-    // WebSocket Pings, and a session that answers them is alive (O-1).
+    // at 60 s quiet, so poll up to 30 s more. S is never READ while waiting:
+    // reading would answer the server's WebSocket Pings, and a session that
+    // answers them is alive (O-1). A and B keep pinging every 5 s while we
+    // poll, as a page does: their 20 s deadline runs from their last ping
+    // above, ~20 s before S's 60 s, so without these pings it expires in the
+    // same reaper pass as S's and the count jumps 3 -> 0 (seen under the
+    // parallel `cargo test` load). A ping answer may be preceded by S's
+    // `peer.left` when the reap lands between the ping and its pong.
+    let mut left_seen: [Option<serde_json::Value>; 2] = [None, None];
+    let mut last_ping = tokio::time::Instant::now();
     for _ in 0..300 {
         if registry.current_peers() == 2 {
             break;
+        }
+        if last_ping.elapsed() >= Duration::from_secs(5) {
+            for (i, peer) in [&mut a, &mut b].into_iter().enumerate() {
+                peer.send_text(r#"{"v":1,"type":"ping","body":{}}"#.to_string())
+                    .await?;
+                loop {
+                    let (typ, body) = control_msg(&peer.next_text(wait).await?.expect("poll pong"));
+                    match typ.as_str() {
+                        "pong" => break,
+                        "peer.left" => left_seen[i] = Some(body),
+                        other => panic!("unexpected {other} while waiting for the reap"),
+                    }
+                }
+            }
+            last_ping = tokio::time::Instant::now();
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -1277,9 +1299,15 @@ async fn t_web_peers() -> Result<()> {
     }
     assert!(closed, "the reaped peer's socket must be closed");
     // A and B are healthy: the leave plus one more rename both arrive.
-    for peer in [&mut a, &mut b] {
-        let (typ, body) = control_msg(&peer.next_text(wait).await?.expect("left S"));
-        assert_eq!(typ, "peer.left");
+    for (i, peer) in [&mut a, &mut b].into_iter().enumerate() {
+        let body = match left_seen[i].take() {
+            Some(body) => body,
+            None => {
+                let (typ, body) = control_msg(&peer.next_text(wait).await?.expect("left S"));
+                assert_eq!(typ, "peer.left");
+                body
+            }
+        };
         assert_eq!(body["revision"].as_u64(), Some(49));
     }
     let rid = "b".repeat(32);

@@ -2559,6 +2559,7 @@ async fn upgrade_task(
 }
 
 #[cfg(not(feature = "udp"))]
+#[allow(clippy::too_many_arguments)]
 async fn negotiate_direct_consumer(
     _control: &mut Delimited<mux::Stream>,
     _endpoint: &Endpoint,

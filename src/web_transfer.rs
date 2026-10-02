@@ -41,9 +41,17 @@ pub const ROOM_ID_BYTES: usize = 16;
 pub const MEMBER_TOKEN_BYTES: usize = 32;
 /// Bytes in the derived room encryption key.
 pub const ROOM_KEY_BYTES: usize = 32;
-/// Owner-lease heartbeat the CLI sends on an idle control connection.
+/// Owner-lease heartbeat cadence of a CLI that predates O-1.
+///
+/// A current CLI beats every [`crate::liveness::CTRL_CLIENT_HEARTBEAT`] (2 s)
+/// and declares it through `ctrl_heartbeat_ms`, which is what lets the server
+/// reap a silent owner on the short transport deadline. This value is what an
+/// UNDECLARED owner is assumed to send, and is why that owner keeps the 60 s
+/// [`WEB_TRANSFER_CTRL_TIMEOUT`].
 pub const WEB_TRANSFER_CLIENT_HEARTBEAT: Duration = Duration::from_secs(20);
-/// Control-connection liveness timeout (server reaper, tick-checked).
+/// Control-connection liveness timeout (server reaper, tick-checked) for a
+/// session that has not proved it answers a faster probe: a legacy owner, or
+/// a browser that has never answered a WebSocket Ping.
 pub const WEB_TRANSFER_CTRL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Server reaper tick; liveness is checked here, never via `timeout(recv)`.
 pub const WEB_TRANSFER_REAPER_TICK: Duration = Duration::from_millis(500);
@@ -1874,6 +1882,8 @@ pub(crate) struct RegistryInner {
     /// automatic relay fallback (10 s; tests shorten it).
     direct_deadline: std::sync::Mutex<Duration>,
     upgrade_delay: std::sync::Mutex<Duration>,
+    /// Browser transport-liveness deadline (20 s; tests shorten it).
+    peer_transport_timeout: std::sync::Mutex<Duration>,
     /// Relay ticket lifetime (30 s; both legs must attach inside it).
     ticket_ttl: Duration,
 }
@@ -1927,6 +1937,7 @@ impl WebTransferRegistry {
                 admit_timeout: std::sync::Mutex::new(WEB_TRANSFER_RELAY_ADMIT_TIMEOUT),
                 direct_deadline: std::sync::Mutex::new(WEB_TRANSFER_DIRECT_DEADLINE),
                 upgrade_delay: std::sync::Mutex::new(WEB_TRANSFER_UPGRADE_DELAY),
+                peer_transport_timeout: std::sync::Mutex::new(WEB_TRANSFER_PEER_TRANSPORT_TIMEOUT),
                 ticket_ttl: WEB_TRANSFER_TICKET_TTL,
             }),
         })
@@ -2646,10 +2657,35 @@ pub const WEB_TRANSFER_PRE_AUTH_IP_TTL: Duration = Duration::from_secs(10 * 60);
 pub const WEB_TRANSFER_REQUEST_CACHE_CAP: usize = 256;
 /// TTL of one cached terminal response.
 pub const WEB_TRANSFER_REQUEST_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
-/// Peer heartbeat cadence: browsers send `ping` every 20 s; the server
-/// answers `pong` and reaps sessions quiet for `WEB_TRANSFER_CTRL_TIMEOUT`
-/// (60 s) on its tick. The server transmits nothing on a timer.
+/// Application-level `ping` cadence of a browser that predates O-1 (20 s).
+///
+/// A current browser sends its `ping` envelope every 5 s and abandons a
+/// socket that has answered nothing for 20 s (`web/transfer/src/control.js`,
+/// `PING_INTERVAL_MS`/`PONG_DEADLINE_MS`). Neither is what the SERVER relies
+/// on: a hidden tab's timers are throttled to one a minute, so an app-level
+/// ping cannot carry a deadline shorter than that. See
+/// [`WEB_TRANSFER_PEER_WS_PING`].
 pub const WEB_TRANSFER_PEER_PING: Duration = Duration::from_secs(20);
+/// How often the server sends a WebSocket Ping frame on a browser control
+/// session (O-1).
+///
+/// The browser's network stack answers a Ping with a Pong without running
+/// any page script, so the answer arrives on time even from a throttled
+/// background tab, and it refreshes the session's `last_recv` like any other
+/// inbound frame. Two bytes a second per peer.
+pub const WEB_TRANSFER_PEER_WS_PING: Duration = Duration::from_secs(1);
+/// Transport-liveness deadline for a browser session that has answered at
+/// least one WebSocket Ping (O-1).
+///
+/// 20 s is one probe interval plus the full TCP retransmission ladder for a
+/// short flick (cumulative 0.2 + 0.4 + 0.8 + 1.6 + 3.2 + 6.4 = 12.6 s) with
+/// headroom, so a path that drops for a few seconds keeps its session while
+/// a peer whose IP changed is gone in 20 s instead of a minute — the ghost
+/// peer (and its offers) a reconnecting tab left behind. A session that has
+/// never answered a Ping keeps the 60 s [`WEB_TRANSFER_CTRL_TIMEOUT`]: a
+/// client that cannot answer must never be judged by a deadline it cannot
+/// meet (DEC-VE2).
+pub const WEB_TRANSFER_PEER_TRANSPORT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Default display name from a peer ID: `Peer <last-4-hex>`.
 pub fn default_display_name(peer_id: PeerId) -> String {
@@ -3164,6 +3200,22 @@ pub(crate) fn generate_peer_id() -> PeerId {
 /// window. Checked on the reaper tick, never via `timeout(recv)`.
 pub fn control_liveness_expired(last_recv: Instant, now: Instant) -> bool {
     now.saturating_duration_since(last_recv) >= WEB_TRANSFER_CTRL_TIMEOUT
+}
+
+/// Whether a browser control session is dead (O-1).
+///
+/// `pong_seen` is the compat gate: only a session that has answered a
+/// WebSocket Ping is held to `transport_timeout`; every other session keeps
+/// the legacy [`control_liveness_expired`] window. Checked on the reaper
+/// tick against `last_recv`, never via `timeout(recv)` (DEC-VE3).
+pub fn peer_session_expired(
+    last_recv: Instant,
+    now: Instant,
+    pong_seen: bool,
+    transport_timeout: Duration,
+) -> bool {
+    control_liveness_expired(last_recv, now)
+        || (pong_seen && now.saturating_duration_since(last_recv) >= transport_timeout)
 }
 
 impl PeerSession {
@@ -3910,6 +3962,23 @@ impl WebTransferRegistry {
     /// without sleeping ten seconds.
     pub fn set_direct_deadline(&self, deadline: Duration) {
         if let Ok(mut slot) = self.inner.direct_deadline.lock() {
+            *slot = deadline;
+        }
+    }
+
+    /// The browser transport-liveness deadline in force (20 s; tests shorten it).
+    pub fn peer_transport_timeout(&self) -> Duration {
+        self.inner
+            .peer_transport_timeout
+            .lock()
+            .map(|slot| *slot)
+            .unwrap_or(WEB_TRANSFER_PEER_TRANSPORT_TIMEOUT)
+    }
+
+    /// Test seam: shortens the browser transport-liveness deadline so a reap
+    /// is observable without waiting twenty seconds.
+    pub fn set_peer_transport_timeout(&self, deadline: Duration) {
+        if let Ok(mut slot) = self.inner.peer_transport_timeout.lock() {
             *slot = deadline;
         }
     }
@@ -8586,6 +8655,32 @@ mod control_session_tests {
         assert!(control_liveness_expired(stale, now));
         let older = now.checked_sub(Duration::from_secs(61)).unwrap();
         assert!(control_liveness_expired(older, now));
+    }
+
+    /// O-1 — a browser session that has answered a WebSocket Ping is held to
+    /// the transport deadline; one that never has keeps the legacy 60 s, so a
+    /// client that cannot answer is never judged by a deadline it cannot meet.
+    #[test]
+    fn peer_session_expiry_is_gated_on_an_answered_ping() {
+        let t = WEB_TRANSFER_PEER_TRANSPORT_TIMEOUT;
+        let now = Instant::now();
+        let just_inside = now.checked_sub(t - Duration::from_millis(1)).unwrap();
+        let at_deadline = now.checked_sub(t).unwrap();
+        let legacy_inside = now.checked_sub(Duration::from_secs(59)).unwrap();
+        let legacy_out = now.checked_sub(WEB_TRANSFER_CTRL_TIMEOUT).unwrap();
+        // Answered a Ping: the short deadline governs.
+        assert!(!peer_session_expired(now, now, true, t));
+        assert!(!peer_session_expired(just_inside, now, true, t));
+        assert!(peer_session_expired(at_deadline, now, true, t));
+        // Never answered: only the legacy window can reap it.
+        assert!(!peer_session_expired(at_deadline, now, false, t));
+        assert!(!peer_session_expired(legacy_inside, now, false, t));
+        assert!(peer_session_expired(legacy_out, now, false, t));
+        // The shipped values: one-second probes, and a deadline that covers
+        // the 12.6 s retransmission ladder of a short flick with headroom.
+        assert_eq!(WEB_TRANSFER_PEER_WS_PING, Duration::from_secs(1));
+        assert!(t >= Duration::from_millis(12_600) + WEB_TRANSFER_PEER_WS_PING);
+        assert!(t < WEB_TRANSFER_CTRL_TIMEOUT);
     }
 
     #[tokio::test]

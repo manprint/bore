@@ -1241,18 +1241,32 @@ async fn t_web_peers() -> Result<()> {
         assert_eq!(typ, "peer.renamed");
         let (typ, _) = control_msg(&b.next_text(wait).await?.expect("wait event"));
         assert_eq!(typ, "peer.renamed");
-        tokio::time::sleep(Duration::from_secs(20)).await;
-        for peer in [&mut a, &mut b] {
-            peer.send_text(r#"{"v":1,"type":"ping","body":{}}"#.to_string())
-                .await?;
-            let (typ, _) = control_msg(&peer.next_text(wait).await?.expect("wait pong"));
-            assert_eq!(typ, "pong");
+        // A and B ping every 10 s, as a page does every 5 s: well inside the
+        // 20 s transport deadline that applies once a session has answered a
+        // server WebSocket Ping (O-1).
+        for _ in 0..2 {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            for peer in [&mut a, &mut b] {
+                peer.send_text(r#"{"v":1,"type":"ping","body":{}}"#.to_string())
+                    .await?;
+                let (typ, _) = control_msg(&peer.next_text(wait).await?.expect("wait pong"));
+                assert_eq!(typ, "pong");
+            }
         }
     }
     // S has now been silent ~40 s (snapshot read to here); the reaper fires
     // at 60 s quiet, so poll up to 30 s more. A/B stay healthy throughout.
+    // S is never READ while waiting: reading would answer the server's
+    // WebSocket Pings, and a session that answers them is alive (O-1).
+    for _ in 0..300 {
+        if registry.current_peers() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(registry.current_peers(), 2, "silent peer must be reaped");
     let mut closed = false;
-    for _ in 0..60 {
+    for _ in 0..20 {
         match s.next_text(Duration::from_millis(500)).await {
             Ok(None) => {
                 closed = true;
@@ -1261,14 +1275,7 @@ async fn t_web_peers() -> Result<()> {
             _ => continue,
         }
     }
-    assert!(closed, "silent peer must be reaped");
-    for _ in 0..100 {
-        if registry.current_peers() == 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert_eq!(registry.current_peers(), 2);
+    assert!(closed, "the reaped peer's socket must be closed");
     // A and B are healthy: the leave plus one more rename both arrive.
     for peer in [&mut a, &mut b] {
         let (typ, body) = control_msg(&peer.next_text(wait).await?.expect("left S"));
@@ -7716,5 +7723,82 @@ async fn t_web_deploy_behind_reverse_proxy() -> Result<()> {
         bypass.is_err(),
         "a client bypassing the proxy was accepted with the wrong authority"
     );
+    Ok(())
+}
+
+/// O-1 — the server Pings every browser control session once a second. A
+/// session that answered and then went silent (its path died, its IP changed)
+/// is reaped on the transport deadline, so the ghost peer a reconnecting tab
+/// leaves behind is gone in seconds instead of the legacy minute. A peer that
+/// keeps reading answers every Ping and is never reaped by it.
+///
+/// RED-CHECK: without the server's Ping arm no Pong ever arrives, the session
+/// stays on the legacy 60 s window and B's departure misses the bound below.
+#[tokio::test]
+async fn a_browser_that_stops_answering_pings_leaves_on_the_transport_deadline() -> Result<()> {
+    use bore_cli::web_transfer::{MemberToken, OwnerLease, OwnerToken};
+
+    let port = support::free_port().await?;
+    let mut args = support::enabled_args();
+    args.base_url = Some(format!("http://127.0.0.1:{port}/"));
+    let config = bore_cli::web_transfer::resolve_server_config(&args, false, port)?
+        .expect("config resolves");
+    let mut server = Server::new(1024..=65535, None);
+    server.set_control_port(port);
+    server.set_web_transfer(config)?;
+    let registry = server.web_transfer().expect("registry enabled");
+    tokio::spawn(server.listen());
+    support::wait_port(port, true).await;
+    let transport = Duration::from_millis(1500);
+    registry.set_peer_transport_timeout(transport);
+    let member = MemberToken::from_bytes([0x91u8; 32]);
+    let owner = OwnerToken::from_bytes([0x92u8; 32]);
+    let lease = OwnerLease::create(&registry, member.sha256_hash(), owner.sha256_hash(), false)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let room_hex = lease.id().to_string();
+    let token_hex = member.to_string();
+    let host = format!("127.0.0.1:{port}");
+    let origin = format!("http://127.0.0.1:{port}");
+    let wait = Duration::from_secs(5);
+
+    let mut a = support::WsPeer::connect(&host, &room_hex, &origin).await?;
+    a.hello(&token_hex, Some("A")).await?;
+    let (typ, _) = control_msg(&a.next_text(wait).await?.expect("welcome A"));
+    assert_eq!(typ, "welcome");
+    read_snapshot(&mut a).await?;
+
+    let mut b = support::WsPeer::connect(&host, &room_hex, &origin).await?;
+    b.hello(&token_hex, Some("B")).await?;
+    let (typ, body) = control_msg(&a.next_text(wait).await?.expect("joined B"));
+    assert_eq!(typ, "peer.joined");
+    let peer_b = body["peerId"].as_str().unwrap().to_string();
+
+    // B proves it answers Pings, then stops reading: its socket stays open, so
+    // nothing but the transport deadline can tell the server it is gone.
+    b.answer_one_ping_then_go_silent(wait).await?;
+    let silent_at = tokio::time::Instant::now();
+    let (typ, body) = control_msg(&a.next_text(Duration::from_secs(10)).await?.expect("left B"));
+    let took = silent_at.elapsed();
+    assert_eq!(typ, "peer.left");
+    assert_eq!(body["peerId"].as_str(), Some(peer_b.as_str()));
+    assert!(
+        took < transport + Duration::from_secs(3),
+        "a silent browser must leave on the transport deadline, took {took:?}"
+    );
+
+    // A kept reading the whole time, so it kept answering: two more deadlines
+    // pass with no close, and the session still serves a request.
+    assert!(
+        a.next_text(transport * 2).await.is_err(),
+        "a peer that answers every Ping must not be reaped"
+    );
+    a.send_text(format!(
+        r#"{{"v":1,"type":"peer.rename","requestId":"{}","body":{{"displayName":"A2"}}}}"#,
+        "b".repeat(32)
+    ))
+    .await?;
+    let (typ, _) = control_msg(&a.next_text(wait).await?.expect("rename ack"));
+    assert_eq!(typ, "ack");
+    drop(b);
     Ok(())
 }

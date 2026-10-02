@@ -310,8 +310,9 @@ impl WsPeer {
     pub async fn close_code(&mut self, wait: Duration) -> Result<Option<u16>> {
         use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::Message;
+        let deadline = tokio::time::Instant::now() + wait;
         loop {
-            let next = tokio::time::timeout(wait, self.ws.next()).await?;
+            let next = tokio::time::timeout_at(deadline, self.ws.next()).await?;
             match next {
                 None => return Ok(None),
                 Some(Err(_)) => return Ok(None),
@@ -323,13 +324,36 @@ impl WsPeer {
         }
     }
 
+    /// Reads until the server's first WebSocket Ping, makes sure the automatic
+    /// Pong has left, then returns WITHOUT reading further: the shape of a
+    /// browser whose path dies right after its session proved it answers
+    /// Pings (O-1). Text frames read on the way are discarded.
+    pub async fn answer_one_ping_then_go_silent(&mut self, wait: Duration) -> Result<()> {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            match tokio::time::timeout_at(deadline, self.ws.next()).await? {
+                Some(Ok(Message::Ping(_))) => break,
+                Some(Ok(_)) => continue,
+                _ => anyhow::bail!("session closed before the first ping"),
+            }
+        }
+        self.ws.flush().await?;
+        Ok(())
+    }
+
     /// Next application text message within `wait`; `None` means the peer was
     /// closed or the transport broke. Ping/pong/binary frames are skipped.
+    /// `wait` bounds the WHOLE call, not each frame: the server Pings every
+    /// second (O-1), so a per-frame timeout longer than that would never
+    /// expire on a session that receives nothing else.
     pub async fn next_text(&mut self, wait: Duration) -> Result<Option<String>> {
         use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::Message;
+        let deadline = tokio::time::Instant::now() + wait;
         loop {
-            let next = tokio::time::timeout(wait, self.ws.next()).await?;
+            let next = tokio::time::timeout_at(deadline, self.ws.next()).await?;
             match next {
                 None => return Ok(None),
                 Some(Err(_)) => return Ok(None),
@@ -467,8 +491,9 @@ impl RelayLeg {
     ) -> Result<Option<tokio_tungstenite::tungstenite::Message>> {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
+        let deadline = tokio::time::Instant::now() + wait;
         loop {
-            let next = match tokio::time::timeout(wait, self.ws.next()).await {
+            let next = match tokio::time::timeout_at(deadline, self.ws.next()).await {
                 Ok(next) => next,
                 Err(_) => return Ok(None),
             };

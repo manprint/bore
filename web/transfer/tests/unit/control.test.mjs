@@ -2,9 +2,22 @@
 // with a fake WebSocket (no network, no timers beyond the 250 ms floor).
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { CONTROL_SUBPROTOCOL, createControlSession, reconnectDelayMs } from "../../src/control.js";
+import {
+  CONTROL_SUBPROTOCOL,
+  LIVENESS_CLOSE,
+  PING_INTERVAL_MS,
+  PONG_DEADLINE_MS,
+  createControlSession,
+  pingTickDecision,
+  reconnectDelayMs,
+} from "../../src/control.js";
 
 const instances = [];
+// Every session a test starts, so `afterEach` can stop it even when an
+// assertion threw first: a session left running keeps its ping/reconnect
+// timers armed and the test process never exits — a regression must FAIL,
+// never hang the suite.
+const sessions = [];
 
 class FakeSocket {
   constructor(url, protocol) {
@@ -71,6 +84,7 @@ function startSession(overrides = {}) {
     onRepublishNeeded: () => [],
     ...overrides,
   });
+  sessions.push(session);
   session.start();
   return { session, events, socket: instances[instances.length - 1] };
 }
@@ -84,6 +98,9 @@ describe("control session", () => {
   });
 
   afterEach(() => {
+    for (const session of sessions.splice(0)) {
+      session.stop();
+    }
     delete globalThis.WebSocket;
   });
 
@@ -194,6 +211,126 @@ describe("control session", () => {
     assert.ok(instances.length >= 3, "a timed-out hello keeps retrying");
     assert.equal(events.closes.at(-1).terminal, false);
     session.stop();
+  });
+
+  it("ping_tick_decision_table", () => {
+    const base = { intervalMs: 100, deadlineMs: 400 };
+    // First tick: nothing outstanding, the ping it sends opens the window.
+    assert.deepEqual(
+      pingTickDecision({ ...base, now: 1000, lastTickAt: null, outstandingSince: null }),
+      { abandon: false, outstandingSince: 1000 },
+    );
+    // Outstanding but inside the deadline: keep the OLDEST send time.
+    assert.deepEqual(
+      pingTickDecision({ ...base, now: 1300, lastTickAt: 1200, outstandingSince: 1000 }),
+      { abandon: false, outstandingSince: 1000 },
+    );
+    // Exactly at the deadline, timers running normally: abandon.
+    assert.deepEqual(
+      pingTickDecision({ ...base, now: 1400, lastTickAt: 1300, outstandingSince: 1000 }),
+      { abandon: true },
+    );
+    // Same age, but the previous tick is more than two intervals back: the
+    // page was suspended, so the window restarts instead of tripping.
+    assert.deepEqual(
+      pingTickDecision({ ...base, now: 5000, lastTickAt: 1300, outstandingSince: 1000 }),
+      { abandon: false, outstandingSince: 5000 },
+    );
+    // A gap of exactly two intervals is still a normal (late) tick.
+    assert.deepEqual(
+      pingTickDecision({ ...base, now: 1400, lastTickAt: 1200, outstandingSince: 1000 }),
+      { abandon: true },
+    );
+    // The shipped values: 5 s pings, 20 s deadline (≤ 25 s to notice).
+    assert.equal(PING_INTERVAL_MS, 5_000);
+    assert.equal(PONG_DEADLINE_MS, 20_000);
+    assert.equal(LIVENESS_CLOSE, 4003);
+  });
+
+  it("an_unanswered_ping_abandons_a_dead_socket_and_redials", { timeout: 5_000 }, async () => {
+    const { session, socket, events } = startSession({ pingIntervalMs: 30, pongDeadlineMs: 120 });
+    socket.open();
+    socket.serverText({ v: 1, type: "welcome", body: { peerId: "1".repeat(32), roomId: "2".repeat(32) } });
+    assert.equal(session.ready, true);
+    // The path dies: pings go out, nothing comes back, and the fake's
+    // close() fires no event — exactly a blackholed connection.
+    await sleep(200);
+    assert.equal(socket.closedWith, LIVENESS_CLOSE, "the dead socket is abandoned");
+    assert.ok(
+      socket.sent.filter((t) => JSON.parse(t).type === "ping").length >= 2,
+      "pings were sent before giving up",
+    );
+    assert.deepEqual(events.closes.at(-1), { code: LIVENESS_CLOSE, terminal: false });
+    await sleep(350);
+    assert.equal(instances.length, 2, "redialled without waiting for a close event");
+    const retry = instances[1];
+    retry.open();
+    assert.equal(JSON.parse(retry.sent[0]).type, "hello");
+    retry.serverText({ v: 1, type: "welcome", body: { peerId: "3".repeat(32), roomId: "2".repeat(32) } });
+    assert.equal(session.ready, true);
+    // The abandoned socket's close finally arrives: it must not touch the
+    // session that replaced it.
+    const closesBefore = events.closes.length;
+    socket.serverClose(1006);
+    await sleep(100);
+    assert.equal(session.ready, true, "a late close of the old socket is ignored");
+    assert.equal(events.closes.length, closesBefore);
+    assert.equal(instances.length, 2);
+    session.stop();
+  });
+
+  it("answered_pings_keep_the_session", { timeout: 5_000 }, async () => {
+    const { session, socket } = startSession({ pingIntervalMs: 30, pongDeadlineMs: 120 });
+    socket.open();
+    socket.serverText({ v: 1, type: "welcome", body: { peerId: "1".repeat(32), roomId: "2".repeat(32) } });
+    let answered = 0;
+    const responder = setInterval(() => {
+      const pings = socket.sent.filter((t) => JSON.parse(t).type === "ping").length;
+      while (answered < pings) {
+        answered += 1;
+        socket.serverText({ v: 1, type: "pong", body: {} });
+      }
+    }, 5);
+    await sleep(500);
+    clearInterval(responder);
+    assert.ok(answered >= 8, `pings kept flowing (${answered})`);
+    assert.equal(socket.closedWith, null, "a path that answers is never abandoned");
+    assert.equal(instances.length, 1);
+    assert.equal(session.ready, true);
+    session.stop();
+  });
+
+  it("a_hello_timeout_redials_without_waiting_for_close", { timeout: 5_000 }, async () => {
+    const { session, socket, events } = startSession({ helloTimeoutMs: 50 });
+    socket.open();
+    await sleep(120);
+    assert.equal(socket.closedWith, 4002);
+    assert.deepEqual(events.closes.at(-1), { code: 4002, terminal: false });
+    await sleep(300);
+    assert.equal(instances.length, 2, "the redial does not depend on the close event");
+    session.stop();
+  });
+
+  it("cycle_redials_without_waiting_for_close", { timeout: 5_000 }, async () => {
+    const { session, socket } = startSession();
+    socket.open();
+    socket.serverText({ v: 1, type: "welcome", body: { peerId: "1".repeat(32), roomId: "2".repeat(32) } });
+    session.cycle();
+    assert.equal(socket.closedWith, 1000);
+    await sleep(350);
+    assert.equal(instances.length, 2, "an offline/online cycle redials at once");
+    session.stop();
+  });
+
+  it("stop_silences_the_closed_socket", { timeout: 5_000 }, async () => {
+    const { session, socket, events } = startSession();
+    socket.open();
+    socket.serverText({ v: 1, type: "welcome", body: { peerId: "1".repeat(32), roomId: "2".repeat(32) } });
+    session.stop();
+    socket.serverClose(1000);
+    await sleep(350);
+    assert.equal(events.closes.length, 0, "no callback after stop");
+    assert.equal(instances.length, 1);
   });
 
   it("rename_request_id_is_canonical_and_offline_send_fails", () => {

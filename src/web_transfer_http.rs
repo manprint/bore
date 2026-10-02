@@ -24,7 +24,7 @@ use tokio_tungstenite::WebSocketStream;
 
 use crate::prefixed::Prefixed;
 use crate::web_transfer::{
-    authenticate_hello, build_resync, control_liveness_expired, generate_peer_id, HelloAuth,
+    authenticate_hello, build_resync, generate_peer_id, peer_session_expired, HelloAuth,
     MemberToken, PeerSession, RoomId, TransferId, WebTransferBaseUrl, WebTransferRegistry,
     WEB_TRANSFER_AUTH_FAIL_DELAY, WEB_TRANSFER_CTRL_SEND_TIMEOUT, WEB_TRANSFER_HELLO_TIMEOUT,
     WEB_TRANSFER_MAX_CONTROL_BYTES, WEB_TRANSFER_PEER_ID_RETRIES, WEB_TRANSFER_REAPER_TICK,
@@ -979,6 +979,18 @@ pub async fn serve_control_websocket<S: AsyncRead + AsyncWrite + Unpin>(
     // `RoomState`: joins/renames lock, clone, unlock, then broadcast.
     let mut ticker = interval(WEB_TRANSFER_REAPER_TICK);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // O-1: a WebSocket Ping every second. The browser answers it below page
+    // script, so a session that has answered once (`pong_seen`) is held to the
+    // short transport deadline; one that never has keeps the legacy 60 s.
+    // The first Ping waits one period: the session has just proved itself by
+    // authenticating, and a Ping racing the welcome and snapshot frames would
+    // make whether a session counts as "answered" depend on scheduling.
+    let ping_every = crate::web_transfer::WEB_TRANSFER_PEER_WS_PING;
+    let mut ws_ping =
+        tokio::time::interval_at(tokio::time::Instant::now() + ping_every, ping_every);
+    ws_ping.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let transport_timeout = registry.peer_transport_timeout();
+    let mut pong_seen = false;
     loop {
         tokio::select! {
             inbound = ws.next() => {
@@ -1013,9 +1025,23 @@ pub async fn serve_control_websocket<S: AsyncRead + AsyncWrite + Unpin>(
                         let _ = ws.close(None).await;
                         break;
                     }
+                    Ok(Message::Pong(_)) => {
+                        pong_seen = true;
+                        session.touch(Instant::now());
+                    }
                     Ok(_) => {
                         session.touch(Instant::now());
                     }
+                }
+            }
+            _ = ws_ping.tick() => {
+                // Bounded like every other write (P-9): a socket that cannot
+                // take two bytes in the send timeout is not serving anyone.
+                if !matches!(
+                    timeout(WEB_TRANSFER_CTRL_SEND_TIMEOUT, ws.send(Message::Ping(Default::default()))).await,
+                    Ok(Ok(()))
+                ) {
+                    break;
                 }
             }
             outgoing = out_rx.recv() => {
@@ -1093,7 +1119,7 @@ pub async fn serve_control_websocket<S: AsyncRead + AsyncWrite + Unpin>(
                 }
             }
             _ = ticker.tick() => {
-                if control_liveness_expired(session.last_recv(), Instant::now()) {
+                if peer_session_expired(session.last_recv(), Instant::now(), pong_seen, transport_timeout) {
                     close_ws(&mut ws, WS_CLOSE_AUTH).await;
                     break;
                 }

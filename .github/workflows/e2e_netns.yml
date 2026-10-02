@@ -80,6 +80,11 @@ jobs:
           - { script: vhost_netns_test,          secs: 1200, gate: true }
           - { script: vhost_netns_test_hard,     secs: 1200, gate: true }
           - { script: ssh_gateway_test,          secs: 1200, gate: true }
+          # Outage recovery (plan 005, O-1): a 4 s flick, a 20 s outage and two
+          # ISP-style IP changes against every mode at once; each must serve
+          # again within its window. Real kernel TCP retransmission + real
+          # OpenSSH, which no in-process test reproduces.
+          - { script: outage_netns_test,         secs: 1200, gate: true }
           # Transfer-link root gate: verifies --exec under sudo/tar metadata,
           # producer failure and process-group cancellation through the real
           # release binary. It does not need a network namespace, but keeping

@@ -7762,9 +7762,73 @@ async fn t_web_deploy_behind_reverse_proxy() -> Result<()> {
 ///
 /// RED-CHECK: without the server's Ping arm no Pong ever arrives, the session
 /// stays on the legacy 60 s window and B's departure misses the bound below.
+///
+/// The test runs with a 3 s deadline, so a runner that freezes this process
+/// for seconds (measured: a 3.9 s control round trip in `t_web_fairness` of
+/// the same macos-14 run) can reap even a peer that answers every Ping: its
+/// Pong is still in a socket buffer when the reaper's late tick looks. Such
+/// an attempt is no verdict either way, so it is retried on a fresh server;
+/// three of them in a row fail the test. A failure on a runner that did not
+/// freeze fails at once.
 #[tokio::test]
 async fn a_browser_that_stops_answering_pings_leaves_on_the_transport_deadline() -> Result<()> {
-    use bore_cli::web_transfer::{MemberToken, OwnerLease, OwnerToken};
+    for attempt in 1..=3 {
+        match browser_transport_deadline_attempt().await? {
+            None => return Ok(()),
+            Some(why) => eprintln!("attempt {attempt}: no verdict ({why}); retrying"),
+        }
+    }
+    anyhow::bail!("three attempts in a row were stalled by the runner; no verdict")
+}
+
+/// How late this runtime wakes a short timer, at worst, since `reset`. The
+/// `#[tokio::test]` runtime is single-threaded and runs the server, both
+/// peers and this probe, so its lateness is exactly the freeze every one of
+/// them suffered.
+struct StallProbe {
+    worst_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl StallProbe {
+    fn start() -> Self {
+        use std::sync::atomic::Ordering;
+        let worst_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let worst = worst_ms.clone();
+        let task = tokio::spawn(async move {
+            let period = Duration::from_millis(20);
+            loop {
+                let before = tokio::time::Instant::now();
+                tokio::time::sleep(period).await;
+                let late = before.elapsed().saturating_sub(period);
+                worst.fetch_max(late.as_millis() as u64, Ordering::Relaxed);
+            }
+        });
+        Self { worst_ms, task }
+    }
+
+    fn reset(&self) {
+        self.worst_ms.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn worst(&self) -> Duration {
+        Duration::from_millis(self.worst_ms.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Drop for StallProbe {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// One run of the scenario on its own server. `Ok(None)` is a pass,
+/// `Ok(Some(reason))` an attempt the runner's freeze leaves without a
+/// verdict, and an `Err` or a panic a failure.
+async fn browser_transport_deadline_attempt() -> Result<Option<String>> {
+    use bore_cli::web_transfer::{
+        MemberToken, OwnerLease, OwnerToken, WEB_TRANSFER_PEER_WS_PING, WEB_TRANSFER_REAPER_TICK,
+    };
 
     let port = support::free_port().await?;
     let mut args = support::enabled_args();
@@ -7782,6 +7846,9 @@ async fn a_browser_that_stops_answering_pings_leaves_on_the_transport_deadline()
     // runner's late Ping; at 1.5 s the 0.5 s margin reaped a healthy A on
     // macos-14. Still far below the legacy 60 s the red-check tells apart.
     let transport = Duration::from_secs(3);
+    // A freeze at least this long can make a reading peer look silent for
+    // the whole deadline, so a failure under it is no verdict.
+    let margin = transport - WEB_TRANSFER_PEER_WS_PING - WEB_TRANSFER_REAPER_TICK;
     registry.set_peer_transport_timeout(transport);
     let member = MemberToken::from_bytes([0x91u8; 32]);
     let owner = OwnerToken::from_bytes([0x92u8; 32]);
@@ -7792,6 +7859,7 @@ async fn a_browser_that_stops_answering_pings_leaves_on_the_transport_deadline()
     let host = format!("127.0.0.1:{port}");
     let origin = format!("http://127.0.0.1:{port}");
     let wait = Duration::from_secs(5);
+    let probe = StallProbe::start();
 
     let mut a = support::WsPeer::connect(&host, &room_hex, &origin).await?;
     a.hello(&token_hex, Some("A")).await?;
@@ -7815,21 +7883,41 @@ async fn a_browser_that_stops_answering_pings_leaves_on_the_transport_deadline()
     // cancel-safe (`Stream::next` keeps partial frames), so dropping A's read
     // when B is done loses no frame; any text A receives here is a failure,
     // because nothing can have left yet.
+    probe.reset();
     {
         let silent = b.answer_one_ping_then_go_silent(wait);
         tokio::pin!(silent);
         tokio::select! {
             r = &mut silent => r?,
             early = a.next_text(wait) => {
+                if probe.worst() >= margin {
+                    return Ok(Some(format!("A received {early:?} while the runner froze {:?}", probe.worst())));
+                }
                 anyhow::bail!("A received {early:?} before B went silent");
             }
         }
     }
     let silent_at = tokio::time::Instant::now();
-    let (typ, body) = control_msg(&a.next_text(Duration::from_secs(10)).await?.expect("left B"));
+    let left = a.next_text(Duration::from_secs(10)).await?;
     let took = silent_at.elapsed();
+    let Some(left) = left else {
+        if probe.worst() >= margin {
+            return Ok(Some(format!(
+                "A was closed while the runner froze {:?}",
+                probe.worst()
+            )));
+        }
+        panic!("left B: A's own session was closed");
+    };
+    let (typ, body) = control_msg(&left);
     assert_eq!(typ, "peer.left");
     assert_eq!(body["peerId"].as_str(), Some(peer_b.as_str()));
+    if took >= transport + Duration::from_secs(3) && probe.worst() >= margin {
+        return Ok(Some(format!(
+            "B left after {took:?} while the runner froze {:?}",
+            probe.worst()
+        )));
+    }
     assert!(
         took < transport + Duration::from_secs(3),
         "a silent browser must leave on the transport deadline, took {took:?}"
@@ -7837,9 +7925,17 @@ async fn a_browser_that_stops_answering_pings_leaves_on_the_transport_deadline()
 
     // A kept reading the whole time, so it kept answering: two more deadlines
     // pass with no close, and the session still serves a request.
+    let survived = a.next_text(transport * 2).await;
+    if survived.is_ok() && probe.worst() >= margin {
+        return Ok(Some(format!(
+            "A read {survived:?} while the runner froze {:?}",
+            probe.worst()
+        )));
+    }
     assert!(
-        a.next_text(transport * 2).await.is_err(),
-        "a peer that answers every Ping must not be reaped"
+        survived.is_err(),
+        "a peer that answers every Ping must not be reaped (read {survived:?}, worst runner freeze {:?})",
+        probe.worst()
     );
     a.send_text(format!(
         r#"{{"v":1,"type":"peer.rename","requestId":"{}","body":{{"displayName":"A2"}}}}"#,
@@ -7849,5 +7945,5 @@ async fn a_browser_that_stops_answering_pings_leaves_on_the_transport_deadline()
     let (typ, _) = control_msg(&a.next_text(wait).await?.expect("rename ack"));
     assert_eq!(typ, "ack");
     drop(b);
-    Ok(())
+    Ok(None)
 }

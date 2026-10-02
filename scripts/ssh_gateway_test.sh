@@ -426,19 +426,25 @@ if [ -z "$OLD_SPORT" ]; then
 else
     ip netns exec ns0 iptables -A INPUT -p tcp -s "$CLI_IP" --sport "$OLD_SPORT" -j DROP
     ip netns exec ns0 iptables -A OUTPUT -p tcp -d "$CLI_IP" --dport "$OLD_SPORT" -j DROP
-    echo "  (isolated flow on client port $OLD_SPORT; waiting up to 75s for the reaper...)"
+    # The reaper fires after SSH_CTRL_TIMEOUT (15 s) of silence (plan 005,
+    # D9). The bound below is that deadline plus the polling slack: a
+    # regression to the old 60 s reaper fails here instead of passing late.
+    echo "  (isolated flow on client port $OLD_SPORT; waiting up to 20s for the reaper...)"
     REAPED=0
-    for _ in $(seq 1 75); do
+    N1_START=$SECONDS
+    for _ in $(seq 1 40); do
         if [ "$(count_rows '"secret_id":"n1"')" = "0" ]; then
             REAPED=1
             break
         fi
-        sleep 1
+        [ $((SECONDS - N1_START)) -ge 20 ] && break
+        sleep 0.5
     done
+    N1_TOOK=$((SECONDS - N1_START))
     if [ "$REAPED" = "1" ]; then
-        pass "T-SSH-N1 admin row cleared by the reaper (real netfilter half-open, not a process kill)"
+        pass "T-SSH-N1 admin row cleared by the reaper after ${N1_TOOK}s (real netfilter half-open, not a process kill)"
     else
-        fail "T-SSH-N1 admin row never cleared within 75s"
+        fail "T-SSH-N1 admin row not cleared within 20s (SSH_CTRL_TIMEOUT is 15 s)"
     fi
     ip netns exec ns0 iptables -D INPUT -p tcp -s "$CLI_IP" --sport "$OLD_SPORT" -j DROP 2>/dev/null || true
     ip netns exec ns0 iptables -D OUTPUT -p tcp -d "$CLI_IP" --dport "$OLD_SPORT" -j DROP 2>/dev/null || true

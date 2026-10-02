@@ -50,18 +50,30 @@ use crate::vhost::{
 };
 
 /// Interval between server-initiated SSH keepalive probes on an authenticated
-/// gateway connection. Parity with `CTRL_CLIENT_HEARTBEAT` (`src/secret.rs`),
-/// deliberately far below `SSH_CTRL_TIMEOUT` so a healthy idle tunnel never
-/// trips the reaper.
-pub const SSH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+/// gateway connection (plan 005, D9).
+///
+/// It is short for the same reason the native client beats every 2 s
+/// ([`crate::liveness::CTRL_CLIENT_HEARTBEAT`]): on an idle session, the
+/// first thing sent after a network flick is the next probe, and if the
+/// flick swallowed it TCP retransmits it on the ~0.2, 0.6, 1.4, 3, 6, 12.6 s
+/// ladder. The client's answer can therefore arrive up to `interval + 12.6 s`
+/// after its last byte, and that must stay inside [`SSH_CTRL_TIMEOUT`] or a
+/// flick that TCP would have repaired costs the user a reconnect. A 5 s probe
+/// (17.6 s) would not fit; 1 s (13.6 s) does with margin, at the cost of one
+/// small request/reply per second per session.
+pub const SSH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Silence duration after which an SSH gateway connection is treated as dead
-/// and torn down (all its forwards, registry entries and admin rows released).
-/// Parity with `SECRET_CTRL_TIMEOUT` (`src/secret.rs`) — the same zombie-entry
-/// reaper invariant applies here (I-SSH3). Enforced by russh's own
-/// `keepalive_max` (see `SSH_KEEPALIVE_MAX_MISSES` and
-/// `SshGateway::russh_config`'s doc), not a from-scratch timer.
-pub const SSH_CTRL_TIMEOUT: Duration = Duration::from_secs(60);
+/// and torn down (all its forwards, registry entries and admin rows released)
+/// — the same zombie-entry reaper invariant as the native tunnels (I-SSH3),
+/// and the same 15 s as their transport deadline
+/// ([`crate::liveness::TRANSPORT_REAP_FLOOR`], plan 005), so a dead OpenSSH
+/// session frees its port/label/alias within 15 s instead of 60 s. Enforced
+/// by russh's own `keepalive_max` (see `SSH_KEEPALIVE_MAX_MISSES` and
+/// `SshGateway::russh_config`'s doc), not a from-scratch timer: russh counts
+/// silence from the last byte RECEIVED, so a session that carries data is
+/// never reaped.
+pub const SSH_CTRL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// `russh::server::Config::keepalive_max`: number of consecutive unanswered
 /// server keepalive probes tolerated before russh disconnects the
@@ -517,7 +529,7 @@ impl SshGateway {
     /// internal `Handle`-driven dispatch (e.g. `channel_open_forwarded_tcpip`
     /// for a newly accepted public connection) — so a "busy tunnel, dead
     /// client" connection still gets reaped on schedule. `keepalive_max` is
-    /// tuned so the 3rd unanswered probe (at `keepalive_max + 1` intervals)
+    /// tuned so the fatal unanswered probe (at `keepalive_max + 1` intervals)
     /// lands at `SSH_CTRL_TIMEOUT`.
     ///
     /// `inactivity_timeout` stays at `SSH_PREAUTH_GRACE` and is shared across
@@ -4901,6 +4913,22 @@ mod tests {
             .expect("auto-assign within an unrestricted range must succeed");
         let port = listener.local_addr().unwrap().port();
         assert!((20000..=20010).contains(&port));
+    }
+
+    /// Plan 005, D9: the shipped values, and the flick arithmetic that chose
+    /// them. RED: a 5 s probe (`5 s + 12.6 s > 15 s`) fails the second
+    /// assertion, and a 60 s timeout fails the first.
+    #[test]
+    fn ssh_reaper_values_cover_a_probe_plus_the_retransmit_ladder() {
+        assert_eq!(SSH_KEEPALIVE_INTERVAL, Duration::from_secs(1));
+        assert_eq!(SSH_CTRL_TIMEOUT, Duration::from_secs(15));
+        assert_eq!(SSH_KEEPALIVE_MAX_MISSES, 14);
+        assert_eq!(SSH_CTRL_TIMEOUT, crate::liveness::TRANSPORT_REAP_FLOOR);
+        let ladder = Duration::from_millis(200 + 400 + 800 + 1_600 + 3_200 + 6_400);
+        assert!(
+            SSH_KEEPALIVE_INTERVAL + ladder < SSH_CTRL_TIMEOUT,
+            "a flick TCP repairs must not reap an idle SSH session"
+        );
     }
 
     #[test]

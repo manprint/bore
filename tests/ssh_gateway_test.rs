@@ -1858,11 +1858,11 @@ async fn t_ssh_preauth1_stalled_handshake_is_disconnected() -> Result<()> {
 
 // ---------------------------------------------------------------------------
 // T-SSH-KEEP1 — an idle, authenticated `-N -R` session with zero tunnel
-// traffic survives well past `SSH_CTRL_TIMEOUT` (60s) on `ServerAliveInterval`
-// keepalives alone, and the tunnel still relays afterwards (I-3: the reaper
-// must not fire on a healthy connection — see `SshGateway::russh_config`'s
-// doc for why this is russh's own `keepalive_max`, not a callback-driven
-// tracker).
+// traffic survives well past `SSH_CTRL_TIMEOUT` (15 s) on keepalives alone
+// (the server's 1 s probes, answered by the client), and the tunnel still
+// relays afterwards (I-3: the reaper must not fire on a healthy connection —
+// see `SshGateway::russh_config`'s doc for why this is russh's own
+// `keepalive_max`, not a callback-driven tracker).
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1908,10 +1908,10 @@ async fn t_ssh_keep1_idle_session_survives_ctrl_timeout() -> Result<()> {
         "forward not live before the idle window"
     );
 
-    // Zero tunnel traffic for well past SSH_CTRL_TIMEOUT (60s): only the
-    // client's own ServerAliveInterval keepalives (invisible to any
-    // Handler callback) keep the connection alive on russh's side.
-    time::sleep(Duration::from_secs(90)).await;
+    // Zero tunnel traffic for twice SSH_CTRL_TIMEOUT (15 s): only keepalive
+    // traffic (invisible to any Handler callback) keeps the connection alive
+    // on russh's side.
+    time::sleep(Duration::from_secs(30)).await;
 
     assert!(
         roundtrip(fwd_port, b"ping-keep1-after").await?,

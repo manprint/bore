@@ -32,9 +32,19 @@
 use std::time::Duration;
 
 /// How often a client sends `ClientMessage::Heartbeat` up its control
-/// substream. 20 s before plan 005; 5 s now, so that a server deadline of three
-/// beats is the 15 s floor rather than a minute.
-pub const CTRL_CLIENT_HEARTBEAT: Duration = Duration::from_secs(5);
+/// substream. 20 s before plan 005; 2 s now.
+///
+/// The value is set by flick tolerance, not by detection speed. A server reaps
+/// a declared client once its connection has delivered no byte for
+/// [`TRANSPORT_REAP_FLOOR`]. On an idle tunnel the client's beats are the only
+/// bytes it sends, so after a flick the server's silence is one beat interval
+/// PLUS however long TCP's retransmission backoff takes to deliver the lost
+/// beat once the path is back — and Linux's ladder (RTO 200 ms, doubling) next
+/// retransmits 12.6 s after the first loss for any flick between 6.2 s and
+/// 12.6 s. A 5 s beat therefore let the server reap a client that would itself
+/// have survived (5 + 12.6 > 15); at 2 s both ends tolerate the same flicks.
+/// The cost is one ~15-byte frame every 2 s per tunnel.
+pub const CTRL_CLIENT_HEARTBEAT: Duration = Duration::from_secs(2);
 
 /// How long a client tolerates total inbound silence from the server before it
 /// declares the connection dead, tears it down and reconnects (D2).
@@ -117,6 +127,49 @@ pub fn transport_reap_deadline(declared_ms: u32, floor: Duration) -> Option<Dura
     let beats =
         Duration::from_millis(u64::from(declared_ms)).saturating_mul(TRANSPORT_REAP_MULTIPLIER);
     Some(beats.max(floor).min(DEADLINE_CAP))
+}
+
+/// The server half of D3 for one connection: its activity and the deadline
+/// its client declared. Built only for a client that declared a heartbeat, so
+/// an `Option<TransportReaper>` of `None` IS the legacy, never-reaped path.
+#[derive(Clone, Debug)]
+pub struct TransportReaper {
+    activity: crate::mux::ConnActivity,
+    deadline: Duration,
+}
+
+impl TransportReaper {
+    /// The reaper for a client that declared `declared_ms` (`None` for 0).
+    pub fn new(
+        activity: crate::mux::ConnActivity,
+        declared_ms: u32,
+        floor: Duration,
+    ) -> Option<Self> {
+        transport_reap_deadline(declared_ms, floor).map(|deadline| Self { activity, deadline })
+    }
+
+    /// The deadline in force.
+    pub fn deadline(&self) -> Duration {
+        self.deadline
+    }
+
+    /// Check on the loop's heartbeat tick (never as `timeout(recv)`, DEC-VE3).
+    /// `Some(idle)` when the connection has been silent past the deadline; it
+    /// has then already been terminated, so every substream on it — data
+    /// included — ends now instead of when the kernel gives up (≈15 min).
+    pub fn reap_if_due(&self) -> Option<Duration> {
+        if !self.activity.reap_due(Some(self.deadline)) {
+            return None;
+        }
+        let idle = self.activity.inbound_idle();
+        self.activity.terminate();
+        Some(idle)
+    }
+}
+
+/// [`TransportReaper::reap_if_due`] for an optional reaper.
+pub fn reap_if_due(reaper: &Option<TransportReaper>) -> Option<Duration> {
+    reaper.as_ref().and_then(TransportReaper::reap_if_due)
 }
 
 /// A ticker for an optional deadline: [`liveness_tick`] when armed, a future
@@ -210,12 +263,25 @@ mod tests {
     /// path the other still considers alive for long.
     #[test]
     fn shipped_defaults_are_consistent() {
-        assert_eq!(CTRL_CLIENT_HEARTBEAT, Duration::from_secs(5));
+        assert_eq!(CTRL_CLIENT_HEARTBEAT, Duration::from_secs(2));
         assert_eq!(
             transport_reap_deadline(declared_ms_for(CTRL_CLIENT_HEARTBEAT), TRANSPORT_REAP_FLOOR),
             Some(TRANSPORT_REAP_FLOOR)
         );
         assert_eq!(CLIENT_SILENCE_DEADLINE, TRANSPORT_REAP_FLOOR);
+    }
+
+    /// The flick-tolerance argument of [`CTRL_CLIENT_HEARTBEAT`], as arithmetic:
+    /// the worst silence a server sees after a flick the client survives (one
+    /// beat + the 12.6 s Linux retransmission step at a 200 ms RTO) must stay
+    /// inside the server's deadline. RED: a 5 s beat fails it.
+    #[test]
+    fn server_deadline_covers_a_beat_plus_the_retransmit_ladder() {
+        let ladder = MS(200 + 400 + 800 + 1_600 + 3_200 + 6_400);
+        assert_eq!(ladder, MS(12_600));
+        assert!(CTRL_CLIENT_HEARTBEAT + ladder < TRANSPORT_REAP_FLOOR);
+        // The client's own worst case (server beats every 500 ms) fits too.
+        assert!(MS(500) + ladder < CLIENT_SILENCE_DEADLINE);
     }
 
     #[tokio::test(start_paused = true)]

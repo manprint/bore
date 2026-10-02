@@ -389,6 +389,7 @@ pub async fn serve_provider(
     udp_tuning: UdpDirectTuning,
     display: SecretDisplay,
     ctrl_timeout: Duration,
+    transport: Option<crate::liveness::TransportReaper>,
 ) -> Result<()> {
     // Register atomically, rejecting a duplicate id rather than hijacking it. The
     // registration is a carrier pool seeded with this connection's opener; extra
@@ -493,6 +494,13 @@ pub async fn serve_provider(
                         "secret provider control idle; reaping (peer wedged/abandoned)");
                     return Ok(());
                 }
+                // Transport liveness (plan 005, D3): a provider that promised
+                // to beat has delivered no byte at all — free its id now.
+                if let Some(idle) = crate::liveness::reap_if_due(&transport) {
+                    warn!(%id, ?idle,
+                        "secret provider connection silent; reaping (path dead)");
+                    return Ok(());
+                }
             }
             message = control.recv() => {
                 last_recv = TokioInstant::now();
@@ -584,6 +592,7 @@ pub async fn serve_consumer(
     display: SecretDisplay,
     ctrl_timeout: Duration,
     carrier: bool,
+    transport: Option<crate::liveness::TransportReaper>,
 ) -> Result<()> {
     if carrier {
         debug!(%id, %peer, "secret consumer relay carrier connected (no admin entry, not reaped — liveness is owned by the consumer's main control connection)");
@@ -671,6 +680,15 @@ pub async fn serve_consumer(
                     warn!(%id, %peer, timeout = ?ctrl_timeout,
                         "secret consumer control idle; reaping (peer wedged/abandoned)");
                     return Ok(());
+                }
+                // Transport liveness (plan 005, D3). The caller never builds a
+                // reaper for a carrier; the guard repeats that rule here.
+                if !carrier {
+                    if let Some(idle) = crate::liveness::reap_if_due(&transport) {
+                        warn!(%id, %peer, ?idle,
+                            "secret consumer connection silent; reaping (path dead)");
+                        return Ok(());
+                    }
                 }
             }
             // A direct-path consumer offers its candidates here; broker them to

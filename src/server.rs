@@ -640,6 +640,13 @@ pub struct Server {
     /// test never perturbs an unrelated registry.
     public_ctrl_timeout: std::time::Duration,
 
+    /// Floor of the TRANSPORT deadline applied to a client that declared its
+    /// heartbeat interval (plan 005, D3): the registration is reaped once its
+    /// connection has delivered no byte for
+    /// `max(3 x declared, transport_reap_floor)`. Defaults to
+    /// [`crate::liveness::TRANSPORT_REAP_FLOOR`]; lowered by tests.
+    transport_reap_floor: std::time::Duration,
+
     /// Web-transfer owner control receive deadline. Defaults to
     /// [`crate::web_transfer::WEB_TRANSFER_CTRL_TIMEOUT`]; lowered by tests
     /// to reap fast. Separate from the other four so a focused liveness test
@@ -810,6 +817,7 @@ impl Server {
             ssh_jump_ctrl_timeout: crate::secret::SECRET_CTRL_TIMEOUT,
             vhost_ctrl_timeout: crate::secret::SECRET_CTRL_TIMEOUT,
             public_ctrl_timeout: crate::secret::SECRET_CTRL_TIMEOUT,
+            transport_reap_floor: crate::liveness::TRANSPORT_REAP_FLOOR,
             web_transfer_ctrl_timeout: crate::web_transfer::WEB_TRANSFER_CTRL_TIMEOUT,
             #[cfg(feature = "ssh-gateway")]
             ssh_gateway: None,
@@ -840,9 +848,16 @@ impl Server {
 
     /// Override the public-tunnel liveness timeout (tests only). Production
     /// keeps [`secret::SECRET_CTRL_TIMEOUT`] (60 s), comfortably above the
-    /// client's 20 s heartbeat.
+    /// client's heartbeat.
     pub fn public_ctrl_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.public_ctrl_timeout = timeout;
+        self
+    }
+
+    /// Override the transport reap floor (tests only). Production keeps
+    /// [`crate::liveness::TRANSPORT_REAP_FLOOR`] (15 s).
+    pub fn transport_reap_floor(mut self, floor: std::time::Duration) -> Self {
+        self.transport_reap_floor = floor;
         self
     }
 
@@ -2444,6 +2459,13 @@ impl Server {
             Some(stream) => Delimited::with_label(stream, "server/control"),
             None => return Ok(()),
         };
+        // The transport reaper for a client that declared its heartbeat
+        // (plan 005, D3); `None` for a client that declared nothing.
+        let activity = opener.activity();
+        let transport_floor = self.transport_reap_floor;
+        let reaper = move |declared_ms: u32| {
+            crate::liveness::TransportReaper::new(activity.clone(), declared_ms, transport_floor)
+        };
 
         // The client sends its first message before authenticating (it must write
         // to announce the lazily-opened substream; the server speaks first during
@@ -2462,13 +2484,15 @@ impl Server {
 
         match request {
             Some(ClientMessage::Hello(port, opts)) => {
-                self.serve_tunnel(control, opener, port, opts, peer).await
+                let transport = reaper(opts.ctrl_heartbeat_ms);
+                self.serve_tunnel(control, opener, port, opts, peer, transport)
+                    .await
             }
             Some(ClientMessage::JoinCarrier { token }) => {
                 self.serve_carrier(control, opener, token).await
             }
             Some(ClientMessage::HelloSecret {
-                ctrl_heartbeat_ms: _,
+                ctrl_heartbeat_ms,
                 id,
                 notes,
                 basic_auth,
@@ -2515,11 +2539,12 @@ impl Server {
                         carriers,
                     },
                     self.secret_ctrl_timeout,
+                    reaper(ctrl_heartbeat_ms),
                 )
                 .await
             }
             Some(ClientMessage::ConnectSecret {
-                ctrl_heartbeat_ms: _,
+                ctrl_heartbeat_ms,
                 id,
                 notes,
                 carriers,
@@ -2564,11 +2589,18 @@ impl Server {
                     },
                     self.secret_ctrl_timeout,
                     carrier,
+                    // A carrier never beats and is never reaped (BUG-S2), even
+                    // if a confused client declared an interval for it.
+                    if carrier {
+                        None
+                    } else {
+                        reaper(ctrl_heartbeat_ms)
+                    },
                 )
                 .await
             }
             Some(ClientMessage::HelloVhost {
-                ctrl_heartbeat_ms: _,
+                ctrl_heartbeat_ms,
                 subdomain,
                 client_id,
                 notes,
@@ -2631,10 +2663,18 @@ impl Server {
                     // Grow the pool only for a provider that can receive the
                     // request (same reason, same pattern).
                     auto_carriers,
+                    reaper(ctrl_heartbeat_ms),
                 )
                 .await
             }
             Some(message @ ClientMessage::HelloSshJump { .. }) => {
+                let ClientMessage::HelloSshJump {
+                    ctrl_heartbeat_ms, ..
+                } = &message
+                else {
+                    unreachable!("matched as HelloSshJump");
+                };
+                let transport = reaper(*ctrl_heartbeat_ms);
                 let Some(base_domain) = self.ssh_jump_base_domain.clone() else {
                     warn!(%peer, "SSH jump registration received while service is disabled");
                     let _ = control
@@ -2646,7 +2686,7 @@ impl Server {
                 };
                 #[cfg(not(feature = "ssh-gateway"))]
                 {
-                    let _ = (message, base_domain);
+                    let _ = (message, base_domain, transport);
                     let _ = control
                         .send(ServerMessage::Error(
                             "server was built without SSH gateway support".into(),
@@ -2688,6 +2728,7 @@ impl Server {
                         self.udp,
                         self.vhost_quic_port,
                         self.udp_tuning,
+                        transport,
                     )
                     .await
                 }
@@ -2907,6 +2948,7 @@ impl Server {
         port: u16,
         mut opts: TunnelOptions,
         peer: SocketAddr,
+        transport: Option<crate::liveness::TransportReaper>,
     ) -> Result<()> {
         // Resolve effective HTTPS flags from the policy (or legacy bools if no policy).
         let capable = self.tls.is_some();
@@ -3115,6 +3157,20 @@ impl Server {
                             );
                             return Ok(());
                         }
+                    }
+                    // Transport liveness (plan 005, D3): no byte at all from a
+                    // client that promised to beat — the path is dead (an ISP IP
+                    // change, a dropped NAT mapping). Free the port now so the
+                    // client's reconnect gets it, instead of when the kernel
+                    // gives up on the socket (~15 min).
+                    if let Some(idle) = crate::liveness::reap_if_due(&transport) {
+                        warn!(
+                            port,
+                            ?idle,
+                            "public tunnel connection silent; reaping (path dead) \
+                             and releasing the public port"
+                        );
+                        return Ok(());
                     }
                 }
                 // Messages FROM the public client. This arm used to not exist at

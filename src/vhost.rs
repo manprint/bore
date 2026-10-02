@@ -933,6 +933,7 @@ pub async fn serve_vhost_provider(
     backend_tls_sni: Option<String>,
     ctrl_timeout: Option<Duration>,
     auto_carriers: bool,
+    transport: Option<crate::liveness::TransportReaper>,
 ) -> Result<()> {
     // Validate against live config (resolve_route checks reservations).
     let cfg = vhost_config.read().unwrap().clone();
@@ -1194,6 +1195,14 @@ pub async fn serve_vhost_provider(
                             "vhost provider control idle; reaping (peer wedged/abandoned)");
                         return Ok(());
                     }
+                }
+                // Transport liveness (plan 005, D3): no byte at all from a
+                // provider that promised to beat — its path is dead. Free the
+                // subdomain now so the provider's reconnect gets it back.
+                if let Some(idle) = crate::liveness::reap_if_due(&transport) {
+                    warn!(?idle,
+                        "vhost provider connection silent; reaping (path dead) and releasing the subdomain");
+                    return Ok(());
                 }
                 // Phase 03.3 shrink: nothing has crowded a carrier for a whole
                 // quiet period, so stop asking the provider to keep this many.

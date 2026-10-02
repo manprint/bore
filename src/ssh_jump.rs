@@ -487,6 +487,7 @@ pub(crate) async fn serve_native_provider(
     server_udp_enabled: bool,
     direct_quic_port: u16,
     udp_tuning: crate::shared::UdpDirectTuning,
+    transport: Option<crate::liveness::TransportReaper>,
 ) -> Result<()> {
     let alias = registration.alias.clone();
     let requested_carriers = registration.carriers;
@@ -615,6 +616,13 @@ pub(crate) async fn serve_native_provider(
                 if last_recv.elapsed() >= ctrl_timeout {
                     warn!(%alias, timeout = ?ctrl_timeout,
                         "SSH jump provider control idle; reaping");
+                    return Ok(());
+                }
+                // Transport liveness (plan 005, D3): free the alias as soon as
+                // a provider that promised to beat has gone silent.
+                if let Some(idle) = crate::liveness::reap_if_due(&transport) {
+                    warn!(%alias, ?idle,
+                        "SSH jump provider connection silent; reaping (path dead)");
                     return Ok(());
                 }
             }

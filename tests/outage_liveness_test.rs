@@ -1,0 +1,517 @@
+//! Outage recovery (plan `005_plan-OutageRecovery`).
+//!
+//! Field report: after a ~20 s network outage (most likely an ISP IP change)
+//! a `bore vhost --auto-reconnect` client stayed down ~16 minutes. Neither end
+//! noticed that the control connection was dead until the kernel gave up on
+//! it (`tcp_retries2`, ≈924 s), and the server kept the dead connection's
+//! subdomain until then.
+//!
+//! These tests drive the real client and server through [`BlackholeProxy`], a
+//! TCP forwarder that can stop forwarding in both directions while keeping
+//! both sockets ESTABLISHED — exactly what a dead path looks like to the two
+//! endpoints: no FIN, no RST, just silence.
+//!
+//! Every test owns its own ports (`#[tokio::test]` runtimes release their
+//! listeners only after the body returned) and holds `SERIAL` because the
+//! liveness knobs are process-wide environment variables.
+
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use bore_cli::{
+    admin::Role,
+    client::{Client, ProviderMeta},
+    mux,
+    secret::Proxy,
+    server::Server,
+    shared::{ClientMessage, Delimited, ServerMessage, TunnelOptions},
+    vhost::{VhostConfig, VhostModeCfg},
+};
+use lazy_static::lazy_static;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+use tokio::time::{self, Instant};
+
+lazy_static! {
+    /// The liveness knobs are environment variables read per call, so tests
+    /// that set them must not overlap.
+    static ref SERIAL: Mutex<()> = Mutex::new(());
+}
+
+const PORT_WAIT_BUDGET: Duration = Duration::from_secs(30);
+
+// ─── Environment ─────────────────────────────────────────────────────────────
+
+/// Sets the liveness environment for one test and clears it on drop.
+struct LivenessEnv;
+
+impl LivenessEnv {
+    /// `heartbeat_ms`: the client's beat; `silence_ms`: the client's
+    /// server-silence deadline (`0` disables it).
+    fn set(heartbeat_ms: u64, silence_ms: u64) -> Self {
+        std::env::set_var("BORE_CTRL_HEARTBEAT_MS", heartbeat_ms.to_string());
+        std::env::set_var("BORE_CTRL_SERVER_SILENCE_MS", silence_ms.to_string());
+        Self
+    }
+}
+
+impl Drop for LivenessEnv {
+    fn drop(&mut self) {
+        std::env::remove_var("BORE_CTRL_HEARTBEAT_MS");
+        std::env::remove_var("BORE_CTRL_SERVER_SILENCE_MS");
+    }
+}
+
+// ─── Blackhole proxy ─────────────────────────────────────────────────────────
+
+/// One proxied connection's observable state.
+#[derive(Default)]
+struct ProxiedConn {
+    /// The client side of this connection reached EOF (the client closed it).
+    client_closed: AtomicBool,
+    /// The server side of this connection reached EOF (the server closed it).
+    server_closed: AtomicBool,
+}
+
+/// A TCP forwarder `client <-> proxy <-> upstream` that can be blackholed:
+/// while blackholed it forwards nothing in either direction and closes
+/// nothing, so both endpoints see a live socket that has gone silent. Bytes
+/// already read are held, not dropped, and delivered on release — the same
+/// thing TCP retransmission does once a flick ends.
+struct BlackholeProxy {
+    addr: SocketAddr,
+    blackholed: Arc<AtomicBool>,
+    #[allow(dead_code)] // read by the client-side tests (1.3)
+    conns: Arc<std::sync::Mutex<Vec<Arc<ProxiedConn>>>>,
+}
+
+impl BlackholeProxy {
+    async fn start(upstream: SocketAddr) -> Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let blackholed = Arc::new(AtomicBool::new(false));
+        let conns: Arc<std::sync::Mutex<Vec<Arc<ProxiedConn>>>> = Arc::default();
+        let (bh, cs) = (blackholed.clone(), conns.clone());
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let Ok(server) = TcpStream::connect(upstream).await else {
+                    continue;
+                };
+                let state = Arc::new(ProxiedConn::default());
+                cs.lock().unwrap().push(state.clone());
+                let (cr, cw) = client.into_split();
+                let (sr, sw) = server.into_split();
+                tokio::spawn(pump(cr, sw, bh.clone(), state.clone(), true));
+                tokio::spawn(pump(sr, cw, bh.clone(), state, false));
+            }
+        });
+        Ok(Self {
+            addr,
+            blackholed,
+            conns,
+        })
+    }
+
+    fn to(&self) -> String {
+        self.addr.to_string()
+    }
+
+    fn set_blackhole(&self, on: bool) {
+        self.blackholed.store(on, Ordering::SeqCst);
+    }
+
+    #[allow(dead_code)] // read by the client-side tests (1.3)
+    fn conns(&self) -> Vec<Arc<ProxiedConn>> {
+        self.conns.lock().unwrap().clone()
+    }
+}
+
+async fn wait_released(blackholed: &AtomicBool) {
+    while blackholed.load(Ordering::SeqCst) {
+        time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn pump(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    blackholed: Arc<AtomicBool>,
+    state: Arc<ProxiedConn>,
+    from_client: bool,
+) {
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        wait_released(&blackholed).await;
+        let n = from.read(&mut buf).await.unwrap_or_default();
+        if n == 0 {
+            if from_client {
+                state.client_closed.store(true, Ordering::SeqCst);
+            } else {
+                state.server_closed.store(true, Ordering::SeqCst);
+            }
+            let _ = to.shutdown().await;
+            return;
+        }
+        // A read that completed just as the blackhole went up is held.
+        wait_released(&blackholed).await;
+        if to.write_all(&buf[..n]).await.is_err() {
+            return;
+        }
+    }
+}
+
+// ─── Servers and helpers ─────────────────────────────────────────────────────
+
+async fn wait_port(port: u16, listening: bool) {
+    let deadline = Instant::now() + PORT_WAIT_BUDGET;
+    loop {
+        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() == listening {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "port {port} never became {} within {PORT_WAIT_BUDGET:?}",
+            if listening { "reachable" } else { "free" },
+        );
+        time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn http_vhost(http_port: u16) -> VhostConfig {
+    VhostConfig {
+        base_domain: "outage.test".to_string(),
+        mode: VhostModeCfg::Http,
+        http_port,
+        https_port: 443,
+        cert_file: None,
+        key_file: None,
+        default_headers: Default::default(),
+        default_response_headers: Default::default(),
+        reservations: vec![],
+    }
+}
+
+/// A server on `control` whose public range is `public`, with the transport
+/// reap floor lowered to `floor`. Returns its admin registry.
+async fn spawn_server(
+    control: u16,
+    public: std::ops::RangeInclusive<u16>,
+    floor: Duration,
+    vhost_http: Option<u16>,
+) -> Result<bore_cli::admin::AdminRegistry> {
+    wait_port(control, false).await;
+    let mut server = Server::new(public, None).transport_reap_floor(floor);
+    server.set_control_port(control);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    if let Some(http) = vhost_http {
+        server.set_vhost(http_vhost(http))?;
+    }
+    let admin = server.admin_registry();
+    tokio::spawn(server.listen());
+    wait_port(control, true).await;
+    Ok(admin)
+}
+
+fn control_addr(control: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], control))
+}
+
+async fn echo_service() -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    tokio::spawn(async move {
+        while let Ok((mut conn, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let _ = conn.write_all(b"alive").await;
+            });
+        }
+    });
+    Ok(port)
+}
+
+async fn vhost_provider(to: &str, local: u16, label: &str) -> Result<Client> {
+    Client::new_vhost_provider(
+        "127.0.0.1",
+        local,
+        to,
+        label,
+        "client",
+        None,
+        false,
+        1,
+        ProviderMeta::default(),
+        None,
+    )
+    .await
+}
+
+async fn secret_provider(to: &str, local: u16, id: &str) -> Result<Client> {
+    Client::new_secret_provider(
+        "127.0.0.1",
+        local,
+        to,
+        id,
+        None,
+        false,
+        false,
+        None,
+        Default::default(),
+        0,
+        0,
+        64,
+        1,
+        ProviderMeta::default(),
+        None,
+    )
+    .await
+}
+
+async fn secret_consumer(to: &str, id: &str) -> Result<Proxy> {
+    Proxy::new(
+        to,
+        "127.0.0.1:0".parse()?,
+        id,
+        None,
+        false,
+        false,
+        None,
+        Default::default(),
+        0,
+        0,
+        1,
+        None,
+        false,
+    )
+    .await
+}
+
+fn count_role(admin: &bore_cli::admin::AdminRegistry, role: Role) -> usize {
+    admin.snapshot().iter().filter(|e| e.role == role).count()
+}
+
+/// Poll `attempt` until it succeeds or `within` elapses; returns the time taken.
+async fn eventually<F, Fut, T>(within: Duration, mut attempt: F) -> Option<(Duration, T)>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let start = Instant::now();
+    loop {
+        if let Some(v) = attempt().await {
+            return Some((start.elapsed(), v));
+        }
+        if start.elapsed() >= within {
+            return None;
+        }
+        time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+// ─── Server transport reapers (1.2) ──────────────────────────────────────────
+
+/// The field case. A vhost provider whose path dies must lose its subdomain
+/// within the transport deadline, so its reconnect is not refused "in use".
+///
+/// RED-CHECK: without the reaper in `serve_vhost_provider` the second
+/// registration is refused for the whole test (the legacy 60 s reaper does not
+/// fire inside it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_transport_reaps_a_silent_declared_vhost_provider() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let _env = LivenessEnv::set(200, 0); // the client must not trip: isolate the server
+    const CONTROL: u16 = 18601;
+    const HTTP: u16 = 18602;
+    spawn_server(CONTROL, 18603..=18603, Duration::from_secs(1), Some(HTTP)).await?;
+    let proxy = BlackholeProxy::start(control_addr(CONTROL)).await?;
+    let local = echo_service().await?;
+
+    let first = vhost_provider(&proxy.to(), local, "field").await?;
+    tokio::spawn(first.listen());
+    // Healthy: the label is held and a second registration is refused.
+    time::sleep(Duration::from_millis(700)).await;
+    assert!(
+        vhost_provider(&format!("127.0.0.1:{CONTROL}"), local, "field")
+            .await
+            .is_err(),
+        "a live provider must keep its subdomain"
+    );
+
+    proxy.set_blackhole(true);
+    let freed = eventually(Duration::from_secs(4), || async {
+        vhost_provider(&format!("127.0.0.1:{CONTROL}"), local, "field")
+            .await
+            .ok()
+    })
+    .await;
+    let (took, second) = freed.expect(
+        "the subdomain of a provider whose path died was never released; \
+         its reconnect would be refused until the kernel gives up (~15 min)",
+    );
+    assert!(took < Duration::from_secs(4), "took {took:?}");
+    drop(second);
+    Ok(())
+}
+
+/// Same shape for a public tunnel on a fixed port.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_transport_reaps_a_silent_declared_public_tunnel() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let _env = LivenessEnv::set(200, 0);
+    const CONTROL: u16 = 18611;
+    const PORT: u16 = 18612;
+    spawn_server(CONTROL, PORT..=PORT, Duration::from_secs(1), None).await?;
+    let proxy = BlackholeProxy::start(control_addr(CONTROL)).await?;
+    let local = echo_service().await?;
+
+    let first = Client::new(
+        "127.0.0.1",
+        local,
+        &proxy.to(),
+        PORT,
+        None,
+        false,
+        TunnelOptions::default(),
+        None,
+    )
+    .await?;
+    assert_eq!(first.remote_port(), PORT);
+    tokio::spawn(first.listen());
+    wait_port(PORT, true).await;
+
+    proxy.set_blackhole(true);
+    let freed = eventually(Duration::from_secs(4), || async {
+        Client::new(
+            "127.0.0.1",
+            local,
+            &format!("127.0.0.1:{CONTROL}"),
+            PORT,
+            None,
+            false,
+            TunnelOptions::default(),
+            None,
+        )
+        .await
+        .ok()
+    })
+    .await;
+    assert!(
+        freed.is_some(),
+        "the public port of a client whose path died was never released"
+    );
+    Ok(())
+}
+
+/// Same shape for a secret provider id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_transport_reaps_a_silent_declared_secret_provider() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let _env = LivenessEnv::set(200, 0);
+    const CONTROL: u16 = 18621;
+    spawn_server(CONTROL, 18622..=18622, Duration::from_secs(1), None).await?;
+    let proxy = BlackholeProxy::start(control_addr(CONTROL)).await?;
+    let local = echo_service().await?;
+
+    let first = secret_provider(&proxy.to(), local, "db").await?;
+    tokio::spawn(first.listen());
+    time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        secret_provider(&format!("127.0.0.1:{CONTROL}"), local, "db")
+            .await
+            .is_err(),
+        "a live provider must keep its id"
+    );
+
+    proxy.set_blackhole(true);
+    let freed = eventually(Duration::from_secs(4), || async {
+        secret_provider(&format!("127.0.0.1:{CONTROL}"), local, "db")
+            .await
+            .ok()
+    })
+    .await;
+    assert!(
+        freed.is_some(),
+        "the id of a secret provider whose path died was never released"
+    );
+    Ok(())
+}
+
+/// A secret consumer has no name to hold, but its admin row is a zombie
+/// until it is reaped (the inflated "Secret Tunnels" count).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_transport_reaps_a_silent_declared_secret_consumer() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let _env = LivenessEnv::set(200, 0);
+    const CONTROL: u16 = 18631;
+    let admin = spawn_server(CONTROL, 18632..=18632, Duration::from_secs(1), None).await?;
+    let proxy = BlackholeProxy::start(control_addr(CONTROL)).await?;
+    let local = echo_service().await?;
+
+    let provider = secret_provider(&format!("127.0.0.1:{CONTROL}"), local, "db").await?;
+    tokio::spawn(provider.listen());
+    let consumer = secret_consumer(&proxy.to(), "db").await?;
+    tokio::spawn(consumer.listen());
+    let seen = eventually(Duration::from_secs(3), || async {
+        (count_role(&admin, Role::SecretConsumer) == 1).then_some(())
+    })
+    .await;
+    assert!(seen.is_some(), "the consumer never registered");
+
+    proxy.set_blackhole(true);
+    let gone = eventually(Duration::from_secs(4), || async {
+        (count_role(&admin, Role::SecretConsumer) == 0).then_some(())
+    })
+    .await;
+    assert!(
+        gone.is_some(),
+        "the admin row of a consumer whose path died was never reaped"
+    );
+    assert_eq!(
+        count_role(&admin, Role::SecretProvider),
+        1,
+        "the healthy provider is untouched"
+    );
+    Ok(())
+}
+
+/// I-5 (DEC-VE2's shape): a client that declared NO interval — every client
+/// built before plan 005 — is never transport-reaped, however long it is
+/// silent. Reaping it would kill healthy idle legacy tunnels.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn undeclared_client_is_never_transport_reaped() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    const CONTROL: u16 = 18641;
+    const PORT: u16 = 18642;
+    spawn_server(CONTROL, PORT..=PORT, Duration::from_secs(1), None).await?;
+
+    // A legacy client, by hand: no `ctrl_heartbeat`, no `ctrl_heartbeat_ms`,
+    // and it never sends another byte.
+    let tcp = TcpStream::connect(("127.0.0.1", CONTROL)).await?;
+    let (opener, _acceptor) = mux::client(tcp);
+    let mut control = Delimited::new(opener.open().await?);
+    let legacy: TunnelOptions = serde_json::from_str(
+        r#"{"https":false,"force_https":false,"basic_auth":null,"notes":null}"#,
+    )?;
+    control.send(ClientMessage::Hello(PORT, legacy)).await?;
+    let reply = control.recv::<ServerMessage>().await?;
+    assert!(matches!(reply, Some(ServerMessage::Hello(p)) if p == PORT));
+
+    time::sleep(Duration::from_secs(3)).await;
+
+    let tcp2 = TcpStream::connect(("127.0.0.1", CONTROL)).await?;
+    let (opener2, _acceptor2) = mux::client(tcp2);
+    let mut control2 = Delimited::new(opener2.open().await?);
+    control2
+        .send(ClientMessage::Hello(PORT, TunnelOptions::default()))
+        .await?;
+    let busy = control2.recv::<ServerMessage>().await?;
+    assert!(
+        matches!(busy, Some(ServerMessage::Error(_))),
+        "an undeclared client must keep its port: {busy:?}"
+    );
+    drop((opener, control));
+    Ok(())
+}

@@ -24,10 +24,10 @@ Read this first in every session. Updated 2026-10-02 by claude-opus-5-5.
 ## 1. Current unit and scope
 
 - Active scope: plan (all phases) — user: "implementa il piano, testa tutto, committa su Dev e segui la ci".
-- Scope result: RUNNING.
+- Scope result: COMPLETE (all phases DONE; G-CI green on da621a1).
 - Type / ID / attempt: none.
-- Next action: G-CI round 2 (round 1 = §7, fixed by rev 1m) — `git push origin dev`, then `gh run list --branch dev` / `gh run watch` until every workflow is green; fix anything red with new commits (record each here) and re-watch. Then report to the user.
-- Next eligible plan unit: none (all phases DONE; G-CI pending).
+- Next action: none — report to the user. Plan scope complete.
+- Next eligible plan unit: none (all phases DONE; G-CI PASS).
 - Unit base: f7b0745; branch: dev.
 - Repo state: plan commits on dev after f7b0745 (latest: P2, matched by `PEV-Unit: P2`).
 
@@ -67,7 +67,7 @@ Read this first in every session. Updated 2026-10-02 by claude-opus-5-5.
 | G-PHASE | P0–P3 | `cargo test` + `cargo test --features vpn` + `cargo test --features ssh-gateway` | 0 failed |
 | G-NETNS-OUT | 4.1 | `sudo -n $PWD/scripts/outage_netns_test.sh` | FAIL: 0; red on baseline |
 | G-NETNS-REG | 4.2 | the `local_proxy_netns_test`, `secret_netns_test`, `vhost_netns_test`, `vpn_netns_test` and `ssh_gateway_test` harnesses, serially via `sudo -n $PWD/scripts/<x>.sh` | FAIL: 0 (or proven pre-existing) |
-| G-CI | final | `git push origin dev`, then `gh run list --branch dev` / `gh run watch` | all workflows success |
+| G-CI | final | `git push origin dev`, then `gh run list --branch dev` / `gh run watch` | all workflows success — PASS on da621a1 (§7) |
 
 ## 4. Work ledger
 
@@ -101,6 +101,7 @@ None.
 | G-U12 (1.3) | `cargo test --test outage_liveness_test` | PASS | 10 passed (5 new client-side) | 1.3 diff | 2026-10-02 |
 | full `cargo test` (1.3) | `cargo test` | PASS (env-only red) | 1095 pass; only `vhost_entry_redirect_overrides_both` (port 19000 foreign pid 3179752, §9) | 1.3 diff | 2026-10-02 |
 | G-PHASE P3 (G-P3) | main tree at 91243d6 (uncommitted: only the 4.1/4.2 harness + workflow, not compiled): fmt; clippy default, `vpn,ssh-gateway`, all-features; all-features `--no-fail-fast` lib/bins/examples/tests (skip `t_ssh_`/`t_dmx_`); doc; ssh serial; web serial; no-default `transfer_link_test`; `cargo test --features ssh-gateway --no-fail-fast`; root `npm test`; `web/transfer` `npm run test:unit` | PASS (env-only red) | all-features 1415 passed, 1 failed = `vhost_entry_redirect_overrides_both` (port 19000, §9); doc 1/0; ssh serial 48/0; web serial 41/0; no-default 22/0; `--features ssh-gateway` 1294 passed, the same 1 env-only failure; npm 125/0; web unit 227/0; fmt + 3 clippy clean. (A first run was void: the root filesystem that holds /tmp hit ENOSPC mid-run (what filled it was not identified; ~36 GB of /tmp belongs to other projects' sessions) and every log came back empty; rerun after freeing this plan's own 14 GB isolated target) | HEAD 91243d6 | 2026-10-02 |
+| G-CI round 2 | push da621a1; `gh run list --branch dev` | PASS | all 5 workflows success (CI, E2E (netns), Docker (GHCR), Mean Bean CI, Mean Bean Deploy; Docker SSH client is path-filtered and not triggered — it was green on ac1beed). macos-14: `a_browser_that_stops_answering_pings_leaves_on_the_transport_deadline ... ok`, web_transfer_test 40 passed / 1 ignored; Fast link `T-FL-PERF` median ratio 1.056 PASS; ac1beed's Windows job also success | da621a1 | 2026-10-02 |
 | G-CI round 1 | push ac1beed; `gh run list --branch dev` | 4/6 green + 2 reds | Docker SSH client, Mean Bean CI, Docker (GHCR), Mean Bean Deploy, E2E (netns, includes the new `outage_netns_test` gate) success; CI red on (1) macOS VPN build: `a_browser_that_stops_answering_pings_leaves_on_the_transport_deadline` (rev 1m, fixed: 41/0 file, 15/15 + 10/10 under 32 busy loops on 16 cores, red-checked both ways) and (2) Fast link `T-FL-PERF` 0.990 (runner noise, rev 1m) | ac1beed | 2026-10-02 |
 | G-FINAL (P4) | `cargo fmt --check`; `cargo clippy --all-targets -- -D warnings`, `--all-targets --features vpn,ssh-gateway`, `--all-targets --all-features`, `--no-default-features` (lib+bins); `cargo test --no-fail-fast` default / `--features vpn` / `--features ssh-gateway`; `--no-default-features --test transfer_link_test`; web_transfer_test serially with `--all-features` (the CI form) | PASS (env-only red) | fmt + every clippy clean (no-default needed rev 1l(b)); default 1172 passed, vpn 1385, ssh-gateway 1293; the only failure common to all three is `vhost_entry_redirect_overrides_both` (port 19000, §9). Per-run load flakes, each re-verified: `t_web_peers` (default run) = a race in this plan's own 3.4 rework, fixed (rev 1l(a)) and then 41/0 serially + 2 x 41/0 in parallel; `admin_web_transfer_fields_are_additive_and_match_the_fixture` (vpn run, "Connection reset by peer", parallel — CI runs that binary serially) passes in those three runs; `transfer_confirm_timeout_rejects_only_when_the_answer_outlasts_the_bound` (ssh run; arm 2's sender reaches the relay 200 ms after spawning its listener) 3/3 on rerun — both predate the plan (84cd16d, 895041b). no-default `transfer_link_test` 22/0. `--no-default-features --all-targets` clippy: 59 errors in `src/holepunch.rs` unit tests (`spray` used without `cfg(feature = "udp")`), file untouched since f7b0745 and never built by CI — out of scope, not fixed | HEAD e7c6485 + rev 1l | 2026-10-02 |
 | G-NETNS-REG (4.2) | `sudo -n $PWD/scripts/<x>.sh`, serially, release `--features vpn,ssh-gateway` at 45e3f31 (includes rev 1k) | PASS | local_proxy_netns_test 16/0; secret_netns_test 34/0; vhost_netns_test 16/0; vpn_netns_test 172/0, 0 SKIP (T-PINMTU ran and passed this time: the control TUN moved 1350 -> 1414; on CI it was red before this plan, 171/1); ssh_gateway_test 21/0 (T-SSH-N1 cleared the half-open row after 15 s) | HEAD 45e3f31 | 2026-10-02 |

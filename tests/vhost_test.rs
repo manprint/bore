@@ -2381,6 +2381,88 @@ async fn vhost_udp_direct_budget_admits_its_slots_and_relays_the_rest() -> Resul
     Ok(())
 }
 
+/// A provider that ends must give its direct-path budget slot BACK (P-15).
+///
+/// Measured on staging 2026-10-10: 8 slots, 2 live pool members, 0 slots free
+/// for 8 days and 10 856 refusals, every one for a provider that had
+/// re-registered after a control-path reap. The admission permit is released
+/// only when the QUIC carrier closes, and `Deregister` never closed it: the
+/// client's direct task outlives its control session and keep-alives from
+/// both ends keep the connection up. One slot makes the leak binary. Red
+/// without the fix: the second provider is refused for the whole wait.
+#[cfg(feature = "udp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vhost_udp_an_ended_provider_returns_its_direct_budget_slot() -> Result<()> {
+    const CTRL: u16 = 18040;
+    const HTTP: u16 = 18041;
+    const QUIC: u16 = 18042;
+
+    let stub_port = spawn_http_stub("slot-returned").await;
+
+    wait_port(CTRL, false).await;
+    let mut server = Server::new(1024..=65535, Some("vhost-udp-secret"));
+    server.set_control_port(CTRL);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_udp(true);
+    server.set_vhost(http_config("bore.local", HTTP))?;
+    server.set_vhost_quic_port(QUIC);
+    server.set_udp_direct_slots(Some(1));
+    let registry = server.vhost_registry();
+    let refusals = server.direct_budget_refusals_atomic();
+    tokio::spawn(server.listen());
+    wait_port(CTRL, true).await;
+    wait_port(HTTP, true).await;
+
+    let ctrl_addr = format!("localhost:{CTRL}");
+    let provider = |label: &'static str| {
+        Client::new_vhost_provider_with_udp(
+            "127.0.0.1",
+            stub_port,
+            &ctrl_addr,
+            label,
+            label,
+            Some("vhost-udp-secret"),
+            false,
+            1,
+            true,
+            ProviderMeta::default(),
+            None,
+        )
+    };
+
+    let first_task = tokio::spawn(provider("leaka").await?.listen());
+    wait_for_vhost_direct_count(&registry, "leaka", 1).await;
+
+    // End the first registration; its direct task stays alive in this process,
+    // exactly like a reconnecting provider's does in the field.
+    first_task.abort();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while registry.get("leaka").is_some() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the server never deregistered the first provider"
+        );
+        time::sleep(Duration::from_millis(20)).await;
+    }
+
+    tokio::spawn(provider("leakb").await?.listen());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while registry.get("leakb").map(|e| e.direct.len()).unwrap_or(0) < 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the ended provider never returned its direct budget slot: the second \
+             provider stayed on the relay ({} refusals)",
+            refusals.load(Ordering::Relaxed)
+        );
+        time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let response = send_http(HTTP, "leakb.bore.local", "/").await?;
+    assert!(response.contains("slot-returned"), "{response}");
+    assert!(direct_stream_opens(&registry, "leakb") >= 1);
+    Ok(())
+}
+
 #[cfg(feature = "udp")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn vhost_udp_falls_back_when_server_udp_disabled() -> Result<()> {

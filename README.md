@@ -503,9 +503,29 @@ When it helps and when it doesn't:
 
 - **Helps** concurrent workloads: parallel `rclone`/S3/WebDAV transfers, browsers (many
   requests), streaming — especially on a lossy or high-latency link to the server.
-- **No change** for a single bulk transfer (one flow = one carrier). For single-flow
-  loss/high-BDP, tune the **host** instead: `sysctl net.ipv4.tcp_congestion_control=bbr`
-  (bore can't set per-socket congestion control without `unsafe`).
+- **No change** for a single bulk transfer (one flow = one carrier). One carrier is one TCP
+  connection, so it runs at most `window / RTT`, and the window is capped by the SENDING
+  side's `net.ipv4.tcp_wmem` max (and the receiver's `tcp_rmem` max). The common kernel
+  default of 4 MiB caps one carrier at ~610-720 Mbit/s at 35 ms RTT. Raise both ceilings on
+  **both** ends; the server's leg matters for downloads, the client's for uploads:
+
+  ```shell
+  # client host (and the server host when it runs on the host network)
+  printf '%s\n' 'net.ipv4.tcp_wmem = 4096 65536 16777216' \
+    'net.ipv4.tcp_rmem = 4096 131072 16777216' 'net.ipv4.tcp_slow_start_after_idle = 0' \
+    'net.core.rmem_max = 16777216' 'net.core.wmem_max = 16777216' \
+    | sudo tee /etc/sysctl.d/99-bore.conf && sudo sysctl --system
+  ```
+
+  For a server in a **bridge-network container**, `net.ipv4.tcp_*` are per network
+  namespace, so set them in compose (`sysctls:` with the same three keys);
+  `net.core.*` are global and must stay on the host. Measured 2026-10-10 on a 1 Gbit,
+  35 ms path (`IONOS_SERVER_VPC.md`): `--carriers 1` went from 527-733 to 930-938 Mbit/s
+  downstream with the server tuned, and from 575-625 to 716-747 Mbit/s upstream with the
+  client tuned too, which is line rate both ways with ONE carrier. These are ceilings, not
+  reservations: autotuning still grows only the sockets that need it. `bbr`
+  (`sysctl net.ipv4.tcp_congestion_control=bbr`) is the other host lever, for lossy paths;
+  bore can't set per-socket congestion control without `unsafe`.
 - The server is always in the relay data path, so this does **not** add bandwidth or bypass
   the server — it removes the single-TCP bottleneck on the relay leg only.
 
@@ -803,7 +823,13 @@ counter is history — how many carriers have been turned away since the server 
 the same endpoint also publishes `udp_direct_slots_available`, the number of slots free
 **right now** (`null` when no budget is configured). Read the two together: refusals rising
 with the gauge at 0 means the budget is the bound; refusals rising with slots free means
-they were taken and released. The CONFIGURED total is a separate thing and lives on
+they were taken and released. A slot is released when its direct connection closes, and
+the server now closes a tunnel's direct carriers the moment that tunnel deregisters (P-15).
+Servers up to v1.2.2 did not: the client's carriers outlived the session and kept each other
+alive with keep-alives, so every re-registration of a `--udp` tunnel leaked its slots until
+the gauge sat at 0 and every new direct carrier was refused — a server showing
+`udp_direct_slots_available: 0` with far fewer live direct carriers than slots has that
+leak, and a restart clears it until the fixed version is deployed. The CONFIGURED total is a separate thing and lives on
 `/admin/api/v1/config` as `udp_direct_slots`, where it never moves with load. A
 budget too small to hold every carrier is still honoured, and says so at startup with the
 figure that would hold them all — note that the figure it names raises the BUDGET, and on a

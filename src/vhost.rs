@@ -596,15 +596,32 @@ pub type PendingVhostUdp = Arc<DashMap<String, [u8; UDP_NONCE_LEN]>>;
 pub type SharedVhostConfig = Arc<RwLock<Arc<VhostConfig>>>;
 
 /// Removes a vhost provider registration when the provider connection ends.
+///
+/// It owns the `entry` it installed and CLOSES that entry's direct pool, the
+/// way `SshJumpDeregister` always has (P-15). A registration that ends does
+/// not end its QUIC carriers: the client's direct tasks outlive the control
+/// session that spawned them, and both ends keep the connection alive with
+/// keep-alives, so each carrier went on holding its `--udp-memory-budget`
+/// admission permit for as long as the provider PROCESS lived. MEASURED on
+/// staging 2026-10-10: 8 slots, 2 live pool members, 0 slots free for 8
+/// days, 10 856 refusals — every one of them a provider that had
+/// re-registered after a control-path reap and whose new carriers found the
+/// budget held by its own previous registration.
 struct Deregister {
     registry: VhostRegistry,
     pending_udp: Option<PendingVhostUdp>,
     subdomain: String,
+    entry: Arc<VhostEntry>,
 }
 
 impl Drop for Deregister {
     fn drop(&mut self) {
-        self.registry.remove(&self.subdomain);
+        #[cfg(feature = "udp")]
+        self.entry.direct.close_all();
+        // Only OUR entry: never what the label resolves to now (P-14's rule).
+        self.registry.remove_if(&self.subdomain, |_, current| {
+            Arc::ptr_eq(current, &self.entry)
+        });
         if let Some(pending) = &self.pending_udp {
             pending.remove(&self.subdomain);
         }
@@ -968,7 +985,7 @@ pub async fn serve_vhost_provider(
     ));
 
     // Atomic insert: reject if subdomain already live.
-    let pool = match registry.entry(subdomain.clone()) {
+    let (pool, entry) = match registry.entry(subdomain.clone()) {
         Entry::Occupied(_) => {
             warn!("vhost subdomain already in use");
             control
@@ -1012,8 +1029,8 @@ pub async fn serve_vhost_provider(
                 transport: crate::admin::Transport::Bore,
                 identity: None,
             });
-            slot.insert(entry);
-            pool
+            slot.insert(Arc::clone(&entry));
+            (pool, entry)
         }
     };
     let _guard = Deregister {
@@ -1024,6 +1041,7 @@ pub async fn serve_vhost_provider(
             None
         },
         subdomain: subdomain.clone(),
+        entry,
     };
 
     // Compute effective admin display flags.

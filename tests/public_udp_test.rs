@@ -670,3 +670,112 @@ async fn a_reregistered_tunnel_keeps_its_carrier_when_the_previous_one_closes() 
 
     Ok(())
 }
+
+/// A tunnel that ends must give its direct-path budget slot BACK (P-15).
+///
+/// THE DEFECT THIS REFUSES (measured on staging 2026-10-10: 8 slots, 2 live
+/// pool members, 0 slots free for 8 days, 10 856 refusals). The admission
+/// permit is released only when the QUIC connection closes, and nothing closed
+/// it when the registration ended: the client's direct task outlives its
+/// control session (the reason the P-14 test above has to close the old pool by
+/// hand) and keep-alives from both ends keep the connection up, so a
+/// deregistered tunnel held its slot for as long as the client process lived.
+/// Every later `--udp` carrier on the server was then refused.
+///
+/// One slot makes the leak binary: the first tunnel takes it, ends, and the
+/// second tunnel can only go direct if the first one's carrier was closed. Red
+/// without the fix: the second tunnel's carriers are refused for the whole
+/// wait and the refusal counter climbs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ended_tunnel_returns_its_direct_budget_slot() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+
+    wait_for_control_port(false).await;
+    let mut server = Server::new(1024..=65535, None);
+    server.set_udp(true);
+    let quic_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let quic_port = quic_listener.local_addr()?.port();
+    drop(quic_listener);
+    server.set_vhost_quic_port(quic_port);
+    server.set_udp_direct_slots(Some(1));
+    let reg = server.public_udp_registry();
+    let refusals = server.direct_budget_refusals_atomic();
+    tokio::spawn(server.listen());
+    wait_for_control_port(true).await;
+
+    let echo_port = spawn_echo_service().await?;
+    let opts = || bore_cli::shared::TunnelOptions {
+        ctrl_heartbeat_ms: 0,
+        preferred_port: None,
+        https: false,
+        force_https: false,
+        basic_auth: None,
+        notes: None,
+        carriers: 1,
+        udp: true,
+        auto_reconnect: false,
+        webserver_log: false,
+        max_conns: 0,
+        local_host: None,
+        local_port: 0,
+        https_policy: None,
+        ctrl_heartbeat: false,
+    };
+
+    let first = Client::new(
+        "localhost",
+        echo_port,
+        "localhost",
+        0,
+        None,
+        false,
+        opts(),
+        None,
+    )
+    .await?;
+    let first_port = first.remote_port();
+    let first_task = tokio::spawn(first.listen());
+    wait_for_direct_carrier(&reg, first_port, 1).await;
+
+    // End the first tunnel's registration. Its direct task stays alive in this
+    // process, exactly like a reconnecting client's does in the field.
+    first_task.abort();
+    let deadline = time::Instant::now() + Duration::from_secs(5);
+    while reg.get(&format!("port:{first_port}")).is_some() {
+        assert!(
+            time::Instant::now() < deadline,
+            "the server never deregistered the first tunnel"
+        );
+        time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // A different tunnel must now be able to take the one slot.
+    let second = Client::new(
+        "localhost",
+        echo_port,
+        "localhost",
+        0,
+        None,
+        false,
+        opts(),
+        None,
+    )
+    .await?;
+    let second_port = second.remote_port();
+    let _second_task = tokio::spawn(second.listen());
+    let deadline = time::Instant::now() + Duration::from_secs(20);
+    while direct_carriers(&reg, second_port) < 1 {
+        assert!(
+            time::Instant::now() < deadline,
+            "the ended tunnel never returned its direct budget slot: the second \
+             tunnel stayed on the relay ({} refusals)",
+            refusals.load(std::sync::atomic::Ordering::Relaxed)
+        );
+        time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let addr: std::net::SocketAddr = ([127, 0, 0, 1], second_port).into();
+    assert_eq!(round_trip(addr, b"slot-returned").await?, b"slot-returned");
+    assert!(direct_opens(&reg, second_port) > 0);
+    Ok(())
+}

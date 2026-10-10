@@ -117,18 +117,26 @@ pub struct PublicDirectStats {
 #[cfg(feature = "udp")]
 pub type PublicUdpRegistry = Arc<DashMap<String, Arc<PublicDirectEntry>>>;
 
-/// Removes a public-tunnel UDP direct registry entry when the tunnel ends.
+/// Removes a public-tunnel UDP direct registry entry when the tunnel ends,
+/// and CLOSES that entry's direct pool (P-15, same defect and same fix as the
+/// vhost `Deregister`): the client's direct tasks outlive its control
+/// session, so an unclosed carrier kept its `--udp-memory-budget` permit for
+/// as long as the client process lived.
 #[cfg(feature = "udp")]
 struct PublicDeregister {
     registry: Arc<DashMap<String, Arc<PublicDirectEntry>>>,
     pending_udp: Arc<DashMap<String, [u8; crate::shared::UDP_NONCE_LEN]>>,
     key: String,
+    entry: Arc<PublicDirectEntry>,
 }
 
 #[cfg(feature = "udp")]
 impl Drop for PublicDeregister {
     fn drop(&mut self) {
-        self.registry.remove(&self.key);
+        self.entry.direct.close_all();
+        // Only OUR entry: a re-registration on the same port owns a fresh one.
+        self.registry
+            .remove_if(&self.key, |_, current| Arc::ptr_eq(current, &self.entry));
         self.pending_udp.remove(&self.key);
     }
 }
@@ -1919,6 +1927,9 @@ impl Server {
                                                     }
                                                 } else {
                                                     debug!(%alias, "SSH jump QUIC connection arrived after provider deregistered");
+                                                    // Close it: the admission watcher holds a clone, so merely
+                                                    // dropping ours would keep it -- and its budget permit -- alive (P-15).
+                                                    direct.close();
                                                 }
                                             // Check if this is a public tunnel (port:N key) or vhost (subdomain key)
                                             } else if key.starts_with("port:") {
@@ -1965,6 +1976,9 @@ impl Server {
                                                         }
                                                     } else {
                                                         debug!(key = %key, "public QUIC connection arrived after tunnel deregistered");
+                                                        // Close it: the admission watcher holds a clone, so merely
+                                                        // dropping ours would keep it -- and its budget permit -- alive (P-15).
+                                                        direct.close();
                                                     }
                                                 }
                                             } else {
@@ -2002,6 +2016,9 @@ impl Server {
                                                     }
                                                 } else {
                                                     debug!("vhost QUIC connection arrived after provider deregistered");
+                                                    // Close it: the admission watcher holds a clone, so merely
+                                                    // dropping ours would keep it -- and its budget permit -- alive (P-15).
+                                                    direct.close();
                                                 }
                                             }
                                         }
@@ -3123,7 +3140,8 @@ impl Server {
                 direct_fallbacks: std::sync::atomic::AtomicU64::new(0),
                 last_path: std::sync::atomic::AtomicU8::new(vhost::VHOST_PATH_UNKNOWN),
             });
-            self.public_udp_registry.insert(key.clone(), entry);
+            self.public_udp_registry
+                .insert(key.clone(), Arc::clone(&entry));
 
             // Offer the direct path to the client. Uses the same helper the
             // renewal arm below uses, so a renewed offer can never drift from
@@ -3144,6 +3162,7 @@ impl Server {
                 registry: Arc::clone(&self.public_udp_registry),
                 pending_udp: Arc::clone(&self.pending_public_udp),
                 key,
+                entry,
             })
         } else {
             None

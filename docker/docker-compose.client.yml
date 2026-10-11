@@ -32,6 +32,15 @@ services:
     # means publishing 80/udp alongside the HTTP frontend:
     # command: ["vhost", "127.0.0.1:8080", "--subdomain", "app", "--id", "my-client", "--udp"]
     restart: unless-stopped
+    # HOST TUNING (optional; IONOS_SERVER_VPC.md sections 2.3 and 3.8). With
+    # `network_mode: host` Docker refuses `net.*` sysctls, so bandwidth tuning
+    # lives on the HOST: /etc/sysctl.d with tcp_wmem/tcp_rmem max 16 MiB,
+    # tcp_slow_start_after_idle 0 and net.core.rmem_max/wmem_max 16 MiB (the
+    # last two are what --udp needs). A downloader never needs bbr; a PROVIDER
+    # whose uplink loses packets (Wi-Fi, 4G) may set
+    # net.ipv4.tcp_congestion_control=bbr on the host -- measured +4 % on a
+    # good Wi-Fi uplink, more expected on a worse one. Switch to a bridge
+    # network instead and the same keys go under `sysctls:` here.
     network_mode: host
     # volumes:
     #   - ./logs:/logs:rw   # BORE_WEBSERVER_LOG

@@ -33,6 +33,32 @@ services:
     restart: unless-stopped
     networks:
       - bore
+    # HOST TCP TUNING (IONOS_SERVER_VPC.md sections 2-3). `net.ipv4.tcp_*` is
+    # per network namespace: a bridge container sets it for itself and nothing
+    # else on the host changes. MEASURED 2026-10-10/11:
+    #   - tcp_wmem/tcp_rmem max 16 MiB + no slow start after idle: ONE carrier
+    #     went from 527-733 to 930-938 Mbit/s downstream on a clean 1 Gbit,
+    #     35 ms path (the 4 MiB kernel default caps one flow at window/RTT).
+    #   - bbr: ONE download to a client on a LOSSY last mile (Wi-Fi, 4G) went
+    #     from 31.4 to 57.6 MB/s through a vhost (median of 7 interleaved
+    #     pairs), 27.0 -> 62.3 with --udp, 32.7 -> 69.2 through a public
+    #     tunnel, and uploads INTO a provider on Wi-Fi 32.1 -> 81.4. cubic
+    #     reads every loss as congestion: a "~30 MB/s download cap" on Wi-Fi
+    #     clients is cubic, not bore. bbr acts only on what the server SENDS
+    #     over TCP; QUIC direct paths have their own controller
+    #     (BORE_DIRECT_QUIC_CC) and a clean wired path gains nothing.
+    # The kernel autoloads tcp_bbr when Docker writes the sysctl. A kernel
+    # WITHOUT bbr refuses the write and the container does NOT start ("failed
+    # to write sysctl net.ipv4.tcp_congestion_control"): check
+    # `modinfo tcp_bbr` on the host, or drop that line.
+    # Docker refuses `net.*` sysctls with `network_mode: host`: in that case
+    # comment this block out and set the same keys on the HOST instead
+    # (README, "Host tuning for bandwidth").
+    sysctls:
+      net.ipv4.tcp_wmem: "4096 65536 16777216"
+      net.ipv4.tcp_rmem: "4096 131072 16777216"
+      net.ipv4.tcp_slow_start_after_idle: "0"
+      net.ipv4.tcp_congestion_control: "bbr"
 
     # FILE DESCRIPTORS vs BORE_MAX_CONNS (P-12). The --max-conns semaphore
     # promises a GRACEFUL bound: at capacity one connection is dropped,
@@ -205,7 +231,14 @@ services:
       # - BORE_UDP_MAX_STREAMS=4096
       # Recommended instead of the three window variables: one server-wide ceiling
       # on the memory the direct UDP path may commit. Measured 2026-09-11: peak
-      # server RSS 340.4 -> 42.2 MiB with 48 slow readers, at no throughput cost.
+      # server RSS 340.4 -> 42.2 MiB with 48 slow readers, at no throughput cost
+      # for a consumer on a clean path.
+      # 2026-10-11 COUNTER-MEASUREMENT (IONOS_SERVER_VPC.md section 6.4): the
+      # window DOES cost when the PROVIDER sits on Wi-Fi, because the server is
+      # the RECEIVER of that QUIC leg. One stream from a Wi-Fi provider, ~50 ms
+      # RTT under load, 6 interleaved reps each: stream window 4 MiB 51.2 MB/s,
+      # 8 MiB 67.8, 16 MiB 69.0. If providers are on Wi-Fi keep
+      # budget / BORE_MAX_CARRIERS >= 128 MiB (stream window >= 8 MiB).
       # Conflicts with the three windows above; derives them from this one number.
       # - BORE_UDP_MEMORY_BUDGET=512MiB
 
@@ -358,4 +391,5 @@ services:
 
     # Linux production alternative when Docker bridge NAT breaks STUN/reflexive UDP:
     # network_mode: host
-    # In that case comment out `networks:` and the whole `ports:` block.
+    # In that case comment out `networks:`, `sysctls:` (set those keys on the host
+    # instead) and the whole `ports:` block.

@@ -45,6 +45,7 @@ frills attached.
   - [HTTPS on the tunnel port](#https-on-the-tunnel-port)
   - [WebSocket support](#websocket-support)
 - [Self-hosting (`bore server`)](#self-hosting)
+  - [Host tuning for bandwidth](#host-tuning-for-bandwidth)
   - [Nginx on ports 80/443](#nginx-on-ports-80443)
   - [Full server flag reference](#full-server-flag-reference)
   - [Serving over HTTPS/HTTP](#serving-over-httpshttp)
@@ -523,9 +524,14 @@ When it helps and when it doesn't:
   35 ms path (`IONOS_SERVER_VPC.md`): `--carriers 1` went from 527-733 to 930-938 Mbit/s
   downstream with the server tuned, and from 575-625 to 716-747 Mbit/s upstream with the
   client tuned too, which is line rate both ways with ONE carrier. These are ceilings, not
-  reservations: autotuning still grows only the sockets that need it. `bbr`
-  (`sysctl net.ipv4.tcp_congestion_control=bbr`) is the other host lever, for lossy paths;
-  bore can't set per-socket congestion control without `unsafe`.
+  reservations: autotuning still grows only the sockets that need it.
+- **No change** either when the receiving end's last mile **loses packets** (Wi-Fi, 4G): there
+  the single flow is capped by the sender's congestion controller, not by its window. The
+  kernel default `cubic` reads every loss as congestion; measured 2026-10-11, one download
+  through a vhost to a Wi-Fi client sat at 31.4 MB/s with `cubic` and reached 57.6 MB/s with
+  `bbr` in the server's network namespace — the same on the relay and with `--udp`. The
+  lever is the server's `net.ipv4.tcp_congestion_control`, not `--carriers`; see
+  [Host tuning for bandwidth](#host-tuning-for-bandwidth).
 - The server is always in the relay data path, so this does **not** add bandwidth or bypass
   the server — it removes the single-TCP bottleneck on the relay leg only.
 
@@ -675,6 +681,14 @@ controller that holds 37 MB in flight against a ~940 KiB BDP is being flattered 
 bottleneck that never drops; and a loss-based controller that is measured only on a
 `lost_pct=0.00` link has not been measured on the case it is worst at. On a link you have
 qualified as clean, `BORE_DIRECT_QUIC_CC=newreno` is worth the 3 %.
+
+**The lossy-path measurement, 2026-10-11** (`IONOS_SERVER_VPC.md` §6.4): one QUIC stream over a
+Wi-Fi last mile, 3 interleaved repetitions per arm, MB/s. Provider on Wi-Fi sending to the
+server: `bbr` 58.2/60.1/61.2, `cubic` 60.6/47.1/52.9, `newreno` 59.7/62.3/59.9. Server sending
+to a provider on Wi-Fi: `bbr` 61.4/49.2/65.1, `cubic` 63.8/63.2/47.3. No controller separates
+from the Wi-Fi's own noise in either direction, so the default stays `bbr`; on that path the
+bound that did move the result was the receiver's stream window
+([above](#udp-memory-budget-on-wi-fi)).
 
 **Direct-path segmentation offload (`BORE_DIRECT_QUIC_GSO`, default on).**
 `BORE_DIRECT_QUIC_GSO=0` disables UDP GSO. GSO is what makes this path cheap (one
@@ -861,6 +875,25 @@ direct stream at 376.79 Mbit/s against the 438 Mbit/s the window allows, with qu
 reporting `loss 0 pkts` and a congestion window ten times the receive window — flow control,
 not the network — and reported the direct path as *slower* than the TCP relay on the same
 pair.
+
+<a id="udp-memory-budget-on-wi-fi"></a>**On Wi-Fi the window binds at a much larger size, and on
+the PROVIDER's leg.** When the provider sends over QUIC (every download from a `--udp` tunnel),
+the server is the receiver, so it is the server's stream window that limits one connection,
+and Wi-Fi raises the RTT under load to ~50 ms. Measured 2026-10-11 (`IONOS_SERVER_VPC.md`
+§6.4), provider on a good Wi-Fi uplink, one stream, 6 interleaved repetitions per arm:
+
+| server | stream window | slots | median |
+|---|---|---|---|
+| `--udp-memory-budget 512MiB --max-carriers 8` | 4 MiB | 8 | 51.2 MB/s |
+| `--udp-memory-budget 512MiB --max-carriers 4` | 8 MiB | 4 | **67.8 MB/s** |
+| no budget | 16 MiB | unbounded | 69.0 MB/s |
+
+On the same path the server's CPU, the UDP buffers (zero `RcvbufErrors`/`SndbufErrors` at both
+ends), the path MTU (1452-byte datagrams) and `BORE_DIRECT_QUIC_CC` (`bbr`, `cubic` and
+`newreno` within noise, in both directions) were all ruled out. If providers sit on Wi-Fi,
+keep `budget / --max-carriers` at 128 MiB or more (an 8 MiB stream window); because slots
+equal `--max-carriers` until the window reaches its clamps, a budget buys EITHER more slots
+OR bigger windows, and both at once cost memory: 16 slots of 128 MiB is a 2 GiB budget.
 
 Whenever the derived stream window falls below the tested default, the server warns at
 startup with the MB/s figures at both reference RTTs and three remedies: lower
@@ -1102,6 +1135,71 @@ The control port also serves the browser surface of
 started with `--web-transfer-base-url`; no additional port is bound for it. That stays
 true when two browsers transfer **directly**: the WebRTC path runs between them and
 needs outbound UDP from each, never an inbound port on the server.
+
+### Host tuning for bandwidth
+
+bore inherits the kernel's TCP behaviour: on each socket it sets only `TCP_NODELAY` and
+keepalive, never buffer sizes (that would switch off the kernel's buffer autotuning) and
+never the congestion controller. Two host settings decide how fast ONE connection goes, and
+both were measured on a 2 vCPU / 1.8 GB VM (`IONOS_SERVER_VPC.md`):
+
+| Setting | What it removes | Measured |
+|---|---|---|
+| `tcp_wmem`/`tcp_rmem` max 16 MiB, `tcp_slow_start_after_idle=0` | the **window** cap on a clean, high bandwidth-delay path (the 4 MiB kernel default caps one flow at `window / RTT`) | one carrier downstream 527–733 → **930–938 Mbit/s** (1 Gbit, 35 ms, wired client) |
+| `tcp_congestion_control=bbr` | the **loss** cap when the receiving end's last mile drops packets (Wi-Fi, 4G); `cubic` reads every loss as congestion | to a Wi-Fi client, one connection: vhost relay 31.4 → **57.6 MB/s** (median of 7 interleaved pairs), vhost `--udp` 27.0 → **62.3**, public tunnel 32.7 → **69.2**; upload into a provider on Wi-Fi 32.1 → **81.4** |
+
+A "download cap around 30 MB/s" that is the same on the relay and with `--udp`, and the same
+on two different servers, is the second row: the server's `cubic` talking to a lossy client.
+
+**Server in a bridge-network container** — `net.ipv4.tcp_*` is per network namespace, so the
+container sets it for itself and nothing else on the host changes:
+
+```yaml
+    sysctls:
+      net.ipv4.tcp_wmem: "4096 65536 16777216"
+      net.ipv4.tcp_rmem: "4096 131072 16777216"
+      net.ipv4.tcp_slow_start_after_idle: "0"
+      net.ipv4.tcp_congestion_control: "bbr"
+```
+
+The kernel loads `tcp_bbr` on its own when Docker writes the sysctl. A kernel **without** bbr
+refuses the write and the container does not start (`failed to write sysctl
+net.ipv4.tcp_congestion_control`): check with `modinfo tcp_bbr` first, or drop that line.
+The three server examples in `docker/` ship this block.
+
+**Server on the host network or as a native binary** — Docker refuses `net.*` sysctls with
+`network_mode: host`, so the same keys go on the host (and become the default for every
+program on it), together with the UDP ceilings `--udp` needs, which are global and can never
+be set from a container:
+
+```shell
+echo tcp_bbr | sudo tee /etc/modules-load.d/bbr.conf
+sudo tee /etc/sysctl.d/99-bore.conf <<'EOF'
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.tcp_rmem = 4096 131072 16777216
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+EOF
+sudo sysctl --system
+```
+
+**What `bbr` on the server covers.** A congestion controller acts only on the side that
+SENDS, so the server's setting improves every TCP leg the server sends on, when the other end
+is lossy: downloads from vhosts and public tunnels (relay and `--udp` alike — the downloader
+always speaks TCP to the server), the server → provider leg of an upload into a home provider,
+secret-tunnel relay legs, the SSH gateway and jump host toward the ssh client, fast-link and
+`bore transfer` relay downloads, the web-transfer relay WebSocket and the VPN relay's outer
+carrier. It does **not** touch QUIC direct paths (quinn has its own controller,
+`BORE_DIRECT_QUIC_CC`), WebRTC, or anything a client sends toward the server; and on a clean
+wired path `cubic` is already at line rate, so it changes nothing there.
+
+**Clients.** Use the same buffer values (`docker/docker-compose.client.yml` explains where they
+go). A client that only downloads never needs `bbr`. A provider whose own uplink loses packets
+may set it: measured +4 % on a good Wi-Fi uplink, more expected on a worse one. A provider on
+Wi-Fi using `--udp` depends instead on the **server's** QUIC stream window, see
+[`--udp-memory-budget`](#udp-memory-budget-on-wi-fi).
 
 ### Nginx on ports 80/443
 
@@ -4435,7 +4533,9 @@ matching credential label; existing gateway modes remain username-agnostic. See
 | `/admin/status` doesn't respond | `--admin-token` unset or < 32 chars, or wrong port/scheme | Set a token ≥ 32 chars; use the right scheme (`http`/`https`) and control port. |
 | Admin token rejected by the page | Wrong token | Re-enter the exact value passed to `--admin-token`. |
 | `--carriers N` doesn't seem to open N connections | Server's `--max-carriers` is lower (applies to public tunnels and providers) | Raise `--max-carriers` on the server. The consumer (`bore proxy`) opens its own, not capped by the server. |
-| `--carriers` doesn't speed up a single download | One flow uses one carrier (the pool helps concurrency, not a single stream) | Set `bbr` on the host: `sysctl net.ipv4.tcp_congestion_control=bbr`. |
+| `--carriers` doesn't speed up a single download | One flow uses one carrier (the pool helps concurrency, not a single stream) | Raise the TCP buffer ceilings on the sending side; for a lossy client see the next row. [Host tuning for bandwidth](#host-tuning-for-bandwidth). |
+| One download to a Wi-Fi/4G client stops around 30 MB/s, the same on the relay and with `--udp`, while uploads are fine | The server's TCP congestion controller (`cubic`) halves its window on every loss of the client's last mile | Set `net.ipv4.tcp_congestion_control=bbr` for the server (compose `sysctls:` or host `/etc/sysctl.d`). Measured 31.4 → 57.6 MB/s. Nothing to change on the downloading client. [Host tuning for bandwidth](#host-tuning-for-bandwidth). |
+| A `--udp` provider on Wi-Fi uploads slower than the relay | `--udp-memory-budget` divided by `--max-carriers` gave the server a small stream window (the startup warning names it) | Keep `budget / --max-carriers` ≥ 128 MiB, or lower `--max-carriers`. Measured 51.2 → 67.8 MB/s from 4 to 8 MiB. [Details](#udp-memory-budget-on-wi-fi). |
 | `tcp-secret-id '<id>' already in use` | A provider with that id already exists | An id has one provider at a time: pick a different id or stop the existing provider (multiple **consumers** are fine). |
 | Basic-auth credentials travel in the clear | Tunnel/control not encrypted | Use a TLS server and `--https` on the public tunnel. |
 | Connections refused under load | `--max-conns` reached | Raise `--max-conns` (server and/or provider). |

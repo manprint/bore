@@ -318,9 +318,10 @@ Implicazioni:
 
 ## Sysctl host per relay TCP
 
-Questi parametri contano per il **relay TCP** e i tunnel pubblici. Sono meglio
-impostati sull'host, non nel compose, perche il supporto ai sysctl network dentro
-container varia e con `network_mode: host` alcuni non sono namespaced.
+Questi parametri contano per il **relay TCP** e i tunnel pubblici. Con
+`network_mode: host` o con il binario nativo vanno impostati sull'host; con un
+container su rete bridge le chiavi `net.ipv4.tcp_*` vanno invece nel compose
+(vedi sotto), mentre `net.core.*` resta sempre sull'host.
 
 Per il direct UDP, bore richiede autonomamente buffer UDP piu ampi sul socket. Se
 il kernel limita `rmem_max`/`wmem_max`, il valore effettivo puo essere piu basso:
@@ -362,6 +363,20 @@ sysctl net.ipv4.tcp_congestion_control
 
 Se BBR non compare, serve un kernel/modulo che lo supporti. Su alcuni VPS basta
 `modprobe tcp_bbr`; su altri non e disponibile.
+
+**Misurato 2026-10-11** (`IONOS_SERVER_VPC.md` §3, README "Host tuning for
+bandwidth"): `bbr` sul server porta un singolo download verso un client in Wi-Fi
+da 31.4 a 57.6 MB/s (vhost relay, mediana di 7 coppie alternate), da 27.0 a
+62.3 MB/s con `--udp`, e l'upload verso un provider in Wi-Fi da 32.1 a 81.4 MB/s.
+Agisce solo sulle tratte TCP in cui il server invia; su un percorso cablato
+pulito non cambia nulla.
+
+**Server in container con rete bridge:** le chiavi `net.ipv4.tcp_*` (compreso
+`tcp_congestion_control`) sono per network namespace, quindi vanno nel compose
+sotto `sysctls:`, come nei tre esempi server in `docker/`. Restano sull'host solo
+`net.core.*` (globali) e, con `network_mode: host`, tutto il resto. Il kernel
+carica `tcp_bbr` da solo quando Docker scrive la sysctl; se il kernel non ha
+`bbr`, la scrittura fallisce e il container non parte.
 
 ## Porte e firewall
 

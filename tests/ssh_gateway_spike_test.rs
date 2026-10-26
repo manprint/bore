@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use lazy_static::lazy_static;
 use russh::keys::{PrivateKey, PublicKey};
-use russh::server::{run_stream, Auth, Config, Handler, Msg, Session};
+use russh::server::{run_stream, Auth, Config, Handler, Msg, Session, VerifiedPublicKey};
 use russh::{Channel, ChannelId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -156,8 +156,8 @@ struct AuthOnlyHandler {
 impl Handler for AuthOnlyHandler {
     type Error = anyhow::Error;
 
-    async fn auth_publickey(&mut self, _user: &str, public_key: &PublicKey) -> Result<Auth> {
-        if public_key.key_data() == self.accepted.key_data() {
+    async fn auth_publickey(&mut self, _user: &str, key: VerifiedPublicKey<'_>) -> Result<Auth> {
+        if key.public_key.key_data() == self.accepted.key_data() {
             Ok(Auth::Accept)
         } else {
             Ok(Auth::reject())
@@ -270,8 +270,8 @@ struct ForwardHandler {
 impl Handler for ForwardHandler {
     type Error = anyhow::Error;
 
-    async fn auth_publickey(&mut self, _user: &str, public_key: &PublicKey) -> Result<Auth> {
-        Ok(if public_key.key_data() == self.accepted.key_data() {
+    async fn auth_publickey(&mut self, _user: &str, key: VerifiedPublicKey<'_>) -> Result<Auth> {
+        Ok(if key.public_key.key_data() == self.accepted.key_data() {
             Auth::Accept
         } else {
             Auth::reject()
@@ -379,8 +379,8 @@ struct DirectTcpipHandler {
 impl Handler for DirectTcpipHandler {
     type Error = anyhow::Error;
 
-    async fn auth_publickey(&mut self, _user: &str, public_key: &PublicKey) -> Result<Auth> {
-        Ok(if public_key.key_data() == self.accepted.key_data() {
+    async fn auth_publickey(&mut self, _user: &str, key: VerifiedPublicKey<'_>) -> Result<Auth> {
+        Ok(if key.public_key.key_data() == self.accepted.key_data() {
             Auth::Accept
         } else {
             Auth::reject()
@@ -519,8 +519,8 @@ struct ExecEnvHandler {
 impl Handler for ExecEnvHandler {
     type Error = anyhow::Error;
 
-    async fn auth_publickey(&mut self, _user: &str, public_key: &PublicKey) -> Result<Auth> {
-        Ok(if public_key.key_data() == self.accepted.key_data() {
+    async fn auth_publickey(&mut self, _user: &str, key: VerifiedPublicKey<'_>) -> Result<Auth> {
+        Ok(if key.public_key.key_data() == self.accepted.key_data() {
             Auth::Accept
         } else {
             Auth::reject()
@@ -636,8 +636,8 @@ struct KeepaliveHandler {
 impl Handler for KeepaliveHandler {
     type Error = anyhow::Error;
 
-    async fn auth_publickey(&mut self, _user: &str, public_key: &PublicKey) -> Result<Auth> {
-        Ok(if public_key.key_data() == self.accepted.key_data() {
+    async fn auth_publickey(&mut self, _user: &str, key: VerifiedPublicKey<'_>) -> Result<Auth> {
+        Ok(if key.public_key.key_data() == self.accepted.key_data() {
             Auth::Accept
         } else {
             Auth::reject()

@@ -490,11 +490,19 @@ aarch64-musl, android via NDK).
   rely on `--basic-auth` to gate raw-TCP services. HTTP is recognised by request-line shape
   (`token SP ...`), never by a method list, and a silent connection is closed rather than
   forwarded (fail-closed; `basicauth::sniff`/`gate`).
-- **The vendored russh carries security backports (`crates/russh/HOL_FIX.md`, "Third
-  vendored delta").** Nested-certificate depth guard (GHSA-3hm4, pre-auth process abort),
-  clamped X25519 + zero-shared-secret rejection (GHSA-5xvq), `pty-req` mode bound
-  (GHSA-cqjc), and `max_auth_attempts` enforcement (GHSA-g6xm). Because the cap is now
-  real, `sshgw::SSH_MAX_AUTH_ATTEMPTS` is 6 (OpenSSH's `MaxAuthTries`): the `none` probe
+- **The vendored russh is now pristine 0.65.0 + two local deltas (`crates/russh/HOL_FIX.md`).**
+  The security fixes that were backported into 0.62.1 (nested-certificate depth guard
+  GHSA-3hm4, clamped X25519 + zero-shared-secret rejection GHSA-5xvq, `pty-req` mode bound
+  GHSA-cqjc, `max_auth_attempts` enforcement GHSA-g6xm) are native in 0.65.0; the backport
+  diff is retired. The two remaining deltas (per-channel HOL fix from Eugeny/russh#730,
+  close-wake + abortable sessions for I-SSH10) were re-ported onto the pristine 0.65.0
+  tree, with no change to the ssh-gateway's observable behaviour. The only bore-side
+  change is the `Handler::auth_publickey` signature (`VerifiedPublicKey<'_>`; the
+  authorized-keys decision lives in `GatewayHandler::check_public_key`, same rules as
+  before). 0.65 no longer counts public-key *probes* (`auth_publickey_offered`) toward
+  `max_auth_attempts`; bore keeps the default (accept the offer) so every unauthorized key
+  is still rejected at the signature stage and counted. Because the cap is real,
+  `sshgw::SSH_MAX_AUTH_ATTEMPTS` is 6 (OpenSSH's `MaxAuthTries`): the `none` probe
   plus each unauthorized key counts, and 3 would disconnect multi-key clients
   (`t_ssh_authcap1_*`/`t_ssh_authcap2_*`). `env_request` keeps at most
   `SSH_MAX_ENV_REQUESTS` (64) variables per connection. The tokio runtime's workers run

@@ -72,9 +72,6 @@ impl KexAlgorithmImplementor for Curve25519Kex {
             pubkey
         };
 
-        // Clamped X25519 (RFC 7748): the scalar is a multiple of 8, so a
-        // small-subgroup point yields the identity instead of leaking our
-        // secret modulo the cofactor.
         let server_secret = rand::random::<[u8; 32]>();
         let server_pubkey = MontgomeryPoint::mul_base_clamped(server_secret);
 
@@ -84,9 +81,8 @@ impl KexAlgorithmImplementor for Curve25519Kex {
             .server_ephemeral
             .extend_from_slice(&server_pubkey.0);
         let shared = client_pubkey.mul_clamped(server_secret);
-        // A low-order client point makes the shared secret all-zero, i.e.
-        // independent of our secret (GHSA-5xvq): reject it.
         if shared.0 == [0u8; 32] {
+            // Non-contributory: the client sent a low-order point.
             debug!("client sent a low-order curve25519 pubkey");
             return Err(crate::Error::Kex);
         }
@@ -116,7 +112,6 @@ impl KexAlgorithmImplementor for Curve25519Kex {
 
     fn compute_shared_secret(&mut self, remote_pubkey_: &[u8]) -> Result<(), crate::Error> {
         let local_secret = self.local_secret.take().ok_or(crate::Error::KexInit)?;
-        // `clone_from_slice` panics on a length mismatch; the peer controls it.
         if remote_pubkey_.len() != 32 {
             return Err(crate::Error::Kex);
         }
@@ -124,6 +119,7 @@ impl KexAlgorithmImplementor for Curve25519Kex {
         remote_pubkey.0.clone_from_slice(remote_pubkey_);
         let shared = remote_pubkey.mul_clamped(local_secret);
         if shared.0 == [0u8; 32] {
+            // Non-contributory: the server sent a low-order point.
             debug!("server sent a low-order curve25519 pubkey");
             return Err(crate::Error::Kex);
         }
@@ -201,61 +197,38 @@ mod tests {
         payload
     }
 
-    fn fresh() -> Curve25519Kex {
-        Curve25519Kex {
-            local_secret: None,
-            shared_secret: None,
-        }
-    }
-
     /// Low-order points make the shared secret non-contributory (all zeros).
-    fn low_order_points() -> [[u8; 32]; 4] {
-        // order 1 (zero), order 2, order 4... and a point of order 8
-        [
+    #[test]
+    fn server_dh_rejects_low_order_points() {
+        // order 2, order 4, and two points of order 8
+        let low_order: [[u8; 32]; 4] = [
             [0; 32],
             hex_literal::hex!("0100000000000000000000000000000000000000000000000000000000000000"),
             hex_literal::hex!("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"),
             hex_literal::hex!("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157"),
-        ]
-    }
+        ];
 
-    #[test]
-    fn server_dh_rejects_low_order_points() {
-        for pubkey in low_order_points() {
-            let mut kex = fresh();
+        for pubkey in low_order {
+            let mut kex = Curve25519Kex {
+                local_secret: None,
+                shared_secret: None,
+            };
             let mut exchange = Exchange::new(b"client", b"server");
             assert!(
                 kex.server_dh(&mut exchange, &kex_ecdh_init(pubkey)).is_err(),
                 "accepted low-order point {pubkey:02x?}"
             );
-            assert!(kex.shared_secret.is_none());
         }
     }
 
     #[test]
     fn server_dh_accepts_a_normal_point() {
-        let mut kex = fresh();
+        let mut kex = Curve25519Kex {
+            local_secret: None,
+            shared_secret: None,
+        };
         let mut exchange = Exchange::new(b"client", b"server");
         let peer = MontgomeryPoint::mul_base_clamped(rand::random::<[u8; 32]>());
         kex.server_dh(&mut exchange, &kex_ecdh_init(peer.0)).unwrap();
-        assert!(kex.shared_secret.is_some());
-    }
-
-    #[test]
-    fn client_rejects_low_order_and_wrong_length_server_pubkey() {
-        for pubkey in low_order_points() {
-            let mut kex = fresh();
-            kex.local_secret = Some(rand::random::<[u8; 32]>());
-            assert!(kex.compute_shared_secret(&pubkey).is_err());
-        }
-        for len in [0usize, 31, 33, 64] {
-            let mut kex = fresh();
-            kex.local_secret = Some(rand::random::<[u8; 32]>());
-            assert!(kex.compute_shared_secret(&vec![7u8; len]).is_err(), "len {len}");
-        }
-        let mut kex = fresh();
-        kex.local_secret = Some(rand::random::<[u8; 32]>());
-        let peer = MontgomeryPoint::mul_base_clamped(rand::random::<[u8; 32]>());
-        kex.compute_shared_secret(&peer.0).unwrap();
     }
 }

@@ -1,8 +1,10 @@
 # Vendored `russh` — per-channel head-of-line-blocking fix
 
-This is an **unmodified copy of `russh` 0.62.1** (crates.io, checksum
-`20d2039c…`) plus a single functional patch that fixes **per-channel
-head-of-line (HOL) blocking** in the SSH session read loop. It is wired into
+This is a copy of **pristine `russh` 0.65.0** (crates.io) plus two local
+deltas (below): a fix for **per-channel head-of-line (HOL) blocking** in the
+SSH session read loop, and a close-wake/abort delta. The security fixes that
+bore used to backport into 0.62.1 (GHSA-3hm4, -5xvq, -cqjc, -g6xm) are native
+in 0.65.0 and no longer carried. It is wired into
 `bore` via `[patch.crates-io]` in the workspace root `Cargo.toml`, so every
 `russh` dependency (direct and transitive) resolves to this tree.
 
@@ -63,12 +65,12 @@ Mechanism:
 `bore` only uses the `russh` **server**; the PR's symmetric **client**-side
 changes are carried too, solely so the shared `session.rs` split compiles.
 
-## Files changed vs pristine 0.62.1
+## Files changed vs pristine 0.65.0 (HOL delta)
 
 `src/channels/mod.rs`, `src/channels/io/rx.rs`, `src/session.rs`,
 `src/server/session.rs`, `src/server/mod.rs`, `src/server/encrypted.rs`,
 `src/client/mod.rs`, `src/client/encrypted.rs`. Everything else is byte-for-byte
-upstream 0.62.1. `git diff` against a fresh 0.62.1 checkout isolates the change.
+upstream 0.65.0. A diff against a fresh 0.65.0 checkout isolates the change.
 
 ## Regression coverage
 
@@ -82,25 +84,29 @@ upstream 0.62.1. `git diff` against a fresh 0.62.1 checkout isolates the change.
 
 ## Re-applying on a `russh` version bump
 
-The patch is preserved as a diff at `scripts/patches/russh-hol-730.diff` (base:
-this vendored 0.62.1 tree). To move to a newer `russh`:
+Both deltas are preserved as diffs against pristine **0.65.0**, applied in
+order, both with `-p1` from inside `crates/russh`:
 
 1. Replace `crates/russh` with the new pristine crate source.
 2. `cd crates/russh && patch -p1 --fuzz=3 < ../../scripts/patches/russh-hol-730.diff`
    (or port by hand if the flow-control internals moved).
-3. Apply the second delta (close-wake + abort, section below): from the repo
-   root, `git apply scripts/patches/russh-close-wake-abort.diff` (paths in
-   that diff are repo-relative), or port by hand.
+3. `patch -p1 --fuzz=3 < ../../scripts/patches/russh-close-wake-abort.diff`
+   (close-wake + abort, section below; also carries the Cargo.toml
+   `[workspace]` block and the test-signature fixes).
 4. Rebuild + run all three regression suites above (now incl. the I-SSH10
-   pair in `tests/ssh_gateway_test.rs`).
+   pair in `tests/ssh_gateway_test.rs`) plus the netns `T-SSH-*` harness.
 5. If upstream has since merged an equivalent fix, drop the vendored crate and
    the `[patch.crates-io]` entry entirely and rely on the release.
+
+Rebase log: 0.62.1 -> 0.65.0 (2026-10-26) was done from the pristine tree, not
+by 3-way merge (the flow-control files drifted too far); the diffs were
+re-derived and verified to reproduce `crates/russh` byte for byte.
 
 ---
 
 ## Second vendored delta (2026-07-06, I-SSH10): close-wake for blocked writers + abortable sessions
 
-Two further deviations from pristine 0.62.1, made for the bore ssh-gateway
+Two further deviations from pristine 0.62.1 (carried unchanged onto 0.65.0), made for the bore ssh-gateway
 resilience fix (wedged-but-TCP-alive clients; see `CLAUDE.md` I-SSH10):
 
 1. **`WindowSizeRef.closed` + `close()` (`src/channels/mod.rs`,
@@ -132,43 +138,18 @@ Also: the vendored crate's `Cargo.toml` gained an empty `[workspace]` table so
 `cargo test --manifest-path crates/russh/Cargo.toml` runs standalone (the
 parent consumes the crate via `[patch.crates-io]`, not as a workspace member).
 
-## Third vendored delta (2026-10-26): security backport from russh 0.65.0
+## Retired: security backport (was the third delta)
 
-`RUSTSEC` does not list russh; the advisories are GHSAs against `russh < 0.65`.
-Bumping to 0.65.0 is a separate, larger change (API drift), so the minimal
-fixes are copied into this 0.62.1 tree. Patch: `scripts/patches/russh-security-backport.diff`
-(paths prefixed `crates/russh/`, apply with `-p3`).
+`scripts/patches/russh-security-backport.diff` (GHSA-3hm4-p7h4-rvwp nested
+certificates, GHSA-5xvq low-order curve25519, GHSA-cqjc `pty-req` modes,
+GHSA-g6xm `max_auth_attempts`) is deleted: 0.65.0 contains all four fixes.
+`sshgw::SSH_MAX_AUTH_ATTEMPTS` stays 6 (`none` probe plus wrong keys count).
 
-1. **GHSA-3hm4-p7h4-rvwp — nested certificate stack overflow (pre-auth,
-   process abort).** `keys::key::check_cert_nesting` counts `-cert-v01@`
-   markers in an offered public-key blob and rejects more than
-   `MAX_CERT_NESTING` (8); called from `PublicKeyExt::decode`,
-   `parse_public_key` and `cert::PublicKeyOrCertificate::decode` (the server's
-   pre-auth publickey path). A stack overflow aborts the WHOLE process (not
-   one connection task), so this is the highest-impact item.
-   Unit: `deeply_nested_certificate_is_rejected` (red: SIGABRT without the guard),
-   `shallow_certificate_nesting_passes_the_guard`.
-2. **GHSA-5xvq — low-order curve25519 point.** `kex/curve25519.rs` now uses
-   clamped X25519 (`MontgomeryPoint::mul_base_clamped`/`mul_clamped`, as 0.65)
-   instead of unclamped `from_bytes_mod_order` scalars (which let an order-8
-   peer point leak the secret mod 8), rejects an all-zero shared secret on
-   both sides and a non-32-byte peer key on the client side. Units:
-   `server_dh_rejects_low_order_points`, `server_dh_accepts_a_normal_point`,
-   `client_rejects_low_order_and_wrong_length_server_pubkey`.
-3. **GHSA-cqjc — `pty-req` with more than 130 terminal modes** indexed past a
-   fixed array (panic in the connection task). The parser now returns
-   `Error::Inconsistent` once the mode count would exceed the buffer. Unit:
-   `malformed_pty_req_too_many_modes_rejected_by_server`.
-4. **GHSA-g6xm — `max_auth_attempts` never enforced.** `process_packet` now
-   disconnects (`NoMoreAuthMethodsAvailable`) once `rejection_count >=
-   max_auth_attempts` on a `USERAUTH_REQUEST`/`USERAUTH_INFO_RESPONSE`.
-   `0` keeps the old "unlimited". **Behavioural consequence for bore:** the
-   `none` probe and every wrong key a client offers each count, so
-   `sshgw::SSH_MAX_AUTH_ATTEMPTS` was raised 3 -> 6 (OpenSSH `MaxAuthTries`
-   default). Units: `auth_attempts_capped_at_max` (russh) and
-   `t_ssh_authcap1_*`/`t_ssh_authcap2_*` (bore, real OpenSSH client).
+## Local test fixes (not behaviour)
 
-Not backported (bore does not run that code): the client-side
-`check_cert_nesting` call sites (`client/kex.rs`, `keys/agent/client.rs`).
-Re-applying on a russh bump: all four are in 0.65.0 already; drop this delta
-when moving to it.
+Upstream 0.65.0 ships `tests/test_window_adjust.rs` and
+`tests/auth_signer_failure.rs` with a stale `auth_publickey(&ssh_key::PublicKey)`
+handler signature and they do not compile; both are changed to
+`russh::server::VerifiedPublicKey<'_>` (in `russh-close-wake-abort.diff`).
+`tests/auth_agent_req_channel_reply.rs` needs `/usr/sbin/sshd` and fails without it
+(environmental, identical on pristine).

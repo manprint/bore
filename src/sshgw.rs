@@ -23,7 +23,7 @@ use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use russh::keys::ssh_key::LineEnding;
 use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
-use russh::server::{Auth, ChannelOpenHandle, Handle, Handler, Msg, Session};
+use russh::server::{Auth, ChannelOpenHandle, Handle, Handler, Msg, Session, VerifiedPublicKey};
 use russh::{Channel, ChannelId, ChannelOpenFailure, Disconnect};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
@@ -915,6 +915,24 @@ pub struct GatewayHandler {
 }
 
 impl GatewayHandler {
+    /// The authorized-keys decision behind `Handler::auth_publickey`. Split out
+    /// because russh 0.65 hands that callback a `VerifiedPublicKey`, a
+    /// `#[non_exhaustive]` type only russh can construct, so a unit test must
+    /// reach the decision through the plain `PublicKey` it wraps.
+    fn check_public_key(&mut self, user: &str, key: &PublicKey) -> Auth {
+        let Some(keys) = &self.gateway.keys else {
+            return Auth::reject();
+        };
+        match keys.check_for_user(key, user) {
+            Some(matched) => {
+                self.grant = Some(matched.grant);
+                self.jump_principal = matched.jump_principal;
+                Auth::Accept
+            }
+            None => Auth::reject(),
+        }
+    }
+
     /// Report an early `tcpip-forward` rejection to the client. A real
     /// OpenSSH client may open its session channel (and have its one-shot
     /// `channel_open_session` drain run empty) BEFORE the server rejects the
@@ -1984,19 +2002,9 @@ impl Handler for GatewayHandler {
     async fn auth_publickey(
         &mut self,
         user: &str,
-        public_key: &PublicKey,
+        key: VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
-        let Some(keys) = &self.gateway.keys else {
-            return Ok(Auth::reject());
-        };
-        match keys.check_for_user(public_key, user) {
-            Some(matched) => {
-                self.grant = Some(matched.grant);
-                self.jump_principal = matched.jump_principal;
-                Ok(Auth::Accept)
-            }
-            None => Ok(Auth::reject()),
-        }
+        Ok(self.check_public_key(user, key.public_key))
     }
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
@@ -4626,7 +4634,7 @@ mod tests {
 
         let mut matched = gateway.handler("127.0.0.1:2222".parse().unwrap());
         assert!(matches!(
-            matched.auth_publickey("fabio", &key).await.unwrap(),
+            matched.check_public_key("fabio", &key),
             Auth::Accept
         ));
         assert_eq!(matched.identity(), Some("key-comment"));
@@ -4634,7 +4642,7 @@ mod tests {
 
         let mut mismatch = gateway.handler("127.0.0.1:2223".parse().unwrap());
         assert!(matches!(
-            mismatch.auth_publickey("wrong", &key).await.unwrap(),
+            mismatch.check_public_key("wrong", &key),
             Auth::Accept
         ));
         assert_eq!(mismatch.identity(), Some("key-comment"));

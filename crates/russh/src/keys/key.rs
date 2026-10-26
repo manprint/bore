@@ -44,11 +44,11 @@ const MAX_CERT_NESTING: usize = 8;
 ///
 /// `ssh-key` decodes a certificate's `signature_key` with `KeyData::decode`,
 /// which recurses into another certificate with no depth limit, so a crafted
-/// pre-auth blob aborts the process (GHSA-3hm4-p7h4-rvwp). Every nesting level
-/// must carry its own `*-cert-v01@*` algorithm name, so counting that marker
-/// bounds the depth. A legitimate certificate has one (its CA key is a plain key).
-// Substring count can over-count markers inside opaque fields; the limit
-// leaves headroom. Drop once ssh-key caps the depth itself.
+/// pre-auth blob aborts the process. Every nesting level must carry its own
+/// `*-cert-v01@*` algorithm name, so counting that marker bounds the depth.
+/// A legitimate certificate has one (its CA key is a plain key).
+// ponytail: substring count can over-count markers inside opaque fields; the
+// limit leaves headroom. Drop once ssh-key caps the depth itself.
 pub(crate) fn check_cert_nesting(blob: &[u8]) -> Result<(), ssh_key::Error> {
     const MARKER: &[u8] = b"-cert-v01@";
     if blob.windows(MARKER.len()).filter(|w| *w == MARKER).count() > MAX_CERT_NESTING {
@@ -186,6 +186,8 @@ mod test {
 
     #[test]
     fn deeply_nested_certificate_is_rejected() {
+        // Shallow chain is well-formed and still decodes.
+        assert!(super::parse_public_key(&nested_cert(2)).is_ok());
         // One packet's worth of nesting; without the guard this aborts on stack overflow.
         let deep = nested_cert(2848);
         assert!(super::parse_public_key(&deep).is_err());
@@ -194,12 +196,5 @@ mod test {
             crate::cert::PublicKeyOrCertificate::decode("ssh-ed25519-cert-v01@openssh.com", &deep)
                 .is_err()
         );
-    }
-
-    #[test]
-    fn shallow_certificate_nesting_passes_the_guard() {
-        assert!(super::check_cert_nesting(&nested_cert(2)).is_ok());
-        assert!(super::check_cert_nesting(&nested_cert(8)).is_ok());
-        assert!(super::check_cert_nesting(&nested_cert(9)).is_err());
     }
 }

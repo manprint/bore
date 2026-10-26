@@ -14,7 +14,7 @@ use bore_cli::shared::{ClientMessage, Delimited, ServerMessage};
 use bore_cli::sshgw::SshGatewayConfig;
 use lazy_static::lazy_static;
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
-use russh::server::{run_stream, Auth, Config, Handler, Msg, Session};
+use russh::server::{run_stream, Auth, Config, Handler, Msg, Session, VerifiedPublicKey};
 use russh::{Channel, ChannelId};
 #[cfg(feature = "udp")]
 use tokio::net::UdpSocket;
@@ -91,12 +91,14 @@ struct TargetHandler {
 impl Handler for TargetHandler {
     type Error = anyhow::Error;
 
-    async fn auth_publickey(&mut self, _user: &str, key: &PublicKey) -> Result<Auth> {
-        Ok(if key.key_data() == self.accepted_key.key_data() {
-            Auth::Accept
-        } else {
-            Auth::reject()
-        })
+    async fn auth_publickey(&mut self, _user: &str, key: VerifiedPublicKey<'_>) -> Result<Auth> {
+        Ok(
+            if key.public_key.key_data() == self.accepted_key.key_data() {
+                Auth::Accept
+            } else {
+                Auth::reject()
+            },
+        )
     }
 
     async fn auth_password(&mut self, _user: &str, password: &str) -> Result<Auth> {

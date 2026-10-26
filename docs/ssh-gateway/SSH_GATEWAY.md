@@ -1025,7 +1025,7 @@ qualche secondo smette di leggere il socket — riempiva la coda del suo canale 
 tunnel) restava fermo finché il primo non si sbloccava o chiudeva. Sintomo sul campo: un
 secondo browser sullo stesso link resta su "caricamento" finché non si chiude il primo.
 
-**Correzione.** `bore` incorpora una copia di `russh` 0.62.1 con la patch upstream
+**Correzione.** `bore` incorpora una copia di `russh` 0.65.0 con la patch upstream
 [`Eugeny/russh#730`](https://github.com/Eugeny/russh/pull/730) (mai unita a monte, quindi
 la portiamo noi): la consegna al canale usa `try_send` non bloccante con un backlog
 per-canale limitato, e il `WINDOW_ADJUST` viene **trattenuto finché l'applicazione non

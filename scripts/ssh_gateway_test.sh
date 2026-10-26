@@ -836,7 +836,7 @@ sleep 0.3
 ssh_cmd -N -R "19821:127.0.0.1:$HOL_PUB_FLOOD" >"$TMPDIR/hol_pub_ssh.log" 2>&1 &
 HOL_PUB_SSH=$!
 sleep 2
-HOL_PUB_B=$(hol_probe raw "$SERVER_IP" 19821 | grep -oE '[0-9]+' | head -1)
+HOL_PUB_B=$(hol_probe raw "$SERVER_IP" 19821 | grep -oE 'B_bytes=[0-9]+' | grep -oE '[0-9]+')
 HOL_PUB_B=${HOL_PUB_B:-0}
 if [ "$HOL_PUB_B" -ge 100000 ]; then
     pass "T-SSH-HOL-PUB reader B served concurrently ($HOL_PUB_B bytes) while A stalled"
@@ -882,7 +882,7 @@ done
 if [ "$HOL_VH_READY" != "1" ]; then
     fail "T-SSH-HOL-VHOST vhost tunnel never became routable/streamable (setup)"
 else
-    HOL_VH_B=$(hol_probe http "$SERVER_IP" "$CTRL_PORT" "hol.$VHOST_DOMAIN" | grep -oE 'B_bytes=[0-9]+' | grep -oE '[0-9]+' | head -1)
+    HOL_VH_B=$(hol_probe http "$SERVER_IP" "$CTRL_PORT" "hol.$VHOST_DOMAIN" | grep -oE 'B_bytes=[0-9]+' | grep -oE '[0-9]+')
     HOL_VH_B=${HOL_VH_B:-0}
     if [ "$HOL_VH_B" -ge 100000 ]; then
         pass "T-SSH-HOL-VHOST reader B served concurrently ($HOL_VH_B bytes) while A stalled"
@@ -911,7 +911,7 @@ ip netns exec nscli "$BORE" proxy \
     --local-proxy-port ":$HOL_SEC_CONS" >"$TMPDIR/hol_sec_consumer.log" 2>&1 &
 HOL_SEC_CONS_PID=$!
 sleep 2
-HOL_SEC_B=$(hol_probe raw 127.0.0.1 "$HOL_SEC_CONS" | grep -oE '[0-9]+' | head -1)
+HOL_SEC_B=$(hol_probe raw 127.0.0.1 "$HOL_SEC_CONS" | grep -oE 'B_bytes=[0-9]+' | grep -oE '[0-9]+')
 HOL_SEC_B=${HOL_SEC_B:-0}
 if [ "$HOL_SEC_B" -ge 100000 ]; then
     pass "T-SSH-HOL-SECRET reader B served concurrently ($HOL_SEC_B bytes) while A stalled"

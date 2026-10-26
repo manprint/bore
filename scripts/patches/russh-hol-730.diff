@@ -1,8 +1,6 @@
-diff --git a/src/channels/io/rx.rs b/src/channels/io/rx.rs
-index 57080db5..010c7a2c 100644
 --- a/src/channels/io/rx.rs
 +++ b/src/channels/io/rx.rs
-@@ -11,6 +11,7 @@ use super::{ChannelMsg, ChannelReadHalf};
+@@ -11,6 +11,7 @@
  pub struct ChannelRx<R> {
      channel: R,
      buffer: Option<(ChannelMsg, usize)>,
@@ -10,7 +8,7 @@ index 57080db5..010c7a2c 100644
  
      ext: Option<u32>,
  }
-@@ -20,6 +21,7 @@ impl<R> ChannelRx<R> {
+@@ -20,6 +21,7 @@
          Self {
              channel,
              buffer: None,
@@ -18,7 +16,7 @@ index 57080db5..010c7a2c 100644
              ext,
          }
      }
-@@ -34,12 +36,21 @@ where
+@@ -34,12 +36,21 @@
          cx: &mut Context<'_>,
          buf: &mut tokio::io::ReadBuf<'_>,
      ) -> Poll<io::Result<()>> {
@@ -44,7 +42,7 @@ index 57080db5..010c7a2c 100644
          };
  
          match (&msg, self.ext) {
-@@ -72,8 +83,10 @@ where
+@@ -72,8 +83,10 @@
                  Poll::Ready(Ok(()))
              }
              (ChannelMsg::Eof, _) => {
@@ -57,8 +55,6 @@ index 57080db5..010c7a2c 100644
                  Poll::Ready(Ok(()))
              }
              _ => {
-diff --git a/src/channels/mod.rs b/src/channels/mod.rs
-index 2573e238..8375aee0 100644
 --- a/src/channels/mod.rs
 +++ b/src/channels/mod.rs
 @@ -1,7 +1,9 @@
@@ -71,7 +67,7 @@ index 2573e238..8375aee0 100644
  use tokio::sync::mpsc::{Receiver, Sender};
  use tokio::sync::{Mutex, Notify};
  
-@@ -143,6 +145,10 @@ impl WindowSizeRef {
+@@ -145,6 +147,10 @@
  /// Allows you to read from a channel without borrowing the session
  pub struct ChannelReadHalf {
      pub(crate) receiver: Receiver<ChannelMsg>,
@@ -82,7 +78,7 @@ index 2573e238..8375aee0 100644
  }
  
  impl std::fmt::Debug for ChannelReadHalf {
-@@ -151,10 +157,36 @@ impl std::fmt::Debug for ChannelReadHalf {
+@@ -153,10 +159,36 @@
      }
  }
  
@@ -120,7 +116,7 @@ index 2573e238..8375aee0 100644
      }
  
      /// Make a reader for the [`Channel`] to receive [`ChannelMsg::Data`]
-@@ -465,10 +497,11 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
+@@ -467,10 +499,11 @@
          max_packet_size: u32,
          window_size: u32,
          channel_buffer_size: usize,
@@ -133,7 +129,7 @@ index 2573e238..8375aee0 100644
          let write_half = ChannelWriteHalf {
              id,
              sender,
-@@ -697,6 +730,143 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
+@@ -699,6 +732,143 @@
      }
  }
  
@@ -277,7 +273,7 @@ index 2573e238..8375aee0 100644
  #[cfg(test)]
  mod tests {
      use tokio::sync::mpsc;
-@@ -825,11 +995,151 @@ mod tests {
+@@ -827,11 +997,151 @@
          assert!(receiver.try_recv().is_err());
      }
  
@@ -431,11 +427,9 @@ index 2573e238..8375aee0 100644
  
          channel.data_bytes(Bytes::from_static(b"channel")).await.unwrap();
  
-diff --git a/src/client/encrypted.rs b/src/client/encrypted.rs
-index fb4dac91..51ffa338 100644
 --- a/src/client/encrypted.rs
 +++ b/src/client/encrypted.rs
-@@ -379,15 +379,15 @@ impl Session {
+@@ -500,15 +500,15 @@
                      return Err(crate::Error::Inconsistent.into());
                  };
  
@@ -457,7 +451,7 @@ index fb4dac91..51ffa338 100644
                  } else {
                      error!("no channel for id {local_id:?}");
                  }
-@@ -412,20 +412,17 @@ impl Session {
+@@ -536,11 +536,10 @@
                  }
                  // Forward the close to the channel before removing it, so that
                  // consumers waiting on `Channel::wait()` receive an explicit
@@ -473,9 +467,10 @@ index fb4dac91..51ffa338 100644
                  client.channel_close(channel_num, self).await
              }
              Some((&msg::CHANNEL_EOF, mut r)) => {
-                 debug!("channel_eof");
-                 let channel_num = map_err!(ChannelId::decode(&mut r))?;
-                 map_err!(ensure_end(&r))?;
+@@ -550,9 +549,7 @@
+                 if !self.common.is_established_channel(channel_num) {
+                     return Ok(());
+                 }
 -                if let Some(chan) = self.channels.get(&channel_num) {
 -                    let _ = chan.send(ChannelMsg::Eof).await;
 -                }
@@ -483,18 +478,20 @@ index fb4dac91..51ffa338 100644
                  client.channel_eof(channel_num, self).await
              }
              Some((&msg::CHANNEL_OPEN_FAILURE, mut r)) => {
-@@ -440,9 +437,7 @@ impl Session {
-                     enc.channels.remove(&channel_num);
+@@ -575,11 +572,7 @@
+                     return Ok(());
                  }
  
 -                if let Some(sender) = self.channels.remove(&channel_num) {
--                    let _ = sender.send(ChannelMsg::OpenFailure(reason_code.clone())).await;
+-                    let _ = sender
+-                        .send(ChannelMsg::OpenFailure(reason_code.clone()))
+-                        .await;
 -                }
 +                self.close_channel(channel_num, ChannelMsg::OpenFailure(reason_code.clone()));
  
                  let _ = self.sender.send(Reply::ChannelOpenFailure);
  
-@@ -450,57 +445,53 @@ impl Session {
+@@ -587,65 +580,56 @@
                      .channel_open_failure(channel_num, reason_code, &descr, &language, self)
                      .await
              }
@@ -511,7 +508,11 @@ index fb4dac91..51ffa338 100644
 +                };
                  let data = map_err!(Bytes::decode(&mut r))?;
                  map_err!(ensure_end(&r))?;
+                 if !self.common.is_established_channel(channel_num) {
+                     return Ok(());
+                 }
 -                let target = self.common.config.window_size;
+-                #[allow(clippy::collapsible_if)]
 +
 +                // Debit the receive window now (RFC 4254 §5.2), but defer
 +                // WINDOW_ADJUST until we know the application has capacity:
@@ -553,7 +554,11 @@ index fb4dac91..51ffa338 100644
 -                let extended_code = map_err!(u32::decode(&mut r))?;
 -                let data = map_err!(Bytes::decode(&mut r))?;
 -                map_err!(ensure_end(&r))?;
+-                if !self.common.is_established_channel(channel_num) {
+-                    return Ok(());
+-                }
 -                let target = self.common.config.window_size;
+-                #[allow(clippy::collapsible_if)]
 -                if let Some(ref mut enc) = self.common.encrypted {
 -                    if enc.adjust_window_size(channel_num, &data, target)? {
 -                        let next_window =
@@ -589,7 +594,7 @@ index fb4dac91..51ffa338 100644
              }
              Some((&msg::CHANNEL_REQUEST, mut r)) => {
                  let channel_num = map_err!(ChannelId::decode(&mut r))?;
-@@ -511,18 +502,14 @@ impl Session {
+@@ -659,18 +643,14 @@
                          map_err!(u8::decode(&mut r))?; // should be 0.
                          let client_can_do = map_err!(u8::decode(&mut r))? != 0;
                          map_err!(ensure_end(&r))?;
@@ -610,7 +615,7 @@ index fb4dac91..51ffa338 100644
                          client.exit_status(channel_num, exit_status, self).await
                      }
                      "exit-signal" => {
-@@ -533,16 +520,15 @@ impl Session {
+@@ -681,16 +661,15 @@
                          let error_message = map_err!(String::decode(&mut r))?;
                          let lang_tag = map_err!(String::decode(&mut r))?;
                          map_err!(ensure_end(&r))?;
@@ -636,23 +641,27 @@ index fb4dac91..51ffa338 100644
                          client
                              .exit_signal(
                                  channel_num,
-@@ -614,11 +600,8 @@ impl Session {
+@@ -768,11 +747,12 @@
                  }
                  if let Some(chan) = self.channels.get(&channel_num) {
-                     chan.window_size().update(new_size).await;
+                     chan.window_size().grow(amount).await;
 -                    // Use try_send to avoid blocking the session loop when channel buffer is full.
 -                    // WindowAdjusted is informational - the critical side effect (updating
--                    // WindowSizeRef and notifying ChannelTx) already happens in update().
+-                    // WindowSizeRef and notifying ChannelTx) already happens in grow().
 -                    let _ = chan.try_send(ChannelMsg::WindowAdjusted { new_size });
                  }
++                // WindowAdjusted is informational - the critical side effect
++                // (updating WindowSizeRef and notifying ChannelTx) already
++                // happened in grow(). Queue it behind any backlog so ordering
++                // vs. buffered data is preserved, and never block on it.
 +                self.forward_channel_msg(channel_num, ChannelMsg::WindowAdjusted { new_size });
                  client.window_adjusted(channel_num, new_size, self).await
              }
              Some((&msg::GLOBAL_REQUEST, mut r)) => {
-@@ -661,17 +644,13 @@ impl Session {
-             Some((&msg::CHANNEL_SUCCESS, mut r)) => {
-                 let channel_num = map_err!(ChannelId::decode(&mut r))?;
-                 map_err!(ensure_end(&r))?;
+@@ -818,9 +798,7 @@
+                 if !self.common.is_established_channel(channel_num) {
+                     return Ok(());
+                 }
 -                if let Some(chan) = self.channels.get(&channel_num) {
 -                    let _ = chan.send(ChannelMsg::Success).await;
 -                }
@@ -660,8 +669,10 @@ index fb4dac91..51ffa338 100644
                  client.channel_success(channel_num, self).await
              }
              Some((&msg::CHANNEL_FAILURE, mut r)) => {
-                 let channel_num = map_err!(ChannelId::decode(&mut r))?;
-                 map_err!(ensure_end(&r))?;
+@@ -829,9 +807,7 @@
+                 if !self.common.is_established_channel(channel_num) {
+                     return Ok(());
+                 }
 -                if let Some(chan) = self.channels.get(&channel_num) {
 -                    let _ = chan.send(ChannelMsg::Failure).await;
 -                }
@@ -669,7 +680,7 @@ index fb4dac91..51ffa338 100644
                  client.channel_failure(channel_num, self).await
              }
              Some((&msg::CHANNEL_OPEN, mut r)) => {
-@@ -703,6 +682,7 @@ impl Session {
+@@ -863,6 +839,7 @@
                      channel_params.recipient_maximum_packet_size,
                      channel_params.recipient_window_size,
                      self.common.config.channel_buffer_size,
@@ -677,11 +688,9 @@ index fb4dac91..51ffa338 100644
                  );
  
                  let pending = crate::PendingChannelOpen {
-diff --git a/src/client/mod.rs b/src/client/mod.rs
-index 9f770ee4..e7976007 100644
 --- a/src/client/mod.rs
 +++ b/src/client/mod.rs
-@@ -55,11 +55,12 @@ use tokio::pin;
+@@ -54,12 +54,13 @@
  use tokio::sync::mpsc::{
      Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel,
  };
@@ -689,6 +698,7 @@ index 9f770ee4..e7976007 100644
 +use tokio::sync::{Notify, oneshot};
  
  pub use crate::auth::AuthResult;
+ use crate::cert::PublicKeyOrCertificate;
  use crate::channels::{
 -    Channel, ChannelMsg, ChannelReadHalf, ChannelRef, ChannelWriteHalf, WindowSizeRef,
 +    Channel, ChannelBacklog, ChannelMsg, ChannelReadHalf, ChannelRef, ChannelWriteHalf,
@@ -696,7 +706,7 @@ index 9f770ee4..e7976007 100644
  };
  use crate::cipher::{self, OpeningKey, clear};
  use crate::kex::{KexAlgorithmImplementor, KexCause, KexProgress, SessionKexState};
-@@ -92,6 +93,11 @@ pub struct Session {
+@@ -92,6 +93,11 @@
      receiver: Receiver<Msg>,
      sender: UnboundedSender<Reply>,
      channels: HashMap<ChannelId, ChannelRef>,
@@ -708,7 +718,7 @@ index 9f770ee4..e7976007 100644
      target_window_size: u32,
      pending_reads: Vec<Vec<u8>>,
      pending_len: u32,
-@@ -103,7 +109,11 @@ pub struct Session {
+@@ -107,7 +113,11 @@
  
  impl Drop for Session {
      fn drop(&mut self) {
@@ -721,15 +731,16 @@ index 9f770ee4..e7976007 100644
      }
  }
  
-@@ -277,6 +287,7 @@ pub struct Handle<H: Handler> {
-     receiver: UnboundedReceiver<Reply>,
+@@ -319,6 +329,8 @@
      join: russh_util::runtime::JoinHandle<Result<(), H::Error>>,
      channel_buffer_size: usize,
+     agent_session_binding: Option<crate::keys::agent::AgentSessionBinding>,
++    /// Shared with the session loop; see [`ChannelReadHalf`].
 +    drain_notify: Arc<Notify>,
  }
  
  impl<H: Handler> Drop for Handle<H> {
-@@ -584,11 +595,12 @@ impl<H: Handler> Handle<H> {
+@@ -740,11 +752,12 @@
      /// Wait for confirmation that a channel is open
      async fn wait_channel_confirmation(
          &self,
@@ -744,7 +755,7 @@ index 9f770ee4..e7976007 100644
                  Some(ChannelMsg::Open {
                      id,
                      max_packet_size,
-@@ -603,7 +615,7 @@ impl<H: Handler> Handle<H> {
+@@ -759,7 +772,7 @@
                              max_packet_size,
                              window_size: window_size_ref,
                          },
@@ -753,7 +764,7 @@ index 9f770ee4..e7976007 100644
                      });
                  }
                  Some(ChannelMsg::OpenFailure(reason)) => {
-@@ -1022,6 +1034,7 @@ where
+@@ -1235,6 +1248,7 @@
          );
      }
      let channel_buffer_size = config.channel_buffer_size;
@@ -761,7 +772,7 @@ index 9f770ee4..e7976007 100644
      let mut session = Session::new(
          config.window_size,
          CommonSession {
-@@ -1042,6 +1055,7 @@ where
+@@ -1255,6 +1269,7 @@
          },
          session_receiver,
          session_sender,
@@ -769,23 +780,23 @@ index 9f770ee4..e7976007 100644
      );
      session.begin_rekey()?;
      let (kex_done_signal, kex_done_signal_rx) = oneshot::channel();
-@@ -1060,6 +1074,7 @@ where
+@@ -1273,6 +1288,7 @@
+ 
+     Ok(Handle {
+         sender: handle_sender,
++        drain_notify,
          receiver: handle_receiver,
          join,
          channel_buffer_size,
-+        drain_notify,
-     })
- }
- 
-@@ -1099,6 +1114,7 @@ impl Session {
+@@ -1316,6 +1332,7 @@
          common: CommonSession<Arc<Config>>,
          receiver: Receiver<Msg>,
          sender: UnboundedSender<Reply>,
 +        drain_notify: Arc<Notify>,
      ) -> Self {
+         let (priority_sender, priority_receiver) = unbounded_channel();
          let (inbound_channel_sender, inbound_channel_receiver) = channel(10);
-         Self {
-@@ -1110,6 +1126,8 @@ impl Session {
+@@ -1330,6 +1347,8 @@
              inbound_channel_sender,
              inbound_channel_receiver,
              channels: HashMap::new(),
@@ -794,7 +805,7 @@ index 9f770ee4..e7976007 100644
              pending_reads: Vec::new(),
              pending_len: 0,
              open_global_requests: VecDeque::new(),
-@@ -1117,6 +1135,26 @@ impl Session {
+@@ -1338,6 +1357,26 @@
          }
      }
  
@@ -821,9 +832,9 @@ index 9f770ee4..e7976007 100644
      async fn run<H: Handler + Send, R: AsyncRead + AsyncWrite + Unpin + Send>(
          mut self,
          stream: SshRead<R>,
-@@ -1241,6 +1279,19 @@ impl Session {
-                     debug!("timeout");
-                     return Err(crate::Error::InactivityTimeout.into());
+@@ -1537,6 +1576,19 @@
+                         }
+                     }
                  }
 +                _ = self.drain_notify.notified(),
 +                    if !self.backlog.is_empty() && !self.kex.active() =>
@@ -838,10 +849,10 @@ index 9f770ee4..e7976007 100644
 +                        }
 +                    }
 +                }
-                 msg = self.receiver.recv(), if !self.kex.active() => {
-                     match msg {
-                         Some(msg) => self.handle_msg(msg)?,
-@@ -1796,6 +1847,7 @@ mod tests {
+             };
+ 
+             self.flush()?;
+@@ -2190,6 +2242,7 @@
              },
              receiver,
              reply_sender,
@@ -849,7 +860,7 @@ index 9f770ee4..e7976007 100644
          );
          (session, sender, reply_receiver)
      }
-@@ -1844,6 +1896,7 @@ mod tests {
+@@ -2497,6 +2550,7 @@
              },
              receiver,
              reply_sender,
@@ -857,23 +868,22 @@ index 9f770ee4..e7976007 100644
          );
          session.open_global_requests = VecDeque::new();
          let _ = receiver_sender;
-diff --git a/src/server/encrypted.rs b/src/server/encrypted.rs
-index af9f26fa..7325a225 100644
 --- a/src/server/encrypted.rs
 +++ b/src/server/encrypted.rs
-@@ -430,9 +430,11 @@ mod tests {
-         };
+@@ -829,10 +829,12 @@
          let config = Arc::new(config);
+         let (priority_sender, priority_receiver) = tokio::sync::mpsc::unbounded_channel();
          let (sender, receiver) = tokio::sync::mpsc::channel(1);
 +        let drain_notify = Arc::new(tokio::sync::Notify::new());
          let handle = Handle {
+             priority_sender,
              sender,
              channel_buffer_size: config.channel_buffer_size,
 +            drain_notify: drain_notify.clone(),
          };
  
          Session {
-@@ -458,6 +460,8 @@ mod tests {
+@@ -859,6 +861,8 @@
              pending_reads: Vec::new(),
              pending_len: 0,
              channels: std::collections::HashMap::new(),
@@ -882,7 +892,7 @@ index af9f26fa..7325a225 100644
              open_global_requests: std::collections::VecDeque::new(),
              kex: SessionKexState::Idle,
          }
-@@ -989,20 +993,17 @@ impl Session {
+@@ -1453,11 +1457,10 @@
                  }
                  // Forward the close to the channel before removing it, so that
                  // consumers waiting on `Channel::wait()` receive an explicit
@@ -898,9 +908,10 @@ index af9f26fa..7325a225 100644
                  debug!("handler.channel_close {channel_num:?}");
                  handler.channel_close(channel_num, self).await
              }
-             msg::CHANNEL_EOF => {
-                 let channel_num = map_err!(ChannelId::decode(r))?;
-                 map_err!(ensure_end(r))?;
+@@ -1467,9 +1470,7 @@
+                 if !self.common.is_established_channel(channel_num) {
+                     return Ok(());
+                 }
 -                if let Some(chan) = self.channels.get(&channel_num) {
 -                    chan.send(ChannelMsg::Eof).await.unwrap_or(())
 -                }
@@ -908,12 +919,13 @@ index af9f26fa..7325a225 100644
                  debug!("handler.channel_eof {channel_num:?}");
                  handler.channel_eof(channel_num, self).await
              }
-@@ -1017,35 +1018,43 @@ impl Session {
+@@ -1487,36 +1488,43 @@
                  trace!("handler.data {ext:?} {channel_num:?}");
                  let data = map_err!(Bytes::decode(r))?;
                  map_err!(ensure_end(r))?;
 -                let target = self.target_window_size;
  
+-                #[allow(clippy::collapsible_if)]
 +                // Debit the receive window now (RFC 4254 §5.2), but defer
 +                // WINDOW_ADJUST until we know the application has capacity:
 +                // a slow consumer should see its peer's window drain to zero
@@ -974,20 +986,24 @@ index af9f26fa..7325a225 100644
              }
  
              msg::CHANNEL_WINDOW_ADJUST => {
-@@ -1069,11 +1078,8 @@ impl Session {
+@@ -1546,11 +1554,12 @@
                  }
                  if let Some(chan) = self.channels.get(&channel_num) {
-                     chan.window_size().update(new_size).await;
+                     chan.window_size().grow(amount).await;
 -                    // Use try_send to avoid blocking the session loop when channel buffer is full.
 -                    // WindowAdjusted is informational - the critical side effect (updating
--                    // WindowSizeRef and notifying ChannelTx) already happens in update().
+-                    // WindowSizeRef and notifying ChannelTx) already happens in grow().
 -                    let _ = chan.try_send(ChannelMsg::WindowAdjusted { new_size });
                  }
++                // WindowAdjusted is informational - the critical side effect
++                // (updating WindowSizeRef and notifying ChannelTx) already
++                // happened in grow(). Queue it behind any backlog so ordering
++                // vs. buffered data is preserved, and never block on it.
 +                self.forward_channel_msg(channel_num, ChannelMsg::WindowAdjusted { new_size });
                  debug!("handler.window_adjusted {channel_num:?}");
                  handler.window_adjusted(channel_num, new_size, self).await
              }
-@@ -1095,15 +1101,15 @@ impl Session {
+@@ -1572,15 +1581,15 @@
                      return Err(Error::Inconsistent.into());
                  };
  
@@ -1009,11 +1025,16 @@ index af9f26fa..7325a225 100644
                  } else {
                      error!("no channel for id {local_id:?}");
                  }
-@@ -1173,19 +1179,18 @@ impl Session {
+@@ -1658,24 +1667,23 @@
                          }
                          map_err!(ensure_end(r))?;
  
 -                        if let Some(chan) = self.channels.get(&channel_num) {
+-                            // Only the first `i` entries were decoded from the
+-                            // request; the rest of `modes` is padding and must
+-                            // not be passed on as if the client had sent it.
+-                            #[allow(clippy::indexing_slicing)] // `i <= modes.len()` checked above
+-                            let terminal_modes = modes[..i].to_vec();
 -                            let _ = chan
 -                                .send(ChannelMsg::RequestPty {
 -                                    want_reply: true,
@@ -1022,10 +1043,15 @@ index af9f26fa..7325a225 100644
 -                                    row_height,
 -                                    pix_width,
 -                                    pix_height,
--                                    terminal_modes: modes.into(),
+-                                    terminal_modes,
 -                                })
 -                                .await;
 -                        }
++                        // Only the first `i` entries were decoded from the
++                        // request; the rest of `modes` is padding and must
++                        // not be passed on as if the client had sent it.
++                        #[allow(clippy::indexing_slicing)] // `i <= modes.len()` checked above
++                        let terminal_modes = modes[..i].to_vec();
 +                        self.forward_channel_msg(
 +                            channel_num,
 +                            ChannelMsg::RequestPty {
@@ -1035,13 +1061,13 @@ index af9f26fa..7325a225 100644
 +                                row_height,
 +                                pix_width,
 +                                pix_height,
-+                                terminal_modes: modes.into(),
++                                terminal_modes,
 +                            },
 +                        );
  
                          debug!("handler.pty_request {channel_num:?}");
                          #[allow(clippy::indexing_slicing)] // `modes` length checked
-@@ -1209,17 +1214,16 @@ impl Session {
+@@ -1699,17 +1707,16 @@
                          let x11_screen_number = map_err!(u32::decode(r))?;
                          map_err!(ensure_end(r))?;
  
@@ -1069,7 +1095,7 @@ index af9f26fa..7325a225 100644
                          debug!("handler.x11_request {channel_num:?}");
                          handler
                              .x11_request(
-@@ -1237,15 +1241,14 @@ impl Session {
+@@ -1727,15 +1734,14 @@
                          let env_value = map_err!(String::decode(r))?;
                          map_err!(ensure_end(r))?;
  
@@ -1093,7 +1119,7 @@ index af9f26fa..7325a225 100644
  
                          debug!("handler.env_request {channel_num:?}");
                          handler
-@@ -1254,21 +1257,19 @@ impl Session {
+@@ -1744,21 +1750,19 @@
                      }
                      "shell" => {
                          map_err!(ensure_end(r))?;
@@ -1123,7 +1149,7 @@ index af9f26fa..7325a225 100644
                          debug!("handler.agent_request {channel_num:?}");
  
                          let response = handler.agent_request(channel_num, self).await?;
-@@ -1282,14 +1283,13 @@ impl Session {
+@@ -1772,14 +1776,13 @@
                      "exec" => {
                          let req = map_err!(Bytes::decode(r))?;
                          map_err!(ensure_end(r))?;
@@ -1145,7 +1171,7 @@ index af9f26fa..7325a225 100644
                          debug!("handler.exec_request {channel_num:?}");
                          handler.exec_request(channel_num, &req, self).await
                      }
-@@ -1297,14 +1297,13 @@ impl Session {
+@@ -1787,14 +1790,13 @@
                          let name = map_err!(String::decode(r))?;
                          map_err!(ensure_end(r))?;
  
@@ -1167,7 +1193,7 @@ index af9f26fa..7325a225 100644
                          debug!("handler.subsystem_request {channel_num:?}");
                          handler.subsystem_request(channel_num, &name, self).await
                      }
-@@ -1315,16 +1314,15 @@ impl Session {
+@@ -1805,16 +1807,15 @@
                          let pix_height = map_err!(u32::decode(r))?;
                          map_err!(ensure_end(r))?;
  
@@ -1193,7 +1219,7 @@ index af9f26fa..7325a225 100644
  
                          debug!("handler.window_change {channel_num:?}");
                          handler
-@@ -1341,13 +1339,12 @@ impl Session {
+@@ -1831,13 +1832,12 @@
                      "signal" => {
                          let signal = Sig::from_name(&map_err!(String::decode(r))?);
                          map_err!(ensure_end(r))?;
@@ -1212,7 +1238,7 @@ index af9f26fa..7325a225 100644
                          debug!("handler.signal {channel_num:?} {signal:?}");
                          handler.signal(channel_num, signal, self).await
                      }
-@@ -1458,12 +1455,7 @@ impl Session {
+@@ -1941,12 +1941,7 @@
                      enc.channels.remove(&channel_num);
                  }
  
@@ -1226,7 +1252,7 @@ index af9f26fa..7325a225 100644
  
                  Ok(())
              }
-@@ -1576,6 +1568,7 @@ impl Session {
+@@ -2059,6 +2054,7 @@
              channel_params.recipient_maximum_packet_size,
              channel_params.recipient_window_size,
              self.common.config.channel_buffer_size,
@@ -1234,11 +1260,9 @@ index af9f26fa..7325a225 100644
          );
  
          let pending = PendingChannelOpen {
-diff --git a/src/server/mod.rs b/src/server/mod.rs
-index 5395cccf..9984b80a 100644
 --- a/src/server/mod.rs
 +++ b/src/server/mod.rs
-@@ -455,6 +455,13 @@ pub trait Handler: Sized {
+@@ -499,6 +499,13 @@
  
      /// Called when a data packet is received. A response can be
      /// written to the `response` argument.
@@ -1252,19 +1276,20 @@ index 5395cccf..9984b80a 100644
      #[allow(unused_variables)]
      fn data(
          &mut self,
-@@ -1063,9 +1070,11 @@ where
-     // Reading SSH id and allocating a session.
+@@ -1108,10 +1115,12 @@
      let mut stream = SshRead::new(stream);
+     let (priority_sender, priority_receiver) = tokio::sync::mpsc::unbounded_channel();
      let (sender, receiver) = tokio::sync::mpsc::channel(config.event_buffer_size);
 +    let drain_notify = Arc::new(tokio::sync::Notify::new());
      let handle = server::session::Handle {
+         priority_sender,
          sender,
          channel_buffer_size: config.channel_buffer_size,
 +        drain_notify: drain_notify.clone(),
      };
  
      let common = read_ssh_id(config, &mut stream).await?;
-@@ -1077,6 +1086,8 @@ where
+@@ -1124,6 +1133,8 @@
          pending_reads: Vec::new(),
          pending_len: 0,
          channels: HashMap::new(),
@@ -1273,16 +1298,14 @@ index 5395cccf..9984b80a 100644
          open_global_requests: VecDeque::new(),
          kex: SessionKexState::Idle,
      };
-diff --git a/src/server/session.rs b/src/server/session.rs
-index 548ba662..21161a30 100644
 --- a/src/server/session.rs
 +++ b/src/server/session.rs
-@@ -6,11 +6,14 @@ use channels::WindowSizeRef;
+@@ -7,11 +7,14 @@
  use kex::ServerKex;
  use log::debug;
  use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 +use tokio::sync::Notify;
- use tokio::sync::mpsc::{Receiver, Sender, channel};
+ use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender, channel};
  use tokio::sync::oneshot;
  
  use super::*;
@@ -1293,7 +1316,7 @@ index 548ba662..21161a30 100644
  use crate::helpers::NameList;
  use crate::kex::{EXTENSION_SUPPORT_AS_CLIENT, KexCause, SessionKexState};
  use crate::{ChannelOpenFailure, map_err, msg};
-@@ -25,10 +28,27 @@ pub struct Session {
+@@ -27,10 +30,27 @@
      pub(crate) pending_reads: Vec<Vec<u8>>,
      pub(crate) pending_len: u32,
      pub(crate) channels: HashMap<ChannelId, ChannelRef>,
@@ -1321,15 +1344,15 @@ index 548ba662..21161a30 100644
  #[derive(Debug)]
  pub enum Msg {
      ChannelOpenAgent {
-@@ -110,6 +130,7 @@ pub type ChannelOpenHandle = crate::ChannelOpenHandleInner<Msg>;
- pub struct Handle {
+@@ -113,6 +133,7 @@
+     pub(crate) priority_sender: UnboundedSender<Msg>,
      pub(crate) sender: Sender<Msg>,
      pub(crate) channel_buffer_size: usize,
 +    pub(crate) drain_notify: Arc<Notify>,
  }
  
  impl Handle {
-@@ -392,11 +413,12 @@ impl Handle {
+@@ -395,11 +416,12 @@
  
      async fn wait_channel_confirmation(
          &self,
@@ -1344,7 +1367,7 @@ index 548ba662..21161a30 100644
                  Some(ChannelMsg::Open {
                      id,
                      max_packet_size,
-@@ -411,7 +433,7 @@ impl Handle {
+@@ -414,7 +436,7 @@
                              max_packet_size,
                              window_size: window_size_ref,
                          },
@@ -1353,9 +1376,9 @@ index 548ba662..21161a30 100644
                      });
                  }
                  Some(ChannelMsg::OpenFailure(reason)) => {
-@@ -574,6 +596,19 @@ impl Session {
-                     debug!("timeout");
-                     return Err(crate::Error::InactivityTimeout.into());
+@@ -805,6 +827,19 @@
+                         }
+                     }
                  }
 +                _ = self.drain_notify.notified(),
 +                    if !self.backlog.is_empty() && !self.kex.active() =>
@@ -1370,10 +1393,10 @@ index 548ba662..21161a30 100644
 +                        }
 +                    }
 +                }
-                 msg = self.receiver.recv(), if !self.kex.active() => {
-                     match msg {
-                         Some(Msg::Channel(id, ChannelMsg::Data { data })) => {
-@@ -717,6 +752,26 @@ impl Session {
+             }
+             self.flush()?;
+ 
+@@ -874,6 +909,26 @@
          self.sender.clone()
      }
  
@@ -1398,21 +1421,22 @@ index 548ba662..21161a30 100644
 +    }
 +
      pub fn writable_packet_size(&self, channel: &ChannelId) -> u32 {
-         if let Some(ref enc) = self.common.encrypted {
-             if let Some(channel) = enc.channels.get(channel) {
-@@ -1392,9 +1447,11 @@ mod tests {
-     fn authenticated_session() -> Session {
+         if let Some(ref enc) = self.common.encrypted
+             && let Some(channel) = enc.channels.get(channel)
+@@ -1621,10 +1676,12 @@
          let config = Arc::new(crate::server::Config::default());
+         let (priority_sender, priority_receiver) = tokio::sync::mpsc::unbounded_channel();
          let (sender, receiver) = tokio::sync::mpsc::channel(config.event_buffer_size);
 +        let drain_notify = Arc::new(Notify::new());
          let handle = Handle {
+             priority_sender,
              sender,
              channel_buffer_size: config.channel_buffer_size,
 +            drain_notify: drain_notify.clone(),
          };
  
          Session {
-@@ -1439,6 +1496,8 @@ mod tests {
+@@ -1670,6 +1727,8 @@
              pending_reads: Vec::new(),
              pending_len: 0,
              channels: HashMap::new(),
@@ -1421,20 +1445,18 @@ index 548ba662..21161a30 100644
              open_global_requests: VecDeque::new(),
              kex: SessionKexState::Idle,
          }
-diff --git a/src/session.rs b/src/session.rs
-index b1eae0be..0a3a57ce 100644
 --- a/src/session.rs
 +++ b/src/session.rs
-@@ -20,7 +20,7 @@ use std::num::Wrapping;
+@@ -21,7 +21,7 @@
  
- use bytes::Bytes;
  use byteorder::{BigEndian, ByteOrder};
+ use bytes::Bytes;
 -use log::{debug, trace};
 +use log::{debug, trace, warn};
  use ssh_encoding::Encode;
  use tokio::sync::oneshot;
  
-@@ -282,22 +282,42 @@ impl Encrypted {
+@@ -302,22 +302,42 @@
          }
      }
  

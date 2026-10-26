@@ -486,8 +486,21 @@ aarch64-musl, android via NDK).
   `handle_connection`; only a configured token enables the first-byte peek. Keep it
   that way (the peek uses a single `read` + `Prefixed` replay so no bytes are lost,
   and `0x00`/non-HTTP always falls through to the bore protocol). Basic auth is
-  **HTTP-only by design**: non-HTTP connections are forwarded unprotected, so do not
-  rely on `--basic-auth` to gate raw-TCP services.
+  **HTTP-only by design**: bytes that positively are not HTTP are forwarded unprotected, so do not
+  rely on `--basic-auth` to gate raw-TCP services. HTTP is recognised by request-line shape
+  (`token SP ...`), never by a method list, and a silent connection is closed rather than
+  forwarded (fail-closed; `basicauth::sniff`/`gate`).
+- **The vendored russh carries security backports (`crates/russh/HOL_FIX.md`, "Third
+  vendored delta").** Nested-certificate depth guard (GHSA-3hm4, pre-auth process abort),
+  clamped X25519 + zero-shared-secret rejection (GHSA-5xvq), `pty-req` mode bound
+  (GHSA-cqjc), and `max_auth_attempts` enforcement (GHSA-g6xm). Because the cap is now
+  real, `sshgw::SSH_MAX_AUTH_ATTEMPTS` is 6 (OpenSSH's `MaxAuthTries`): the `none` probe
+  plus each unauthorized key counts, and 3 would disconnect multi-key clients
+  (`t_ssh_authcap1_*`/`t_ssh_authcap2_*`). `env_request` keeps at most
+  `SSH_MAX_ENV_REQUESTS` (64) variables per connection. The tokio runtime's workers run
+  on 8 MiB stacks (`WORKER_THREAD_STACK_SIZE`, defence in depth). Do not lower the auth
+  cap below 6 and do not drop the vendored guards when merging a russh bump without
+  re-checking that the target version has them (0.65.0 does).
 
 ## Known limitations / candidate next steps
 

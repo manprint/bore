@@ -1813,8 +1813,24 @@ struct VpnConnectArgs {
     refuse_all_routes: bool,
 }
 
-#[tokio::main]
-async fn run(command: Command) -> Result<()> {
+/// Stack size of every tokio worker thread. The default (2 MiB) is what a
+/// spawned per-connection task runs on; recursive parsers of peer-controlled
+/// input (the SSH gateway's certificate/key decoder) overflow it long before
+/// the 8 MiB main thread. Defence in depth only: the parsers carry their own
+/// depth bounds, this just keeps one more class of deep input from aborting
+/// the process.
+const WORKER_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+fn run(command: Command) -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(WORKER_THREAD_STACK_SIZE)
+        .build()
+        .context("failed to build tokio runtime")?
+        .block_on(run_async(command))
+}
+
+async fn run_async(command: Command) -> Result<()> {
     // Race the command against a shutdown signal so Ctrl-C / SIGTERM (e.g.
     // `docker stop`, systemd) exit cleanly with a log line instead of an abrupt
     // kill mid-transfer.

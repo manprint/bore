@@ -61,6 +61,30 @@ impl Session {
             rejection_wait_until
         };
 
+        // `max_auth_attempts` was stored but never consulted, so a client could
+        // guess credentials for as long as it kept the connection open
+        // (GHSA-g6xm). Refuse any auth request past the cap.
+        if self.common.config.max_auth_attempts > 0
+            // auth request messages
+            && matches!(
+                buf.first(),
+                Some(&(msg::USERAUTH_REQUEST | msg::USERAUTH_INFO_RESPONSE))
+            )
+            // with cap exceeded
+            && matches!(
+                self.common.encrypted.as_ref().map(|e| &e.state),
+                Some(EncryptedState::WaitingAuthRequest(a))
+                    if a.rejection_count >= self.common.config.max_auth_attempts
+            )
+        {
+            self.common.disconnect(
+                Disconnect::NoMoreAuthMethodsAvailable,
+                "Too many authentication attempts",
+                "",
+            )?;
+            return Ok(());
+        }
+
         let Some(enc) = self.common.encrypted.as_mut() else {
             return Err(Error::Inconsistent.into());
         };
@@ -163,6 +187,40 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn auth_attempts_capped_at_max() {
+        let max = Config::default().max_auth_attempts;
+        let password_request = || {
+            let mut auth = vec![MSG_USERAUTH_REQUEST];
+            encode_string(&mut auth, b"test");
+            encode_string(&mut auth, b"ssh-connection");
+            encode_string(&mut auth, b"password");
+            auth.push(0); // change = false
+            encode_string(&mut auth, b"wrong");
+            auth
+        };
+
+        let mut session = RawSession::connect().await;
+        session.service_request().await.unwrap();
+
+        // Each rejected attempt gets a USERAUTH_FAILURE, up to the configured cap.
+        for _ in 0..max {
+            session.send_packet(&password_request()).await.unwrap();
+            let reply = read_packet(&mut session.stream).await.unwrap();
+            assert_eq!(reply.first(), Some(&MSG_USERAUTH_FAILURE));
+        }
+
+        // The next attempt exceeds the cap: the server must refuse it with a
+        // DISCONNECT instead of answering with yet another failure.
+        session.send_packet(&password_request()).await.unwrap();
+        let reply = read_packet(&mut session.stream).await.unwrap();
+        assert_eq!(
+            reply.first(),
+            Some(&crate::msg::DISCONNECT),
+            "server kept accepting auth attempts past max_auth_attempts",
+        );
+    }
+
+    #[tokio::test]
     async fn malformed_pty_req_truncated_modes_rejected_by_server() {
         let (result, panicked) = capture_panics(async {
             timeout(raw_channel_request_signal(|server_channel| {
@@ -174,6 +232,28 @@ mod tests {
 
         assert!(!panicked, "truncated pty terminal modes caused a panic");
         assert_rejected(result, "truncated pty terminal modes crashed or survived");
+    }
+
+    #[tokio::test]
+    async fn malformed_pty_req_too_many_modes_rejected_by_server() {
+        // 131 well-formed (code, u32) entries: one more than the fixed table.
+        // Unknown codes count too, so use one to cover both branches.
+        let mut modes = Vec::new();
+        for n in 0..131u32 {
+            modes.push(if n % 2 == 0 { Pty::VINTR as u8 } else { 0xfe });
+            modes.extend_from_slice(&n.to_be_bytes());
+        }
+        modes.push(Pty::TTY_OP_END as u8);
+        let (result, panicked) = capture_panics(async {
+            timeout(raw_channel_request_signal(|server_channel| {
+                pty_req_payload(server_channel, &modes)
+            }))
+            .await
+        })
+        .await;
+
+        assert!(!panicked, "pty-req with >130 modes caused a panic");
+        assert_rejected(result, "pty-req with >130 modes crashed or survived");
     }
 
     #[tokio::test]
@@ -1160,12 +1240,17 @@ impl Session {
                                 #[allow(clippy::indexing_slicing)] // length checked
                                 let num = BigEndian::read_u32(&mode_bytes[1..5]);
                                 debug!("code = {code:?}");
+                                // `i` counts unknown codes too and later slices `modes[0..i]`:
+                                // without this bound a >130-entry request panics (GHSA-cqjc).
+                                if i >= modes.len() {
+                                    error!("pty-req: too many pty codes");
+                                    return Err(Error::Inconsistent.into());
+                                }
                                 if let Some(code) = Pty::from_u8(code) {
-                                    #[allow(clippy::indexing_slicing)] // length checked
-                                    if i < 130 {
+                                    #[allow(clippy::indexing_slicing)]
+                                    // i < modes.len() checked above
+                                    {
                                         modes[i] = (code, num);
-                                    } else {
-                                        error!("pty-req: too many pty codes");
                                     }
                                 } else {
                                     info!("pty-req: unknown pty code {code:?}");

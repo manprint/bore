@@ -253,10 +253,13 @@ async fn tls_tunnel_with_basic_auth() -> Result<()> {
         tls: true,
     };
     let mut tls = transport::connect(&endpoint, true).await?;
-    tls.write_all(b"hello-tls").await?;
-    let mut buf = [0u8; 9];
+    // The payload ends its line: a non-HTTP peer is recognised by its first line,
+    // and a bare `hello-tls` is indistinguishable from the start of a method token
+    // (the gate fails closed on an undecidable prefix instead of forwarding it).
+    tls.write_all(b"hello-tls\r\n").await?;
+    let mut buf = [0u8; 11];
     tls.read_exact(&mut buf).await?;
-    assert_eq!(&buf, b"hello-tls");
+    assert_eq!(&buf, b"hello-tls\r\n");
 
     Ok(())
 }

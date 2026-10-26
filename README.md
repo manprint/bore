@@ -1345,8 +1345,18 @@ on tunnel ports (`--https`) and for the vhost HTTPS frontend unless
 ### Basic auth on tunnels
 
 Any tunnel — public or secret — can be protected with HTTP Basic auth via `--basic-auth
-"user:pass"` on `bore local`. HTTP requests without valid credentials get a `401`; non-HTTP
-traffic is forwarded unprotected (Basic auth is HTTP-only). For a **public** tunnel the
+"user:pass"` on `bore local`. HTTP requests without valid credentials get a `401`. Anything
+shaped like an HTTP request line (`token SP ...`, optionally after leading empty lines) is
+treated as HTTP and gated — **any** method (WebDAV `PROPFIND`/`MKCOL`/..., lowercase or custom
+tokens) and the HTTP/2 prior-knowledge preface (`PRI * HTTP/2.0`) included — there is no
+method allow-list. The gate is fail-closed: a connection that sends nothing (or only an
+unclassifiable fragment) within ~3 s is closed, never forwarded, so it cannot idle past the
+window and then speak HTTP to the service unauthenticated. Only bytes that positively are not
+HTTP (TLS records, binary frames, an `SSH-` banner, `token CRLF` text such as `PING`) are
+forwarded unprotected (Basic auth is HTTP-only). Consequences: a protocol where the *server*
+speaks first no longer works behind `--basic-auth`, and an **HTTPS backend** reached over a
+plain (non-`--https`) tunnel is not protected, because its encrypted records are not HTTP the
+gate can read — terminate TLS on the tunnel (`--https`) or at the backend's own auth. For a **public** tunnel the
 server enforces it; for a **secret** tunnel the provider enforces it (covering both the relay
 and the direct UDP path), so the credentials never leave the provider. Use it over TLS so the
 credentials are not sent in the clear.
@@ -1768,6 +1778,15 @@ Server flags (all `#[cfg(feature = "ssh-gateway")]`; also listed in the
 | `--ssh-window-size <BYTES>` | `BORE_SSH_WINDOW_SIZE` | no (default 16 MiB) | Per-channel SSH flow-control window; raise for high-latency links. |
 
 Without `--ssh-gateway`, behaviour is 100% unchanged bore-native.
+
+**Per-connection hardening (always on):** a connection is disconnected after 6 rejected
+authentication requests (`SSH_MAX_AUTH_ATTEMPTS`, OpenSSH's `MaxAuthTries` default; the
+initial `none` probe and each unauthorized key a client offers count), a wrong credential is
+answered after a 1 s delay, an offered public-key blob nested deeper than 8 certificate layers
+is refused, and at most 64 `env` requests per connection are kept. A client carrying many
+identities in its agent should add `-o IdentitiesOnly=yes -i <key>` so it does not exhaust the
+cap before the right key is tried. For an internet-facing gateway keep it behind a firewall or
+rate limiter anyway: the cap bounds one connection, not the number of connections.
 
 ### Provisioning credentials
 
@@ -4367,7 +4386,8 @@ bore local 22 --to bore.tld --port 22000 --secret hunter2 --auto-reconnect
 ssh -p 22000 user@bore.tld
 ```
 
-`--basic-auth` doesn't protect non-HTTP traffic (passed through unchanged): rely on
+`--basic-auth` doesn't protect non-HTTP traffic (passed through unchanged) and a
+server-speaks-first service (SSH sends its banner first) simply times out behind it: rely on
 `--secret` server-side and/or a **secret** tunnel to restrict access.
 
 ### 10. SSH ingress gateway, end-to-end (no `bore` binary on the client)

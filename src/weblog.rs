@@ -262,7 +262,7 @@ pub fn format_combined(rec: &AccessRecord) -> String {
     let ip = rec.real_ip.as_deref().unwrap_or("-");
 
     // Timestamp format: [10/Oct/2000:13:55:36 -0700]
-    let ts_fmt = format_description::parse(
+    let ts_fmt = format_description::parse_borrowed::<1>(
         "[day]/[month]/[year]:[hour]:[minute]:[second] [offset_hour][offset_minute]",
     )
     .expect("invalid format");

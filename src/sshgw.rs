@@ -118,9 +118,22 @@ pub const SSH_MAX_PACKET_SIZE: u32 = 32 * 1024;
 /// channel. Clamped up to this with a warning rather than accepted.
 pub const SSH_MIN_WINDOW_SIZE: u32 = SSH_MAX_PACKET_SIZE;
 
-/// Maximum number of authentication attempts (any method) allowed on one
-/// connection before russh disconnects it.
-pub const SSH_MAX_AUTH_ATTEMPTS: usize = 3;
+/// Maximum number of rejected authentication requests allowed on one
+/// connection before russh disconnects it (GHSA-g6xm: russh used to store
+/// this limit and never enforce it; the vendored copy now does).
+///
+/// Every OpenSSH session opens with a `none` probe that is rejected and
+/// counts, and every unauthorized key a client's agent offers counts too, so
+/// the value must leave room for a multi-key client: 6 is OpenSSH's own
+/// `MaxAuthTries` default. Brute force stays bounded per connection by this
+/// cap plus `SSH_AUTH_REJECTION_TIME` on each wrong credential.
+pub const SSH_MAX_AUTH_ATTEMPTS: usize = 6;
+
+/// Maximum `env` requests remembered per SSH connection. `env_request` used
+/// to push every one into an unbounded `Vec`, so one authenticated or
+/// unauthenticated-but-connected client could grow server memory at will.
+/// Real clients send a handful (`SendEnv`); anything past the cap is refused.
+pub const SSH_MAX_ENV_REQUESTS: usize = 64;
 
 /// Constant-time delay russh applies before answering a REJECTED
 /// authentication attempt (`russh::server::Config::auth_rejection_time`).
@@ -2247,12 +2260,24 @@ impl Handler for GatewayHandler {
         variable_value: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.state
-            .env
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push((variable_name.to_string(), variable_value.to_string()));
-        session.channel_success(channel)?;
+        let accepted = {
+            let mut env = self
+                .state
+                .env
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if env.len() < SSH_MAX_ENV_REQUESTS {
+                env.push((variable_name.to_string(), variable_value.to_string()));
+                true
+            } else {
+                false
+            }
+        };
+        if accepted {
+            session.channel_success(channel)?;
+        } else {
+            session.channel_failure(channel)?;
+        }
         Ok(())
     }
 
@@ -4968,6 +4993,10 @@ mod tests {
              only delays the client learning which methods exist"
         );
         assert_eq!(config.max_auth_attempts, SSH_MAX_AUTH_ATTEMPTS);
+        // `none` probe + a couple of unauthorized agent keys must still leave
+        // room for the right key: OpenSSH's own `MaxAuthTries` default is 6.
+        // Below it, enforcing the cap disconnects legitimate multi-key clients.
+        const _: () = assert!(SSH_MAX_AUTH_ATTEMPTS >= 6);
     }
 
     /// THE POLICY, independent of the environment it is read from.

@@ -131,3 +131,44 @@ resilience fix (wedged-but-TCP-alive clients; see `CLAUDE.md` I-SSH10):
 Also: the vendored crate's `Cargo.toml` gained an empty `[workspace]` table so
 `cargo test --manifest-path crates/russh/Cargo.toml` runs standalone (the
 parent consumes the crate via `[patch.crates-io]`, not as a workspace member).
+
+## Third vendored delta (2026-10-26): security backport from russh 0.65.0
+
+`RUSTSEC` does not list russh; the advisories are GHSAs against `russh < 0.65`.
+Bumping to 0.65.0 is a separate, larger change (API drift), so the minimal
+fixes are copied into this 0.62.1 tree. Patch: `scripts/patches/russh-security-backport.diff`
+(paths prefixed `crates/russh/`, apply with `-p3`).
+
+1. **GHSA-3hm4-p7h4-rvwp — nested certificate stack overflow (pre-auth,
+   process abort).** `keys::key::check_cert_nesting` counts `-cert-v01@`
+   markers in an offered public-key blob and rejects more than
+   `MAX_CERT_NESTING` (8); called from `PublicKeyExt::decode`,
+   `parse_public_key` and `cert::PublicKeyOrCertificate::decode` (the server's
+   pre-auth publickey path). A stack overflow aborts the WHOLE process (not
+   one connection task), so this is the highest-impact item.
+   Unit: `deeply_nested_certificate_is_rejected` (red: SIGABRT without the guard),
+   `shallow_certificate_nesting_passes_the_guard`.
+2. **GHSA-5xvq — low-order curve25519 point.** `kex/curve25519.rs` now uses
+   clamped X25519 (`MontgomeryPoint::mul_base_clamped`/`mul_clamped`, as 0.65)
+   instead of unclamped `from_bytes_mod_order` scalars (which let an order-8
+   peer point leak the secret mod 8), rejects an all-zero shared secret on
+   both sides and a non-32-byte peer key on the client side. Units:
+   `server_dh_rejects_low_order_points`, `server_dh_accepts_a_normal_point`,
+   `client_rejects_low_order_and_wrong_length_server_pubkey`.
+3. **GHSA-cqjc — `pty-req` with more than 130 terminal modes** indexed past a
+   fixed array (panic in the connection task). The parser now returns
+   `Error::Inconsistent` once the mode count would exceed the buffer. Unit:
+   `malformed_pty_req_too_many_modes_rejected_by_server`.
+4. **GHSA-g6xm — `max_auth_attempts` never enforced.** `process_packet` now
+   disconnects (`NoMoreAuthMethodsAvailable`) once `rejection_count >=
+   max_auth_attempts` on a `USERAUTH_REQUEST`/`USERAUTH_INFO_RESPONSE`.
+   `0` keeps the old "unlimited". **Behavioural consequence for bore:** the
+   `none` probe and every wrong key a client offers each count, so
+   `sshgw::SSH_MAX_AUTH_ATTEMPTS` was raised 3 -> 6 (OpenSSH `MaxAuthTries`
+   default). Units: `auth_attempts_capped_at_max` (russh) and
+   `t_ssh_authcap1_*`/`t_ssh_authcap2_*` (bore, real OpenSSH client).
+
+Not backported (bore does not run that code): the client-side
+`check_cert_nesting` call sites (`client/kex.rs`, `keys/agent/client.rs`).
+Re-applying on a russh bump: all four are in 0.65.0 already; drop this delta
+when moving to it.

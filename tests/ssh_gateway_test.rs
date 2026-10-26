@@ -1857,6 +1857,134 @@ async fn t_ssh_preauth1_stalled_handshake_is_disconnected() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// T-SSH-AUTHCAP — russh now enforces `max_auth_attempts` (GHSA-g6xm; it was
+// stored and never consulted). The cap must stop a client that keeps guessing
+// WITHOUT disconnecting a legitimate multi-key client: the `none` probe and
+// every unauthorized agent key each count as one rejected request, so
+// `SSH_MAX_AUTH_ATTEMPTS` has to leave room for a handful of wrong keys.
+// ---------------------------------------------------------------------------
+
+/// `ssh_args` for one forward, preceded by `wrong` extra identities that the
+/// gateway does not authorize (OpenSSH offers them in command-line order).
+fn ssh_args_with_wrong_keys(
+    gw_port: u16,
+    good: &Path,
+    wrong: &[PathBuf],
+    forwards: &[(u16, u16)],
+) -> Vec<String> {
+    let mut args = ssh_args(gw_port, good, forwards, None);
+    // `ssh_base_args` already carries `-i <good>`; prepend the wrong ones so
+    // they are tried first.
+    let mut front: Vec<String> = Vec::new();
+    for w in wrong {
+        front.push("-i".into());
+        front.push(w.display().to_string());
+    }
+    front.append(&mut args);
+    front
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_authcap1_client_with_a_few_wrong_keys_still_authenticates() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let auth_dir = dir.path().join("auth");
+    std::fs::create_dir_all(&auth_dir)?;
+    let good = gen_keypair(dir.path(), "good").await?;
+    write_authorized_keys(&auth_dir, &good, None)?;
+    // 3 unauthorized keys + the `none` probe = 4 rejections < the cap.
+    let mut wrong = Vec::new();
+    for i in 0..3 {
+        wrong.push(gen_keypair(dir.path(), &format!("wrong{i}")).await?);
+    }
+
+    let gw_port = start_gateway_server(dir.path().join("host_key"), auth_dir).await?;
+    let svc_port = spawn_echo_service().await?;
+
+    let fwd_port = 19071u16;
+    let args = ssh_args_with_wrong_keys(gw_port, &good, &wrong, &[(fwd_port, svc_port)]);
+    let mut child = Command::new("ssh")
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh -R (T-SSH-AUTHCAP1)")?;
+
+    wait_port(fwd_port, true).await;
+    assert!(
+        roundtrip(fwd_port, b"ping-authcap1").await?,
+        "a client that offered 3 wrong keys before the right one was cut off"
+    );
+
+    child.kill().await.ok();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_ssh_authcap2_client_that_keeps_guessing_is_disconnected() -> Result<()> {
+    let _g = SERIAL_GUARD.lock().await;
+    skip_without_ssh_cli!();
+    wait_port(CONTROL_PORT, false).await;
+
+    let dir = tempfile::tempdir()?;
+    let auth_dir = dir.path().join("auth");
+    std::fs::create_dir_all(&auth_dir)?;
+    let good = gen_keypair(dir.path(), "good").await?;
+    write_authorized_keys(&auth_dir, &good, None)?;
+    // More unauthorized keys than the cap, THEN the right one: the cap must
+    // trip before the right key is ever tried.
+    let mut wrong = Vec::new();
+    for i in 0..(bore_cli::sshgw::SSH_MAX_AUTH_ATTEMPTS + 2) {
+        wrong.push(gen_keypair(dir.path(), &format!("wrong{i}")).await?);
+    }
+
+    let gw_port = start_gateway_server(dir.path().join("host_key"), auth_dir).await?;
+    let svc_port = spawn_echo_service().await?;
+
+    let fwd_port = 19072u16;
+    let args = ssh_args_with_wrong_keys(gw_port, &good, &wrong, &[(fwd_port, svc_port)]);
+    let mut child = Command::new("ssh")
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh -R (T-SSH-AUTHCAP2)")?;
+
+    // ssh must give up on its own (server disconnect), and never get the
+    // forward up.
+    let status = time::timeout(Duration::from_secs(60), child.wait())
+        .await
+        .context("ssh kept the session open past the auth-attempt cap")??;
+    assert!(
+        !status.success(),
+        "ssh authenticated even though the cap should have tripped first"
+    );
+    wait_port(fwd_port, false).await;
+
+    // The gateway is unharmed: a well-behaved client still gets in.
+    let ok_args = ssh_args(gw_port, &good, &[(fwd_port, svc_port)], None);
+    let mut ok = Command::new("ssh")
+        .args(&ok_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn ssh -R (T-SSH-AUTHCAP2 follow-up)")?;
+    wait_port(fwd_port, true).await;
+    assert!(roundtrip(fwd_port, b"ping-authcap2").await?);
+    ok.kill().await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // T-SSH-KEEP1 — an idle, authenticated `-N -R` session with zero tunnel
 // traffic survives well past `SSH_CTRL_TIMEOUT` (15 s) on keepalives alone
 // (the server's 1 s probes, answered by the client), and the tunnel still

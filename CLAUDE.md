@@ -116,7 +116,7 @@ Each line = the rule. `docs/INVARIANTS.md` = why, field measurements, gates, red
 - Hub (`--max-clients N>1`): separate `run_listen_hub` branch (I-MC1); per-peer keys from the RAW `session_nonce` + own counter; router never restarts; nft spoke isolation; connector routes default-deny (`filter_accepted`). Trap: a spawn-only helper must not be an unawaited `async fn`.
 - NAT E3 (`real@virtual`): no `@` ⇒ byte-identical masquerade; only the virtual CIDR on the wire; stateless kernel netmap; RAII + `stale_reclaim`.
 - `--forward-accept`: iptables `filter` FORWARD custom chain `bore_<id>_fwd`; off ⇒ probe + warn. NAT'd subnets may also need `--nat-masquerade`.
-- macOS (DEC-M1): Linux bodies byte-identical under `cfg(linux)`, macOS twins additive; utun + PF anchor `bore_vpn/<id>`; doc comment, then `#[allow]`, then `#[cfg]`; macos-14 CI is the only oracle.
+- macOS (DEC-M1): Linux bodies byte-identical under `cfg(linux)`, macOS twins additive; utun + PF anchor `bore_vpn/<id>`; doc comment, then `#[allow]`, then `#[cfg]`; macOS CI (`macos-latest`; `macos-14` retired 2026-11) is the only oracle.
 - Android: twins + `crates/bore-android-tun`; HOST-ONLY (no advertise/NAT/forward/hub/multi-queue), enforced twice; toybox `ip route add` (no `replace`); `ip rule add to <subnet> lookup main priority 100` tolerating "File exists"; `run_dir()` = `/data/local/tmp`.
 
 ## SSH ingress gateway (`--ssh-gateway`; operational guide `docs/ssh-gateway/SSH_GATEWAY.md` §6)

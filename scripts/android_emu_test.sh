@@ -268,11 +268,15 @@ guest_bore_bg "e3.log" local 8080 --to "$HOST_TO" --tcp-secret-id T_AND_E3
 guest_wait_log e3.log "registered secret tunnel" || true
 guest_http_responder 8080
 guest_wait_listen 8080 || true
+# The consumer's local port must sit OUTSIDE the server's public range
+# (40000-40100): inside it, a port the server handed to an earlier stage can
+# still be bound, and the proxy then dies on "Address already in use" (seen in
+# CI as `got ''` with a healthy guest log).
 BODY="$("$BORE_HOST_BIN" proxy --to "$HOST_LOOPBACK" --tcp-secret-id T_AND_E3 \
-    --local-proxy-port ":40031" >"$TMPDIR/e3_proxy.log" 2>&1 &
+    --local-proxy-port ":41031" >"$TMPDIR/e3_proxy.log" 2>&1 &
     E3_PID=$!
     sleep 1.5
-    curl -sf --max-time 5 "http://127.0.0.1:40031" || true
+    curl -sf --max-time 5 "http://127.0.0.1:41031" || true
     kill "$E3_PID" >/dev/null 2>&1 || true
     wait "$E3_PID" 2>/dev/null || true)"
 if [ "$BODY" = "hello" ]; then

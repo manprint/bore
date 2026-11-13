@@ -551,10 +551,15 @@ jobs:
           target/debug/examples/windows_vpn_spike.exe leak-then-reclaim leak
           target/debug/examples/windows_vpn_spike.exe leak-then-reclaim reclaim
 
+  # `macos-latest`, not a pinned image: GitHub retired `macos-14` (2026-11: "The
+  # configuration 'macos-14-arm64-us-default' is not supported"), and a pinned
+  # label that disappears cancels the job before it starts — which also fails
+  # the release gate. The device tests below need Apple Silicon + utun + PF,
+  # all present on every arm64 image since.
   macos-vpn-build:
-    name: macOS VPN build (macos-14)
+    name: macOS VPN build (macos-latest)
     if: inputs.only != 'web-transfer'
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -572,7 +577,7 @@ jobs:
 
       - run: cargo build --features vpn --example macos_vpn_spike
 
-  # T-MAC-SMOKE: REAL single-host device tests on macos-14 under sudo (utun create,
+  # T-MAC-SMOKE: REAL single-host device tests on macos-latest under sudo (utun create,
   # gateway PF apply/revert, SIGKILL stale-reclaim). Gating (no continue-on-error)
   # so the macOS runtime is actually exercised, not skipped. The diagnostic step
   # records runner capabilities first; if a hosted runner forbids utun/PF even
@@ -580,9 +585,9 @@ jobs:
   # runner (labels: [self-hosted, macOS, ARM64]) and the manual checklist
   # docs/vpn/VPN_MACOS_ACCEPTANCE.md remains the two-host acceptance.
   macos-vpn-e2e:
-    name: macOS VPN device e2e (macos-14)
+    name: macOS VPN device e2e (macos-latest)
     if: inputs.only != 'web-transfer'
-    runs-on: macos-14
+    runs-on: macos-latest
     # Independent of macos-vpn-build: the real device tests (utun/PF) are the
     # point and should run even while unrelated test-corpus clippy is cleaned up.
     steps:

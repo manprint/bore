@@ -36,7 +36,7 @@
 #               macOS and Windows transfer-path tests; the VPN cross checks for
 #               windows-msvc / apple-darwin / android; REAL device e2e on
 #               windows-latest (WinTun, routes, firewall, WinNAT) and on
-#               macos-14 (utun, PF); two Android emulator e2e suites.
+#               macos-latest (utun, PF); two Android emulator e2e suites.
 #   gate-cross  build AND test on every target `mean_bean_deploy` ships:
 #               7 Linux targets under `cross`, both windows-msvc, both Darwin.
 #   gate-e2e    the nine root netns correctness suites, BLOCKING for a release

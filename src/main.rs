@@ -1,3 +1,9 @@
+/// mimalloc on the static musl builds, the system allocator elsewhere
+/// (`crates/bore-alloc`).
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: bore_alloc::Allocator = bore_alloc::Allocator;
+
 use std::ffi::OsString;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
@@ -218,9 +224,10 @@ enum Command {
         )]
         nat_udp_release_timeout: u64,
 
-        /// Maximum concurrent connections served over a direct UDP path (the
-        /// direct-path analog of the server's --max-conns; bounds this provider's
-        /// resources). Secret-tunnel providers only.
+        /// Maximum concurrent connections: for a secret-tunnel provider, those
+        /// served over the direct UDP path (bounds this provider's resources);
+        /// for a public tunnel, the cap the server applies to this tunnel's
+        /// port, never above the server's own --max-conns.
         #[clap(long, value_name = "N", default_value_t = bore_cli::server::DEFAULT_MAX_CONNS, env = "BORE_MAX_CONNS")]
         max_conns: usize,
 
@@ -619,7 +626,8 @@ enum Command {
         )]
         secret: Option<String>,
 
-        /// Maximum number of concurrently proxied connections per client.
+        /// Maximum number of concurrently proxied connections on this server
+        /// (one budget shared by every tunnel).
         #[clap(long, value_name = "N", default_value_t = bore_cli::server::DEFAULT_MAX_CONNS, env = "BORE_MAX_CONNS")]
         max_conns: usize,
 
@@ -2150,6 +2158,7 @@ async fn dispatch(command: Command) -> Result<()> {
                         port_prediction: try_port_prediction,
                         manual_candidates: udp_candidate.clone(),
                         no_stun: udp_no_stun,
+                        ..Default::default()
                     };
                     let connect = move || {
                         let (local_host, to, id, secret, stun_server, meta, access_logger, gather) = (
@@ -2313,6 +2322,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 port_prediction: try_port_prediction,
                 manual_candidates: udp_candidate.clone(),
                 no_stun: udp_no_stun,
+                ..Default::default()
             };
             let connect = move || {
                 let (to, tcp_secret_id, secret, stun_server, notes, gather) = (
@@ -3288,6 +3298,7 @@ async fn dispatch(command: Command) -> Result<()> {
                         port_prediction: try_port_prediction,
                         manual_candidates: udp_candidate.clone(),
                         no_stun: udp_no_stun,
+                        ..Default::default()
                     },
                     nat_udp_preferred_port,
                     UdpTestOptions {
@@ -3750,6 +3761,10 @@ fn init_logging(verbose: u8) {
 }
 
 fn main() -> Result<()> {
+    // Before any other thread exists: the allocator's option store is not
+    // thread safe.
+    #[cfg(feature = "mimalloc")]
+    bore_alloc::configure();
     // Windows' default main-thread stack is 1 MiB, versus ~8 MiB on Linux/macOS.
     // `run` drives the entire application (via #[tokio::main]'s block_on) on
     // whichever thread calls it; some paths (found via the windows-vpn-build CI

@@ -2167,7 +2167,7 @@ fn spawn_handle(this: &Arc<Client>, stream: mux::Stream, path: BackendPath) {
     let task_client = Arc::clone(this);
     owner.spawn_task(
         async move {
-            info!("new connection");
+            debug!("new connection");
             match task_client.handle_connection(stream, path).await {
                 // Per-connection success is high-frequency, low-value: log it at
                 // trace, matching the server and secret-relay paths (which trace
@@ -2185,8 +2185,18 @@ fn spawn_handle(this: &Arc<Client>, stream: mux::Stream, path: BackendPath) {
 /// uses the IPv4 UDP stack, so prefer IPv4 answers and fail fast if none are available.
 #[cfg(feature = "udp")]
 async fn resolve_direct_server_addr(endpoint: &Endpoint, port: u16) -> Result<SocketAddr> {
-    tokio::net::lookup_host((endpoint.host.as_str(), port))
+    // Bounded: the caller is the control loop, which also beats and answers the
+    // server. A resolver that drops queries must cost this one direct attempt
+    // (the caller falls back to the warm TCP relay), not the tunnel's liveness.
+    let lookup = tokio::net::lookup_host((endpoint.host.as_str(), port));
+    timeout(crate::holepunch::STUN_RESOLVE_TIMEOUT, lookup)
         .await
+        .with_context(|| {
+            format!(
+                "resolving direct udp endpoint {}:{port} timed out",
+                endpoint.host
+            )
+        })?
         .with_context(|| {
             format!(
                 "failed to resolve direct udp endpoint {}:{port}",
@@ -2563,17 +2573,18 @@ async fn offer_provider_candidates(
         stun_chain = ?stun_chain,
         "provider UDP candidate discovery configured"
     );
-    let stun_targets = match holepunch::resolve_live_stun_targets(
-        &endpoint.host,
-        endpoint.port,
-        stun_server,
-    )
-    .await
-    {
-        Ok(targets) => targets,
-        Err(err) => {
-            warn!(%err, "no STUN targets resolved for provider; offering non-STUN candidates only");
-            Vec::new()
+    // `--udp-no-stun` skips the chain, so its names must not be resolved either:
+    // the flag exists for networks where neither STUN nor its DNS is reachable.
+    let stun_targets = if gather.no_stun {
+        Vec::new()
+    } else {
+        match holepunch::resolve_live_stun_targets(&endpoint.host, endpoint.port, stun_server).await
+        {
+            Ok(targets) => targets,
+            Err(err) => {
+                warn!(%err, "no STUN targets resolved for provider; offering non-STUN candidates only");
+                Vec::new()
+            }
         }
     };
     let discovery = holepunch::gather_candidates_traversal(&tsock, &stun_targets, gather).await;

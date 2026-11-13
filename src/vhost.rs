@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 #[cfg(feature = "udp")]
+use std::sync::atomic::AtomicBool;
+#[cfg(feature = "udp")]
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Arc, RwLock};
@@ -527,6 +529,9 @@ pub struct DirectPool {
     conns: RwLock<Vec<DirectMember>>,
     next: AtomicU64,
     ids: AtomicU64,
+    /// Set by [`DirectPool::close_all`], under the `conns` write lock. A pool
+    /// is closed once, when its registry entry ends, and never reopened.
+    closed: AtomicBool,
 }
 
 #[cfg(feature = "udp")]
@@ -538,11 +543,17 @@ struct DirectMember {
 #[cfg(feature = "udp")]
 impl DirectPool {
     /// Install a connection, returning its id (used by [`DirectPool::remove`] when
-    /// the connection closes). Returns `None` when the pool is already full, so the
-    /// caller can drop the excess connection.
+    /// the connection closes). Returns `None` when the pool is already full or
+    /// already closed, so the caller can close the excess connection.
+    ///
+    /// The closed check is what makes deregistration final: a QUIC carrier that
+    /// authenticated against the entry just before it was dropped would
+    /// otherwise be installed AFTER `close_all`, into a pool nobody will ever
+    /// close again — a live connection (and its `--udp-memory-budget` permit)
+    /// held until the peer goes away on its own.
     pub fn install(&self, conn: crate::holepunch::DirectConn) -> Option<u64> {
         let mut conns = self.conns.write().unwrap();
-        if conns.len() >= MAX_DIRECT_CARRIERS {
+        if self.closed.load(Ordering::Relaxed) || conns.len() >= MAX_DIRECT_CARRIERS {
             return None;
         }
         let id = self.ids.fetch_add(1, Ordering::Relaxed);
@@ -579,6 +590,7 @@ impl DirectPool {
     /// entry ends so detached close monitors cannot keep QUIC carriers alive.
     pub fn close_all(&self) {
         let mut conns = self.conns.write().unwrap();
+        self.closed.store(true, Ordering::Relaxed);
         for member in conns.iter() {
             member.conn.close();
         }
@@ -1124,11 +1136,11 @@ pub async fn serve_vhost_provider(
         let token = Uuid::new_v4().to_string();
         let (tx, rx) = mpsc::unbounded_channel();
         pending_carriers.insert(token.clone(), tx);
+        // Guard BEFORE the fallible send (as in `serve_tunnel`): a failed send
+        // must not leave the token in `pending_carriers` for the process life.
+        let guard = TokenGuard::new(pending_carriers.clone(), token.clone());
         control
-            .send(ServerMessage::CarrierToken {
-                token: token.clone(),
-                extra,
-            })
+            .send(ServerMessage::CarrierToken { token, extra })
             .await?;
         info!(
             extra,
@@ -1136,7 +1148,7 @@ pub async fn serve_vhost_provider(
             ceiling = auto_ceiling,
             "vhost carrier pool offered"
         );
-        Some((rx, TokenGuard::new(pending_carriers.clone(), token)))
+        Some((rx, guard))
     } else {
         None
     };
@@ -1348,17 +1360,30 @@ async fn open_relay_carrier(
     forward_ip: Option<&str>,
     addr: SocketAddr,
 ) -> Result<(mux::LinkStream, std::sync::Arc<AtomicUsize>)> {
-    let pick = entry
-        .pool
-        .pick_avoiding_bulk()
-        .context("no live vhost carrier")?;
-    request_carrier_growth(entry, &pick);
-    let stream = pick
-        .opener
-        .open_ready(forward_ip, Some(addr))
-        .await
-        .context("vhost provider unavailable")?;
-    Ok((stream, pick.bulk))
+    // One attempt per carrier: a carrier whose connection just died is still in
+    // the pool until its owner marks it, and with a healthy sibling available
+    // that must not cost the visitor a 502.
+    let attempts = entry.pool.len().max(1);
+    let mut last_err = None;
+    for attempt in 0..attempts {
+        let Some(pick) = entry.pool.pick_avoiding_bulk() else {
+            break;
+        };
+        if attempt == 0 {
+            request_carrier_growth(entry, &pick);
+        }
+        match pick.opener.open_ready(forward_ip, Some(addr)).await {
+            Ok(stream) => return Ok((stream, pick.bulk)),
+            Err(err) => {
+                tracing::trace!(%err, "vhost carrier open failed; trying the next live carrier");
+                last_err = Some(err);
+            }
+        }
+    }
+    match last_err {
+        Some(err) => Err(err).context("vhost provider unavailable"),
+        None => bail!("no live vhost carrier"),
+    }
 }
 
 /// Nudge an auto-carrier provider's control loop when a new proxied connection
@@ -1546,15 +1571,16 @@ pub async fn relay_vhost(
         provider = Box::new(tls) as mux::LinkStream;
     }
 
-    // Keep a copy of the head for logging (before it's moved/rewritten).
-    let head_for_logging = head.clone();
-    let request_head = if entry.request_headers.is_empty() {
-        // Zero-overhead pure-splice path: forward the already-read head as-is.
-        head
-    } else {
-        rewrite_head(&head, &entry.request_headers)
-    };
-    provider.write_all(&request_head).await?;
+    // Pure-splice path: the already-read head is forwarded as-is, borrowed. The
+    // original head then moves on to the access-log context untouched — no
+    // per-request copy.
+    let rewritten =
+        (!entry.request_headers.is_empty()).then(|| rewrite_head(&head, &entry.request_headers));
+    provider
+        .write_all(rewritten.as_deref().unwrap_or(&head))
+        .await?;
+    drop(rewritten);
+    let head_for_logging = head;
 
     let _guard = crate::admin::ActiveGuard::new(active);
 
@@ -2024,10 +2050,16 @@ pub async fn handle_https(
         }
     };
 
-    let mut tls_stream = acceptor
-        .accept(stream)
-        .await
-        .context("TLS handshake failed")?;
+    // Bounded like the public edge (`edge.rs`): this task holds a `--max-conns`
+    // permit, so a peer that opens the connection and never finishes the
+    // handshake would otherwise pin a slot and a descriptor forever.
+    let mut tls_stream = timeout(
+        crate::shared::TLS_HANDSHAKE_TIMEOUT,
+        acceptor.accept(stream),
+    )
+    .await
+    .context("TLS handshake timed out")?
+    .context("TLS handshake failed")?;
 
     let head = timeout(NETWORK_TIMEOUT, read_head_async(&mut tls_stream))
         .await

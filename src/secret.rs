@@ -460,14 +460,14 @@ pub async fn serve_provider(
         let token = Uuid::new_v4().to_string();
         let (tx, rx) = mpsc::unbounded_channel();
         pending_carriers.insert(token.clone(), tx);
+        // Guard BEFORE the fallible send (as in `serve_tunnel`): a failed send
+        // must not leave the token in `pending_carriers` for the process life.
+        let guard = TokenGuard::new(pending_carriers.clone(), token.clone());
         control
-            .send(ServerMessage::CarrierToken {
-                token: token.clone(),
-                extra,
-            })
+            .send(ServerMessage::CarrierToken { token, extra })
             .await?;
         info!(%id, extra, "provider carrier pool offered");
-        Some((rx, TokenGuard::new(pending_carriers.clone(), token)))
+        Some((rx, guard))
     } else {
         None
     };
@@ -899,7 +899,14 @@ async fn broker_udp(
         peer_selected_stun: consumer_offer.selected_stun.clone(),
         v2: consumer_v2,
     };
-    if to_provider.send(offer).await.is_err() {
+    // Bounded: this runs in the consumer's control loop, which also accepts its
+    // relayed substreams. A provider whose own loop is busy must cost the
+    // consumer this one direct attempt, not every connection it has queued.
+    let delivered = matches!(
+        tokio::time::timeout(crate::shared::NETWORK_TIMEOUT, to_provider.send(offer)).await,
+        Ok(Ok(()))
+    );
+    if !delivered {
         warn!(
             %id,
             "provider task vanished during UDP brokering — provider connection \
@@ -1105,7 +1112,10 @@ impl AsyncWrite for DataStream {
 /// Client side of a secret tunnel consumer (`bore proxy`): binds a local listener
 /// and forwards each accepted connection to the provider through the server.
 pub struct Proxy {
-    control: Delimited<mux::Stream>,
+    /// `None` exactly while [`Proxy::initial`] still owns the control stream.
+    control: Option<Delimited<mux::Stream>>,
+    /// The first direct negotiation, when it outlived the grace of [`Proxy::new`].
+    initial: Option<InitialNegotiation>,
     /// Liveness of the main (control) connection, captured before its opener
     /// moved into the carrier pool (plan 005, D2).
     ctrl_activity: mux::ConnActivity,
@@ -1174,6 +1184,113 @@ pub struct Proxy {
     /// because an operator reads it as the truth.
     #[cfg(feature = "udp")]
     path_report: bool,
+}
+
+/// How long [`Proxy::new`] waits for a SIGN that UDP leaves this network (the
+/// first STUN reflexive answer, `GatherOptions::reflexive_seen`) before it
+/// returns on the relay and lets [`Proxy::listen`] adopt the verdict.
+///
+/// The negotiation used to be awaited to the end before the local listener
+/// existed. On a network that drops UDP that is the STUN budget plus the check
+/// round plus the QUIC connect budget: MEASURED 7.7 s of a consumer that looks
+/// started and accepts nothing, at every start and every reconnect, against
+/// 0.3 s without `--udp`.
+///
+/// The deadline is on the sign, not on the verdict, because a HEALTHY
+/// negotiation is not short: the filtering probe alone waits 900 ms and the
+/// check round follows (2.9–4.1 s measured in the NAT harness). A flat 1 s
+/// deadline sent working direct paths to the relay, and `bore transfer --udp`
+/// with them, since it reads `is_direct()` right after `new`. The sign itself
+/// costs one STUN round trip, so this window only has to cover the provider
+/// hint, the name lookups and that round trip.
+const INITIAL_DIRECT_PROBE_GRACE: Duration = Duration::from_millis(1500);
+
+/// Once the sign arrived, how much longer [`Proxy::new`] waits for the verdict.
+/// Covers a healthy filtering probe + punch + check round + QUIC connect; a
+/// negotiation that needs more is one that is failing, and it finishes in the
+/// background like the no-sign case.
+const INITIAL_DIRECT_VERDICT_GRACE: Duration = Duration::from_secs(4);
+
+/// What the first direct negotiation hands back: the control stream it
+/// borrowed, its verdict, and whether the server accepts a path report (S-1).
+type InitialOutcome = (Delimited<mux::Stream>, Result<Option<DirectUpgrade>>, bool);
+
+/// A first direct negotiation still in flight when [`Proxy::new`] returned. The
+/// task owns the control stream until it ends; dropping this aborts it, so an
+/// abandoned `Proxy` releases its connection at once.
+struct InitialNegotiation {
+    task: tokio_util::task::AbortOnDropHandle<InitialOutcome>,
+    tcp_secret_id: String,
+    carriers: u16,
+}
+
+/// Applies the verdict of the consumer's first direct negotiation: switch the
+/// data path when it produced a connection, and report the path to the server
+/// when the server declared it listens (S-1). Shared by the two places the
+/// verdict can arrive — [`Proxy::new`] inside the grace window, and
+/// [`Proxy::listen`] after it.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "udp"), allow(unused_variables, clippy::ptr_arg))]
+async fn adopt_initial_outcome(
+    control: &mut Delimited<mux::Stream>,
+    outcome: Result<Option<DirectUpgrade>>,
+    path_report: bool,
+    tcp_secret_id: &str,
+    carriers: u16,
+    data_path: &mut DataPath,
+    direct: &mut bool,
+    direct_closed_rx: &mut Option<oneshot::Receiver<()>>,
+) {
+    // The reason is captured BEFORE the match consumes the outcome, so the
+    // report carries the same text the log line does rather than a second,
+    // drifting description of the same failure.
+    let path_reason: Option<String> = match &outcome {
+        Ok(Some(_)) => None,
+        Ok(None) => Some("server reported the direct path unavailable".into()),
+        Err(err) => Some(format!("{err:#}")),
+    };
+    match outcome {
+        #[cfg(feature = "udp")]
+        Ok(Some(conn)) => {
+            info!(%tcp_secret_id, "using direct udp path");
+            // The direct path uses a single QUIC connection (one stream per
+            // proxied connection); `--carriers` only governs the relay
+            // fallback. Warn rather than silently ignore the flag (D8).
+            if carriers > 1 {
+                warn!(
+                    %tcp_secret_id, carriers,
+                    "secret --udp direct path uses a single QUIC connection; \
+                     --carriers applies only to the relay fallback \
+                     (multi-connection direct is not supported)"
+                );
+            }
+            *direct_closed_rx = Some(spawn_closed_monitor(conn.clone()));
+            *data_path = DataPath::Direct(conn);
+            *direct = true;
+        }
+        // Unreachable without the `udp` feature (no direct path exists).
+        #[cfg(not(feature = "udp"))]
+        Ok(Some(_)) => {}
+        Ok(None) => info!(%tcp_secret_id, "udp unavailable, using relay"),
+        Err(err) => warn!(%err, "udp negotiation failed, using relay"),
+    }
+    if path_report {
+        let path = if *direct { "direct" } else { "relay" };
+        let send = control.send(ClientMessage::SecretPathReport {
+            path: path.into(),
+            reason: path_reason,
+        });
+        // Never fatal and always bounded (P-9): the report is observability,
+        // and a tunnel that works must not die or stall because the admin page
+        // cannot be updated.
+        match tokio::time::timeout(ctrl_heartbeat_send_timeout(), send).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                debug!(%err, "could not report the secret data path to the server")
+            }
+            Err(_) => debug!("reporting the secret data path timed out"),
+        }
+    }
 }
 
 /// Initial delay (s) for the UDP upgrade exponential backoff: 2, 4, 8, 16, …
@@ -1298,11 +1415,12 @@ impl Proxy {
         // Declared HERE and not inside the negotiation below, because the
         // answer outlives registration: a relay→direct upgrade happens minutes
         // later and has to report itself too (see `path_report` on `Proxy`).
+        #[cfg(feature = "udp")]
         let mut path_report = false;
 
         // Optionally negotiate a direct UDP path; on any failure keep the relay so
         // the tunnel still works through the server.
-        if udp {
+        let (control, initial) = if udp {
             #[cfg(feature = "udp")]
             if secret.is_none() {
                 warn!(
@@ -1311,70 +1429,90 @@ impl Proxy {
                      Pass --secret for a strong token."
                 );
             }
-            // S-1: set by the negotiation when the server's UdpPunch declared it
-            // accepts a path report. Stays false against an old server, and the
-            // report below is then never sent — an old server cannot decode the
-            // variant and would fail its control loop.
-            let outcome = negotiate_direct_consumer(
-                &mut control,
-                &endpoint,
-                secret,
-                tcp_secret_id,
-                stun_server,
-                &gather,
-                udp_port,
-                &mut path_report,
-            )
+            // S-1: `path_report` is set by the negotiation when the server's
+            // UdpPunch declared it accepts a path report. Stays false against an
+            // old server, and the report is then never sent — an old server
+            // cannot decode the variant and would fail its control loop.
+            //
+            // The negotiation runs in its own task, which owns the control
+            // stream until it ends, so that a slow one (UDP dropped on this
+            // network) cannot keep the local listener closed: past the grace
+            // window `new` returns on the relay and `listen` adopts the verdict.
+            let reflexive_seen = Arc::new(tokio::sync::Notify::new());
+            let mut task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn({
+                let endpoint = endpoint.clone();
+                let secret = secret.map(str::to_string);
+                let id = tcp_secret_id.to_string();
+                let stun_server = stun_server.map(str::to_string);
+                let mut gather = gather.clone();
+                gather.reflexive_seen = Some(Arc::clone(&reflexive_seen));
+                async move {
+                    let mut accepts_report = false;
+                    let outcome = negotiate_direct_consumer(
+                        &mut control,
+                        &endpoint,
+                        secret.as_deref(),
+                        &id,
+                        stun_server.as_deref(),
+                        &gather,
+                        udp_port,
+                        &mut accepts_report,
+                    )
+                    .await;
+                    (control, outcome, accepts_report)
+                }
+            }));
+            let early = tokio::time::timeout(INITIAL_DIRECT_PROBE_GRACE, async {
+                tokio::select! {
+                    joined = &mut task => Some(joined),
+                    _ = reflexive_seen.notified() => None,
+                }
+            })
             .await;
-            // The reason is captured BEFORE the match consumes the outcome, so
-            // the report carries the same text the log line does rather than a
-            // second, drifting description of the same failure.
-            let path_reason: Option<String> = match &outcome {
-                Ok(Some(_)) => None,
-                Ok(None) => Some("server reported the direct path unavailable".into()),
-                Err(err) => Some(format!("{err:#}")),
-            };
-            match outcome {
-                #[cfg(feature = "udp")]
-                Ok(Some(conn)) => {
-                    info!(%tcp_secret_id, "using direct udp path");
-                    // The direct path uses a single QUIC connection (one stream per
-                    // proxied connection); `--carriers` only governs the relay
-                    // fallback. Warn rather than silently ignore the flag (D8).
-                    if carriers > 1 {
-                        warn!(
-                            %tcp_secret_id, carriers,
-                            "secret --udp direct path uses a single QUIC connection; \
-                             --carriers applies only to the relay fallback \
-                             (multi-connection direct is not supported)"
-                        );
-                    }
-                    direct_closed_rx = Some(spawn_closed_monitor(conn.clone()));
-                    data_path = DataPath::Direct(conn);
-                    direct = true;
-                }
-                // Unreachable without the `udp` feature (no direct path exists).
-                #[cfg(not(feature = "udp"))]
-                Ok(Some(_)) => {}
-                Ok(None) => info!(%tcp_secret_id, "udp unavailable, using relay"),
-                Err(err) => warn!(%err, "udp negotiation failed, using relay"),
-            }
-            if path_report {
-                let path = if direct { "direct" } else { "relay" };
-                if let Err(err) = control
-                    .send(ClientMessage::SecretPathReport {
-                        path: path.into(),
-                        reason: path_reason,
-                    })
+            let joined = match early {
+                Ok(Some(joined)) => Some(joined),
+                Ok(None) => tokio::time::timeout(INITIAL_DIRECT_VERDICT_GRACE, &mut task)
                     .await
-                {
-                    // Never fatal: the report is observability, and a tunnel
-                    // that works must not die because the admin page cannot be
-                    // updated.
-                    debug!(%err, "could not report the secret data path to the server");
+                    .ok(),
+                Err(_) => None,
+            };
+            match joined {
+                Some(joined) => {
+                    let (mut control, outcome, accepts_report) =
+                        joined.context("initial direct negotiation task failed")?;
+                    #[cfg(feature = "udp")]
+                    {
+                        path_report = accepts_report;
+                    }
+                    adopt_initial_outcome(
+                        &mut control,
+                        outcome,
+                        accepts_report,
+                        tcp_secret_id,
+                        carriers,
+                        &mut data_path,
+                        &mut direct,
+                        &mut direct_closed_rx,
+                    )
+                    .await;
+                    (Some(control), None)
+                }
+                None => {
+                    info!(
+                        %tcp_secret_id,
+                        "direct udp negotiation still running; serving on the relay meanwhile"
+                    );
+                    let initial = InitialNegotiation {
+                        task,
+                        tcp_secret_id: tcp_secret_id.to_string(),
+                        carriers,
+                    };
+                    (None, Some(initial))
                 }
             }
-        }
+        } else {
+            (Some(control), None)
+        };
 
         // On the relay path with `--carriers > 1`, open extra connections and add
         // their openers to the pool so the consumer's forwarded substreams spread
@@ -1417,6 +1555,7 @@ impl Proxy {
 
         Ok(Proxy {
             control,
+            initial,
             ctrl_activity,
             carrier_activities,
             data_path,
@@ -1465,7 +1604,8 @@ impl Proxy {
     #[cfg_attr(not(feature = "udp"), allow(unused_mut))]
     pub async fn listen(self) -> Result<()> {
         let Proxy {
-            mut control,
+            control,
+            initial,
             ctrl_activity,
             carrier_activities,
             mut data_path,
@@ -1495,6 +1635,46 @@ impl Proxy {
             #[cfg(feature = "udp")]
             mut path_report,
         } = self;
+        let mut control = match (control, initial) {
+            (Some(control), _) => control,
+            // The first direct negotiation outlived the grace window: serve on
+            // the relay until it ends, then adopt its verdict. Bounded by the
+            // negotiation's own budgets (STUN, check round, QUIC connect).
+            (None, Some(initial)) => {
+                let InitialNegotiation {
+                    mut task,
+                    tcp_secret_id: id,
+                    carriers,
+                } = initial;
+                let joined = loop {
+                    tokio::select! {
+                        joined = &mut task => break joined,
+                        accepted = listener.accept() => {
+                            forward_accepted(accepted, &data_path, "relay");
+                        }
+                    }
+                };
+                let (mut control, outcome, accepts_report) =
+                    joined.context("initial direct negotiation task failed")?;
+                #[cfg(feature = "udp")]
+                {
+                    path_report = accepts_report;
+                }
+                adopt_initial_outcome(
+                    &mut control,
+                    outcome,
+                    accepts_report,
+                    &id,
+                    carriers,
+                    &mut data_path,
+                    &mut direct,
+                    &mut direct_closed_rx,
+                )
+                .await;
+                control
+            }
+            (None, None) => bail!("secret consumer has no control stream"),
+        };
         let mut path = if direct { "direct-udp" } else { "relay" };
         #[cfg(feature = "udp")]
         let mut last_upgrade = tokio::time::Instant::now();
@@ -1508,14 +1688,18 @@ impl Proxy {
         let mut preferred_port_remapped = false;
         // Pre-resolve one STUN target for the lightweight port-release check.
         #[cfg(feature = "udp")]
-        let check_stun_addr = crate::holepunch::resolve_live_stun_targets(
-            &endpoint.host,
-            endpoint.port,
-            stun_server.as_deref(),
-        )
-        .await
-        .ok()
-        .and_then(|t| t.into_iter().next().map(|t| t.addr));
+        let check_stun_addr = if gather.no_stun {
+            None
+        } else {
+            crate::holepunch::resolve_live_stun_targets(
+                &endpoint.host,
+                endpoint.port,
+                stun_server.as_deref(),
+            )
+            .await
+            .ok()
+            .and_then(|t| t.into_iter().next().map(|t| t.addr))
+        };
         #[cfg(not(feature = "udp"))]
         let _check_stun_addr: Option<SocketAddr> = None;
         // Relay → direct upgrade state. The slow work (STUN gather, punch, QUIC
@@ -1947,34 +2131,44 @@ impl Proxy {
                     }
                 }
                 accepted = listener.accept() => {
-                    let (local, addr) = match accepted {
-                        Ok(pair) => pair,
-                        Err(err) => {
-                            warn!(%err, "failed to accept local connection");
-                            continue;
-                        }
-                    };
-                    tune_tcp(&local);
-                    let opener = match data_path.opener() {
-                        Ok(opener) => opener,
-                        Err(err) => {
-                            warn!(%err, "no data path available, dropping connection");
-                            continue;
-                        }
-                    };
-                    info!(?addr, %path, "forwarding local connection over secret tunnel");
-                    tokio::spawn(
-                        async move {
-                            if let Err(err) = forward(local, opener).await {
-                                warn!(%err, "proxy connection closed with error");
-                            }
-                        }
-                        .instrument(info_span!("proxy", ?addr, %path)),
-                    );
+                    forward_accepted(accepted, &data_path, path);
                 }
             }
         }
     }
+}
+
+/// Hands one accepted local connection to its own forwarding task on the
+/// current data path. Never waits: the caller is an accept loop.
+fn forward_accepted(
+    accepted: io::Result<(TcpStream, SocketAddr)>,
+    data_path: &DataPath,
+    path: &'static str,
+) {
+    let (local, addr) = match accepted {
+        Ok(pair) => pair,
+        Err(err) => {
+            warn!(%err, "failed to accept local connection");
+            return;
+        }
+    };
+    tune_tcp(&local);
+    let opener = match data_path.opener() {
+        Ok(opener) => opener,
+        Err(err) => {
+            warn!(%err, "no data path available, dropping connection");
+            return;
+        }
+    };
+    debug!(?addr, %path, "forwarding local connection over secret tunnel");
+    tokio::spawn(
+        async move {
+            if let Err(err) = forward(local, opener).await {
+                warn!(%err, "proxy connection closed with error");
+            }
+        }
+        .instrument(info_span!("proxy", ?addr, %path)),
+    );
 }
 
 /// Spawn a task that resolves the returned receiver once the direct QUIC
@@ -2133,18 +2327,23 @@ async fn gather_consumer_candidates(
         stun_chain = ?stun_chain,
         "consumer UDP candidate discovery configured"
     );
-    let stun_targets = match holepunch::resolve_live_stun_targets_with_hint(
-        &endpoint.host,
-        endpoint.port,
-        stun_server,
-        provider_stun_hint,
-    )
-    .await
-    {
-        Ok(targets) => targets,
-        Err(err) => {
-            warn!(%err, "no STUN targets resolved for consumer; offering non-STUN candidates only");
-            Vec::new()
+    // `--udp-no-stun`: no chain, so no lookups either (see the provider side).
+    let stun_targets = if gather.no_stun {
+        Vec::new()
+    } else {
+        match holepunch::resolve_live_stun_targets_with_hint(
+            &endpoint.host,
+            endpoint.port,
+            stun_server,
+            provider_stun_hint,
+        )
+        .await
+        {
+            Ok(targets) => targets,
+            Err(err) => {
+                warn!(%err, "no STUN targets resolved for consumer; offering non-STUN candidates only");
+                Vec::new()
+            }
         }
     };
     let discovery = holepunch::gather_candidates_traversal(&tsock, &stun_targets, gather).await;

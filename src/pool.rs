@@ -225,6 +225,34 @@ impl CarrierPool {
         Some(carriers[idx].opener.clone())
     }
 
+    /// Open a ready substream on a live carrier, moving on to the next one when
+    /// an open fails.
+    ///
+    /// A carrier whose connection just died stays in the pool until its owner
+    /// task marks it, and round-robin can land on it in that window. With more
+    /// than one carrier that used to cost the proxied connection even though
+    /// another carrier was healthy. One attempt per carrier, so a single-carrier
+    /// tunnel behaves exactly as a bare `pick().open_ready()`.
+    pub async fn open_ready(
+        &self,
+        forward_ip: Option<&str>,
+        caller: Option<std::net::SocketAddr>,
+    ) -> std::io::Result<mux::LinkStream> {
+        let attempts = self.len().max(1);
+        let mut last_err = None;
+        for _ in 0..attempts {
+            let Some(opener) = self.pick() else { break };
+            match opener.open_ready(forward_ip, caller).await {
+                Ok(stream) => return Ok(stream),
+                Err(err) => {
+                    tracing::trace!(%err, "carrier open failed; trying the next live carrier");
+                    last_err = Some(err);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| std::io::Error::other("no live carrier")))
+    }
+
     /// Pick a live carrier, preferring the one holding the fewest bulk-classified
     /// connections, and return its bulk counter so the caller can account its own
     /// connection against it (phase 03.2).

@@ -60,6 +60,9 @@ Each line = the rule. `docs/INVARIANTS.md` = why, field measurements, gates, red
 - Secret consumer carriers (`ConnectSecret{carrier:true}`): no admin row, no reap. One logical tunnel = ONE admin row. Provider carriers use `JoinCarrier`/`serve_carrier` — do not fork.
 - Hole-punch strays (`DirectListener::accept`) = `debug`, never WARN; token auth is the gate; never filter by offered candidates (CGNAT).
 - `relay()` fails over across provider carriers; `--carriers N>1` on a DIRECT consumer warns once.
+- **N-4:** `Proxy::new` waits `INITIAL_DIRECT_PROBE_GRACE` (1.5 s) for a SIGN UDP leaves the network (`GatherOptions::reflexive_seen`, fired on the first STUN answer — never after the filtering probe), then `INITIAL_DIRECT_VERDICT_GRACE` (4 s) for the verdict; otherwise returns on the relay (`control: None` + `initial`) and `Proxy::listen` adopts the verdict via the same `adopt_initial_outcome`. Never a flat deadline on the verdict (healthy negotiation ≈ 1–4 s).
+- **N-5:** bounded by construction — TLS handshakes 10 s (`TLS_HANDSHAKE_TIMEOUT`: control port both branches + HTTPS vhost), ≤256 unauthenticated QUIC handshakes (Retry past half), STUN/direct-endpoint DNS 2 s in parallel and none with `--udp-no-stun`, `broker_udp` offer `NETWORK_TIMEOUT`.
+- **N-6:** `TokenGuard` before the `CarrierToken` send; `DirectPool::install` refuses after `close_all`; relay opens fail over across carriers on public + vhost; public tunnel capped by its client's `--max-conns` (per-tunnel semaphore, clamped to the server's).
 - **S-5/S-7:** the listener ends the check round on the dialer's authenticated request (reply on the wire BEFORE announce, `nominated` set) and must NOT exit on `validated_rx`. `DIRECT_INITIAL_RTT` 100 ms. **S-8:** `UDP_UPGRADE_MAX_SECS` ≤ 60 s (const-asserted). **S-9:** `pair_cache` swept in `remember`, capped 256.
 - **Fase 0–3/5:** candidates capped 16; single-owner `UdpTraversalSocket`; HMAC check round only when both advertise `check-v1`; broker plan only with BOTH profiles (missing ⇒ never RelayOnly); normalized generation; `MAX_FRAME_LENGTH` 8192 fits the worst-case `UdpPunch`; never add a `UdpCandidateKind` variant (use RouterMapped); `--upnp` = managed PCP/UPnP lease.
 - **Fase 6–7:** the NON-symmetric side's FILTERING decides; `port_restricted()` never treats `None` as restrictive. Spray roles broker-assigned, complementary, a `String`; easy side decides + `CONFIRM_COPIES`; aux sockets ≤ half `fd_headroom()`; spray recv errors are transient (Windows `WSAECONNRESET`). OTHER-ADDRESS observation runs AFTER `probe_filtering`; may conclude `Symmetric`, never `Eim`.
@@ -74,6 +77,10 @@ Each line = the rule. `docs/INVARIANTS.md` = why, field measurements, gates, red
 - `carriers<=1` = byte-for-byte single path. Defaults: 1 for local/proxy/vhost, 0 (auto) for transfer.
 - Relay path is AEAD-opaque (server splices ciphertext).
 - **V-14a:** `relay_writer` coalesces via `recv_many` (cap 32) and never waits for company. **V-14b:** `SealKey` seals/opens in place, one allocation; the free fns `crypto::seal_with_counter`/`open` are the ORACLE — never rewrite them to call the cached path.
+
+- **N-1 (1.4.0):** mux transport = `BufStream<ActivityIo<S>>` (`mux::mux_io`), `split_send_size` = `mux_buffer_size()` (256 KiB, `BORE_MUX_BUFFER_SIZE`, clamp 16 KiB–1 MiB = yamux frame limit). Activity counter stays inside the buffer; each side sizes only what it sends (never negotiate).
+- **N-2:** mux `drive` never awaits the acceptor: `PollSender` + local backlog (256) inside the `poll_fn`.
+- **N-3:** musl x86_64/aarch64 = mimalloc via `crates/bore-alloc` only; `bore_alloc::configure()` first statement of `main` (purge delay 0 through the C shim). Other targets = `System`.
 
 ### Vhost
 - Injected-response path: `flush()` after every write before parking on read; no `tokio::io::copy`; split + `try_join!` in ONE task. Gates are FlushGatedWriter mocks (loopback TLS false-passes).
@@ -122,3 +129,7 @@ Stock OpenSSH `-R`/`-L` → public/vhost/secret tunnels; SSH leg = TCP relay onl
 ## Version string
 
 `bore <semver> - <branch> - <sha8>` — embedded at compile time via `build.rs` (`BORE_GIT_BRANCH`/`BORE_GIT_SHA` → `GITHUB_REF_NAME`/`GITHUB_SHA` → `git` CLI). Run `cargo build` to regenerate.
+
+## Deployment / perf review (2026-11)
+
+Staging server: `network_mode: host` + systemd `bore-443-redirect.service` (kernel `REDIRECT` tcp/443 → control port 7835, `--dst-type LOCAL`); rfw removed from the data path. Replication guide, measurements, open findings (allocator + yamux buffering prototype, secret `--udp` startup/DNS defects, review items): `OPTIMIZATION_NOVEMBER_2026.md`. Netns NAT harness needs a fast-failing resolver inside the namespaces (see that file, §8.5).

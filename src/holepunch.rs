@@ -1565,6 +1565,18 @@ impl UdpTraversalSocket {
         &self,
         targets: &[StunTarget],
     ) -> (Option<SelectedStun>, UdpNatProfile) {
+        self.discover_reflexive_profile_notifying(targets, None)
+            .await
+    }
+
+    /// [`Self::discover_reflexive_profile`], waking `reflexive_seen` the moment
+    /// the first reflexive answer arrives, before the confirming observation
+    /// and the filtering probe are awaited.
+    pub async fn discover_reflexive_profile_notifying(
+        &self,
+        targets: &[StunTarget],
+        reflexive_seen: Option<&tokio::sync::Notify>,
+    ) -> (Option<SelectedStun>, UdpNatProfile) {
         use futures_util::stream::{FuturesUnordered, StreamExt};
         let local_port = self.local_addr().map(|a| a.port()).unwrap_or(0);
         let mut profile = UdpNatProfile::default();
@@ -1620,6 +1632,9 @@ impl UdpTraversalSocket {
             };
             match &selected {
                 None => {
+                    if let Some(seen) = reflexive_seen {
+                        seen.notify_one();
+                    }
                     profile.observations = 1;
                     profile.port_preserved =
                         (local_port != 0).then(|| observation.reflexive.port() == local_port);
@@ -2288,6 +2303,10 @@ async fn resolve_stun_target(target: &str) -> Result<SocketAddr> {
         .with_context(|| format!("no addresses for STUN server {target}"))
 }
 
+/// Bound on one STUN server name lookup. A healthy resolver answers in
+/// milliseconds; past this the name is skipped and the chain goes on without it.
+pub const STUN_RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Resolve the live tunnel STUN chain. With an explicit override the chain has a
 /// single element. Without one, public STUN on common ports is tried first and
 /// the bore server's own STUN endpoint is kept as the final fallback.
@@ -2308,11 +2327,25 @@ pub async fn resolve_live_stun_targets_with_hint(
     override_server: Option<&str>,
     peer_hint: Option<&str>,
 ) -> Result<Vec<StunTarget>> {
+    // Every name is looked up at once and each lookup is bounded. They used to
+    // run one after the other with no limit, so a resolver that drops queries
+    // (captive network, firewalled namespace) held the caller — a provider's
+    // constructor, a consumer's accept loop — for the resolver's own retry
+    // budget times the length of the chain. Order is preserved: it is the
+    // chain's priority.
+    let specs = live_stun_target_specs_with_hint(host, port, override_server, peer_hint);
+    let lookups = specs.iter().map(|(requested, _)| async move {
+        match tokio::time::timeout(STUN_RESOLVE_TIMEOUT, resolve_stun_target(requested)).await {
+            Ok(resolved) => resolved,
+            Err(_) => Err(anyhow::anyhow!(
+                "DNS lookup timed out after {STUN_RESOLVE_TIMEOUT:?}"
+            )),
+        }
+    });
+    let resolved = futures_util::future::join_all(lookups).await;
     let mut targets = Vec::new();
-    for (requested, source) in
-        live_stun_target_specs_with_hint(host, port, override_server, peer_hint)
-    {
-        match resolve_stun_target(&requested).await {
+    for ((requested, source), resolved) in specs.into_iter().zip(resolved) {
+        match resolved {
             Ok(addr) => {
                 debug!(
                     stun_server = %requested,
@@ -2359,6 +2392,13 @@ pub struct GatherOptions {
     /// port-mapped) candidates only. With no manual candidate this most
     /// likely ends on the relay — logged loudly, never silent.
     pub no_stun: bool,
+    /// Fired once, as early as possible, when this gather has evidence that
+    /// UDP leaves the network: the first STUN reflexive answer, or at once
+    /// with `no_stun` (nothing to wait for). A caller that must decide
+    /// quickly whether a direct path is worth waiting for (N-4) listens here
+    /// instead of waiting for the whole gather, whose filtering probe alone
+    /// outlasts any short deadline.
+    pub reflexive_seen: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl GatherOptions {
@@ -2478,9 +2518,14 @@ pub async fn gather_candidates_traversal(
     );
     let (selected_stun, profile) = if opts.no_stun {
         info!("STUN chain skipped (--udp-no-stun); using manual/local candidates only");
+        if let Some(seen) = &opts.reflexive_seen {
+            seen.notify_one();
+        }
         (None, UdpNatProfile::default())
     } else {
-        tsock.discover_reflexive_profile(stun_targets).await
+        tsock
+            .discover_reflexive_profile_notifying(stun_targets, opts.reflexive_seen.as_deref())
+            .await
     };
     let mut discovery = finish_discovery(
         local_addr,

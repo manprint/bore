@@ -10,21 +10,23 @@
 //! connection, accepts inbound substreams onto a channel ([`Acceptor`]), and
 //! services outbound-open requests sent over another channel ([`Opener`]).
 
+use std::collections::VecDeque;
 use std::future::poll_fn;
 #[cfg(feature = "ssh-gateway")]
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::task::AtomicWaker;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufStream, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, PollSender};
+use tracing::debug;
 use yamux::{Config, Connection, Mode};
 
 /// A multiplexed substream exposing Tokio's async I/O traits.
@@ -289,8 +291,73 @@ const _: () = assert!(
     "MAX_NUM_STREAMS * yamux::DEFAULT_CREDIT must not overflow usize on this target",
 );
 
+/// Default size of the buffers between `yamux` and the socket, and of the
+/// largest data frame `yamux` sends.
+///
+/// `yamux` writes a 12-byte header and the frame body as two separate writes and
+/// allocates one buffer per frame; at its 16 KiB default that is 65 536 frames,
+/// 131 072 write syscalls and as many allocations per GiB. MEASURED on a real
+/// 0.7 ms link (TLS, musl + mimalloc): relay 2.2 → 3.4 Gbit/s down and
+/// 1.9 → 3.6 Gbit/s up at 256 KiB, with unchanged connect/echo latency.
+pub const DEFAULT_MUX_BUFFER_SIZE: usize = 256 * 1024;
+
+/// Lower clamp: `yamux`'s own default frame size, i.e. the legacy framing.
+const MIN_MUX_BUFFER_SIZE: usize = 16 * 1024;
+
+/// Upper clamp. A peer REJECTS a frame body above 1 MiB (`yamux`'s
+/// `MAX_FRAME_BODY_LEN`), so this is a wire limit, not a tuning preference.
+const MAX_MUX_BUFFER_SIZE: usize = 1024 * 1024;
+
+/// Buffer and frame size for multiplexed connections.
+///
+/// Honors `BORE_MUX_BUFFER_SIZE` (raw bytes or a `KiB`/`MiB` style suffix),
+/// clamped to `[16 KiB, 1 MiB]`; defaults to [`DEFAULT_MUX_BUFFER_SIZE`].
+/// Resolved once per process. Each side sizes only what IT sends and buffers,
+/// so the two ends of a connection may differ, and a peer that predates this
+/// setting interoperates unchanged. Costs up to twice this value of memory per
+/// carrier that has moved bulk data.
+pub fn mux_buffer_size() -> usize {
+    static SIZE: OnceLock<usize> = OnceLock::new();
+    *SIZE.get_or_init(|| resolve_mux_buffer_size(std::env::var("BORE_MUX_BUFFER_SIZE").ok()))
+}
+
+fn resolve_mux_buffer_size(raw: Option<String>) -> usize {
+    raw.as_deref()
+        .and_then(crate::shared::parse_size_bytes)
+        .map(|bytes| {
+            usize::try_from(bytes)
+                .unwrap_or(MAX_MUX_BUFFER_SIZE)
+                .clamp(MIN_MUX_BUFFER_SIZE, MAX_MUX_BUFFER_SIZE)
+        })
+        .unwrap_or(DEFAULT_MUX_BUFFER_SIZE)
+}
+
+/// The socket as `yamux` sees it: a buffer on top of the activity-stamping
+/// wrapper. The order matters (O-1): [`ActivityIo`] sits BELOW the buffer, so
+/// liveness is stamped by bytes that really left the socket, never by a read
+/// served from memory.
+type MuxIo<S> = BufStream<ActivityIo<S>>;
+
+fn mux_io<S: Transport>(socket: S, activity: &Arc<Activity>) -> Compat<MuxIo<S>> {
+    let size = mux_buffer_size();
+    BufStream::with_capacity(
+        size,
+        size,
+        ActivityIo {
+            inner: socket,
+            activity: Arc::clone(activity),
+        },
+    )
+    .compat()
+}
+
+/// Inbound substreams the driver holds while the [`Acceptor`]'s channel is
+/// full. Past this the newest stream is refused (reset) instead of queued.
+const INBOUND_BACKLOG: usize = 256;
+
 fn config() -> Config {
     let mut cfg = Config::default();
+    cfg.set_split_send_size(mux_buffer_size());
     // Let each stream's receive window auto-tune to the bandwidth-delay product
     // for throughput; concurrency (and thus total memory) is bounded elsewhere.
     cfg.set_max_connection_receive_window(None);
@@ -454,12 +521,8 @@ impl Acceptor {
 /// Start multiplexing as the connection initiator (dialer).
 pub fn client<S: Transport>(socket: S) -> (Opener, Acceptor) {
     let activity = Arc::new(Activity::new());
-    let io = ActivityIo {
-        inner: socket,
-        activity: Arc::clone(&activity),
-    };
     spawn_driver_inner(
-        Connection::new(io.compat(), config(), Mode::Client),
+        Connection::new(mux_io(socket, &activity), config(), Mode::Client),
         activity,
         None,
     )
@@ -473,12 +536,8 @@ pub(crate) fn client_scoped<S: Transport>(
     scope: Arc<crate::client::ClientScope>,
 ) -> (Opener, Acceptor) {
     let activity = Arc::new(Activity::new());
-    let io = ActivityIo {
-        inner: socket,
-        activity: Arc::clone(&activity),
-    };
     spawn_driver_inner(
-        Connection::new(io.compat(), config(), Mode::Client),
+        Connection::new(mux_io(socket, &activity), config(), Mode::Client),
         activity,
         Some(scope),
     )
@@ -487,19 +546,15 @@ pub(crate) fn client_scoped<S: Transport>(
 /// Start multiplexing as the connection responder (listener).
 pub fn server<S: Transport>(socket: S) -> (Opener, Acceptor) {
     let activity = Arc::new(Activity::new());
-    let io = ActivityIo {
-        inner: socket,
-        activity: Arc::clone(&activity),
-    };
     spawn_driver_inner(
-        Connection::new(io.compat(), config(), Mode::Server),
+        Connection::new(mux_io(socket, &activity), config(), Mode::Server),
         activity,
         None,
     )
 }
 
 fn spawn_driver_inner<S: Transport>(
-    conn: Connection<Compat<ActivityIo<S>>>,
+    conn: Connection<Compat<MuxIo<S>>>,
     activity: Arc<Activity>,
     scope: Option<Arc<crate::client::ClientScope>>,
 ) -> (Opener, Acceptor) {
@@ -557,7 +612,12 @@ fn spawn_driver_inner<S: Transport>(
 /// while the connection is polled, and every poll method needs `&mut`. So all of
 /// it happens in one task, interleaving outbound-open requests with the inbound
 /// driver inside a single `poll_fn`.
-async fn drive<S: Transport>(
+///
+/// The driver NEVER parks on the `Acceptor`: an inbound substream the acceptor
+/// has no room for waits in a local backlog while the connection keeps being
+/// polled. Awaiting the channel here would freeze every already-open substream
+/// of the connection behind one slow consumer of new ones.
+async fn drive<S: AsyncRead + AsyncWrite + Unpin>(
     mut conn: Connection<Compat<S>>,
     mut open_rx: mpsc::Receiver<oneshot::Sender<io::Result<Stream>>>,
     inbound_tx: mpsc::Sender<Stream>,
@@ -574,6 +634,11 @@ async fn drive<S: Transport>(
     // Stop pulling new open requests once every `Opener` has been dropped, but
     // keep driving the connection for streams that are still alive.
     let mut openers_gone = false;
+    let mut inbound = PollSender::new(inbound_tx);
+    let mut backlog: VecDeque<Stream> = VecDeque::new();
+    // Once the `Acceptor` is gone inbound streams are dropped, but the
+    // connection keeps being driven for streams still in flight.
+    let mut acceptor_gone = false;
 
     loop {
         let step = poll_fn(|cx| {
@@ -586,6 +651,20 @@ async fn drive<S: Transport>(
                 // makes the peer's own driver reach `Step::Done`, so one side
                 // noticing releases the socket at BOTH ends.
                 return Poll::Ready(Step::Done);
+            }
+            while !backlog.is_empty() {
+                match inbound.poll_reserve(cx) {
+                    Poll::Ready(Ok(())) => {
+                        if let Some(stream) = backlog.pop_front() {
+                            let _ = inbound.send_item(stream);
+                        }
+                    }
+                    Poll::Ready(Err(_)) => {
+                        acceptor_gone = true;
+                        backlog.clear();
+                    }
+                    Poll::Pending => break,
+                }
             }
             if pending.is_none() && !openers_gone {
                 match open_rx.poll_recv(cx) {
@@ -618,9 +697,16 @@ async fn drive<S: Transport>(
                 }
             }
             Step::Inbound(stream) => {
-                // If the `Acceptor` is gone, drop the stream but keep driving for
-                // any streams still in flight.
-                let _ = inbound_tx.send(track(stream, &liveness)).await;
+                if acceptor_gone {
+                    drop(stream);
+                } else if backlog.len() >= INBOUND_BACKLOG {
+                    debug!("mux inbound backlog full; refusing a new substream");
+                    drop(stream);
+                } else {
+                    // Delivered by the next turn's flush, which is also what
+                    // registers the wake-up for a full channel.
+                    backlog.push_back(track(stream, &liveness));
+                }
             }
             Step::Done => break,
         }
@@ -1190,5 +1276,114 @@ mod tests {
         let mut buf = [0u8; 5];
         stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"hello");
+    }
+
+    /// A consumer that stops accepting NEW substreams must not freeze the ones
+    /// already open on the same connection.
+    ///
+    /// RED-CHECK: with `inbound_tx.send(..).await` back in `drive()`, the 33rd
+    /// unaccepted substream parks the driver and the echo below times out.
+    #[tokio::test]
+    async fn a_full_accept_queue_does_not_stall_open_substreams() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let peer = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (_opener, mut acceptor) = server(sock);
+            // Accept exactly ONE substream, then never look at the queue again.
+            let mut first = acceptor.accept().await.expect("first substream");
+            let mut buf = [0u8; 4];
+            loop {
+                if first.read_exact(&mut buf).await.is_err() {
+                    break;
+                }
+                first.write_all(&buf).await.unwrap();
+                first.flush().await.unwrap();
+            }
+            drop(acceptor);
+        });
+
+        let (opener, _acceptor) = client(TcpStream::connect(addr).await.unwrap());
+        let mut live = opener.open().await.unwrap();
+        live.write_all(b"ping").await.unwrap();
+        live.flush().await.unwrap();
+        let mut buf = [0u8; 4];
+        live.read_exact(&mut buf).await.unwrap();
+
+        // Well past the acceptor channel (32): each write announces the stream.
+        let mut parked = Vec::new();
+        for _ in 0..48 {
+            let mut s = opener.open().await.unwrap();
+            s.write_all(&[STREAM_READY]).await.unwrap();
+            s.flush().await.unwrap();
+            parked.push(s);
+        }
+
+        live.write_all(b"pong").await.unwrap();
+        live.flush().await.unwrap();
+        timeout(Duration::from_secs(5), live.read_exact(&mut buf))
+            .await
+            .expect("an unread accept queue stalled an already-open substream")
+            .unwrap();
+        assert_eq!(&buf, b"pong");
+        drop(live);
+        drop(parked);
+        drop(opener);
+        let _ = timeout(Duration::from_secs(5), peer).await;
+    }
+
+    /// The frame size is a WIRE limit at the top (a peer rejects bodies above
+    /// 1 MiB) and the legacy framing at the bottom.
+    #[test]
+    fn mux_buffer_size_is_clamped_to_the_wire_limits() {
+        assert_eq!(resolve_mux_buffer_size(None), DEFAULT_MUX_BUFFER_SIZE);
+        assert_eq!(
+            resolve_mux_buffer_size(Some("garbage".into())),
+            DEFAULT_MUX_BUFFER_SIZE
+        );
+        assert_eq!(resolve_mux_buffer_size(Some("1".into())), 16 * 1024);
+        assert_eq!(resolve_mux_buffer_size(Some("64KiB".into())), 64 * 1024);
+        assert_eq!(resolve_mux_buffer_size(Some("1GiB".into())), 1024 * 1024);
+    }
+
+    /// One frame larger than the default split crosses a connection whose two
+    /// ends buffer independently, in both directions, byte for byte.
+    #[tokio::test]
+    async fn bulk_data_survives_the_buffered_transport() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        const LEN: usize = 3 * 1024 * 1024 + 17;
+
+        let peer = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (_opener, mut acceptor) = server(sock);
+            let mut s = acceptor.accept().await.expect("inbound substream");
+            let mut data = vec![0u8; LEN];
+            s.read_exact(&mut data).await.unwrap();
+            s.write_all(&data).await.unwrap();
+            s.flush().await.unwrap();
+            let mut end = [0u8; 1];
+            let _ = s.read(&mut end).await;
+        });
+
+        let (opener, _acceptor) = client(TcpStream::connect(addr).await.unwrap());
+        let mut stream = opener.open().await.unwrap();
+        let sent: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+        let mut echoed = vec![0u8; LEN];
+        // Write and read concurrently in ONE task (single yamux waker).
+        let (mut rd, mut wr) = tokio::io::split(&mut stream);
+        let write = async {
+            wr.write_all(&sent).await?;
+            wr.flush().await
+        };
+        let read = rd.read_exact(&mut echoed);
+        let (w, r) = timeout(Duration::from_secs(20), async { tokio::join!(write, read) })
+            .await
+            .expect("bulk echo stalled on the buffered transport");
+        w.unwrap();
+        r.unwrap();
+        assert!(echoed == sent, "bulk payload corrupted in transit");
+        drop(peer);
     }
 }

@@ -231,6 +231,14 @@ pub fn parse_size_bytes(value: &str) -> Option<u64> {
 /// Timeout for network connections and initial protocol messages.
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Bound on a server-side TLS handshake (control port and vhost HTTPS).
+///
+/// Unbounded, a peer that connects and never finishes the handshake holds a
+/// task, a descriptor and (on the vhost listener) a `--max-conns` permit for
+/// ever. Looser than [`NETWORK_TIMEOUT`] because a handshake is several round
+/// trips on what may be a slow mobile link.
+pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Default timeout (seconds) before re-checking the preferred UDP port after
 /// detecting it was remapped by NAT. During this window the socket binds on an
 /// ephemeral port so the NAT entry for the preferred port expires naturally.
@@ -393,8 +401,10 @@ pub struct TunnelOptions {
     /// `#[serde(default)]` keeps the wire format backward-compatible.
     #[serde(default)]
     pub webserver_log: bool,
-    /// The client's `--max-conns` cap on concurrent proxied connections.
-    /// Display-only. `#[serde(default)]` keeps the wire format backward-compatible.
+    /// The client's `--max-conns` cap on concurrent proxied connections. The
+    /// server applies it to a public tunnel's port (never above its own);
+    /// `0` = undeclared, no tunnel cap. `#[serde(default)]` keeps the wire
+    /// format backward-compatible.
     #[serde(default)]
     pub max_conns: usize,
     /// The client's local service host (`-l/--local-host`). Display-only.

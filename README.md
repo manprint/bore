@@ -435,7 +435,7 @@ Options:
       --try-port-prediction     Advertise predicted symmetric-NAT ports (opt-in, best-effort) [env: BORE_TRY_PORT_PREDICTION=]
       --nat-udp-preferred-port <PORT> Bind the UDP hole-punch socket to a fixed port (0=random) [env: BORE_NAT_UDP_PORT=]
       --nat-udp-release-timeout <SECS> Re-check interval when the NAT remapped the preferred UDP port (default 600s, 0=disable) [env: BORE_NAT_UDP_RELEASE_TIMEOUT=]
-      --max-conns <N>           Max concurrent connections on the direct UDP path (default 1024) [env: BORE_MAX_CONNS=]
+      --max-conns <N>           Max concurrent connections: direct UDP path (secret provider) / this tunnel's port on the server (public) (default 1024) [env: BORE_MAX_CONNS=]
       --basic-auth <USER:PASS>  Protect the tunnel with HTTP Basic auth [env: BORE_BASIC_AUTH]
       --notes <TEXT>            Note shown on the server's admin status page [env: BORE_NOTES=]
       --carriers <N>            Parallel TCP carrier connections for the data path (public tunnels; default 1) [env: BORE_CARRIERS=]
@@ -603,6 +603,30 @@ buffer helps high-latency, high-BDP links, not single-stream throughput on a fas
 The resolved value is reported as `proxy_buffer_size` by `GET /admin/api/v1/config` and in
 the dashboard's Configuration panel, so a deployment can be checked against the default
 rather than assumed.
+
+**Mux transport buffer:** every yamux-muxed TCP connection (control, carriers, relay) is
+read and written through a userspace buffer, and yamux frames are cut at the same size.
+`BORE_MUX_BUFFER_SIZE` (default 256 KiB; accepts a `KB`/`MB`/... suffix, clamped
+`[16 KiB, 1 MiB]` — 1 MiB is the largest frame a yamux peer accepts) sets both. Before
+1.4.0 each 16 KiB frame cost two `write` syscalls (12-byte header, then body) and, over
+TLS, two records; with the buffer a burst leaves in one write. Each side sizes only what it
+*sends*, so a 1.4 peer interoperates with an older one in both directions. Memory is
+touched only as data arrives: an idle connection costs a few pages, a connection that has
+moved bulk data up to twice the buffer.
+
+**Allocator:** the static `x86_64`/`aarch64` musl builds — the release binaries and the
+Docker image — use [mimalloc](https://github.com/microsoft/mimalloc) (Cargo feature
+`mimalloc`, on by default) instead of musl's `malloc`, which serializes every thread on one
+lock. Freed memory is returned to the OS immediately (purge delay 0, set at start-up;
+`MIMALLOC_PURGE_DELAY=<ms>` in the environment overrides it). Every other target (glibc,
+macOS, Windows, Android, 32-bit musl) keeps the system allocator, with or without the
+feature. `bore --version` is unchanged; to build without it use `--no-default-features
+--features udp`.
+
+**TLS handshake bound:** a TLS handshake on the control port or on the HTTPS vhost port
+must complete within 10 s. A client that connects and never finishes it used to hold its
+task (and, on the vhost port, a `--max-conns` permit) for as long as it kept the TCP
+connection open.
 
 **Direct-path QUIC liveness:** `BORE_DIRECT_QUIC_KEEPALIVE_MS` (default 3000) and
 `BORE_DIRECT_QUIC_IDLE_MS` (default 10000, clamped `[1 s, 600 s]`) set the keep-alive
@@ -1229,9 +1253,17 @@ Core:
       --min-port <PORT>          Minimum accepted TCP port number [env: BORE_MIN_PORT=] [default: 1024]
       --max-port <PORT>          Maximum accepted TCP port number [env: BORE_MAX_PORT=] [default: 65535]
   -s, --secret <SECRET>          Optional secret for client authentication [env: BORE_SECRET=]
-      --max-conns <N>            Max concurrently proxied connections per client [env: BORE_MAX_CONNS=] [default: 1024]
+      --max-conns <N>            Max concurrently proxied connections on this server [env: BORE_MAX_CONNS=] [default: 1024]
       --max-carriers <N>         Max parallel TCP carriers a public/provider/vhost tunnel may use (1 disables the pool). Does not cap bore proxy's own carriers. [env: BORE_MAX_CARRIERS=] [default: 16]
 
+> **Per-tunnel cap.** The server's `--max-conns` is one budget shared by every tunnel. A
+> public tunnel (`bore local <port>`) is additionally held to its own client's
+> `--max-conns` (default 1024, never above the server's), so a flood on one public port
+> cannot spend the whole budget; a connection refused for that reason is logged as
+> `tunnel at its --max-conns, dropping` and counted in `conn_rejections`. An old client
+> that does not declare the value gets no tunnel cap. Vhost tunnels have no per-tunnel
+> cap.
+>
 > **`--max-conns` and the file-descriptor limit.** Each admitted connection
 > costs one descriptor, so the bound can only refuse *gracefully* (one
 > connection dropped, `conn_rejections` incremented, everything else still
@@ -1486,6 +1518,43 @@ through this single shared UDP endpoint. STUN stays on container UDP 7835.
 For a bare binary with `--control-port 443`, do not also set
 `--vhost-quic-port 443`: STUN already owns UDP 443. Use distinct internal UDP ports; the
 no-8443 rule above is specific to this bridge-network Compose topology.
+
+**Host networking (`network_mode: host`).** This is the faster deployment: no `docker-proxy`
+and no bridge NAT between the NIC and bore (measured on a 1 Gbit/s VM pair: QUIC direct
+2.2–2.4× the bridge figure, relay CPU per GiB down by a third; details and the full
+replication procedure in [`OPTIMIZATION_NOVEMBER_2026.md`](OPTIMIZATION_NOVEMBER_2026.md)
+§5). With no port mapping, the `443:7835` line has to be replaced by a kernel redirect —
+bore itself still binds TCP 7835 and UDP 443, exactly as above:
+
+```ini
+# /etc/systemd/system/bore-443-redirect.service
+[Unit]
+Description=bore: redirect tcp/443 to the bore control port 7835
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/iptables -w -t nat -A PREROUTING -p tcp -m addrtype --dst-type LOCAL --dport 443 -j REDIRECT --to-ports 7835
+ExecStart=/usr/sbin/iptables -w -t nat -A OUTPUT -p tcp -m addrtype --dst-type LOCAL --dport 443 -j REDIRECT --to-ports 7835
+ExecStop=/usr/sbin/iptables -w -t nat -D PREROUTING -p tcp -m addrtype --dst-type LOCAL --dport 443 -j REDIRECT --to-ports 7835
+ExecStop=/usr/sbin/iptables -w -t nat -D OUTPUT -p tcp -m addrtype --dst-type LOCAL --dport 443 -j REDIRECT --to-ports 7835
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```shell
+sudo systemctl daemon-reload && sudo systemctl enable --now bore-443-redirect.service
+```
+
+`--dst-type LOCAL` limits the rule to packets addressed to this host, so traffic that other
+containers send to a remote `:443` is never captured. In the Compose file drop `ports:` and
+`sysctls:` (Docker rejects `net.*` sysctls in host mode — set them on the host, see
+[Host tuning for bandwidth](#host-tuning-for-bandwidth)) and add `network_mode: host`.
+Every other listener keeps the port it had inside the container, now bound on the host:
+check for conflicts with `ss -ltnup` before switching.
 
 Server option:
 
@@ -2302,6 +2371,19 @@ Notes:
 - To confirm the direct path is in use, look for `using direct udp path` / `direct udp
   carrier established (… token verified)` in the logs. For the full control-plane story, use
   `-vv` or `RUST_LOG=bore_cli=trace,bore=trace`.
+- **Start-up never waits for a UDP that is not there.** `bore proxy --udp` first waits
+  1.5 s for a sign that UDP leaves the network at all (the first STUN answer; immediate
+  with `--udp-no-stun`). With that sign it waits up to 4 s more for the direct path, so
+  where UDP works the consumer starts on the direct path as before. Without it (UDP
+  dropped by the network), or when the negotiation outlasts those 4 s, the local listener
+  opens on the relay — logged as `direct udp negotiation still running; serving on the
+  relay meanwhile` — and the negotiation's verdict is adopted when it arrives, with no
+  interruption to connections already flowing. Before 1.4.0 the listener stayed closed
+  for the whole negotiation (measured 7.7 s on a UDP-blocked network, at every start and
+  reconnect).
+- **STUN name lookups are bounded.** The STUN chain's hostnames are resolved in parallel,
+  2 s each at most; a name that does not resolve in time is skipped. With `--udp-no-stun`
+  no STUN hostname is resolved at all.
 
 **Hard NATs and firewalls.** Extra, opt-in candidate sources help with difficult networks
 (the flags go on `bore local` and `bore proxy`, since both peers punch):

@@ -71,6 +71,72 @@ Authoritative detailed invariants (rationale, field measurements, gates, red-che
   `src/mux.rs`, each refusing a different wrong fix; red-check = the first one times
   out (the production symptom) without the count. Field gate
   `scripts/perf/staging/vpn/vpn_ctrl_leak.sh`. Note `docs/vpn/VPN_CTRL_CONN_LEAK.md`.
+- **The mux transport is buffered BELOW yamux and ABOVE the activity counter (N-1, 1.4.0).**
+  `mux::mux_io` wraps the socket as `BufStream<ActivityIo<S>>`; `config()` sets
+  `split_send_size` to the same `mux_buffer_size()` (default 256 KiB, `BORE_MUX_BUFFER_SIZE`,
+  clamped `[16 KiB, 1 MiB]`). WHY: yamux writes each frame as header-then-body, so every
+  16 KiB frame was two `write` syscalls and, over TLS, two records — MEASURED relay
+  throughput 1.6–3.5× lower than with the buffer (`OPTIMIZATION_NOVEMBER_2026.md` §7).
+  RULES: (a) `ActivityIo` stays INSIDE the buffer, or O-1 would count bytes that never
+  reached the wire; (b) the upper clamp is yamux's `MAX_FRAME_BODY_LEN` — a larger frame is
+  a protocol error on the peer; (c) each side sizes only what it SENDS, which is what keeps
+  old and new peers interoperable — never negotiate it; (d) TCP `SO_*BUF` stays untouched
+  (P-13). Gates: `mux::tests::bulk_data_survives_the_buffered_transport`,
+  `mux_buffer_size_is_clamped_to_the_wire_limits`.
+- **The mux driver never awaits the acceptor (N-2).** `drive` hands inbound substreams to the
+  acceptor through `PollSender` + a local backlog (`INBOUND_BACKLOG` 256) polled inside the
+  same `poll_fn` as the connection. An `inbound_tx.send(..).await` there stopped the driver
+  — and with it EVERY substream on the connection, in both directions — whenever the
+  acceptor's task was busy with something slow (a DNS lookup, a broker round). Past the
+  backlog the substream is dropped (`debug`); an acceptor that is gone clears it. Gate:
+  `a_full_accept_queue_does_not_stall_open_substreams`.
+- **musl builds use mimalloc with purge delay 0, and only through `crates/bore-alloc` (N-3).**
+  musl's `malloc` takes one lock for every thread: on the static image that was the single
+  largest CPU cost of the relay. The crate is target-gated (`musl` + `x86_64`/`aarch64`);
+  everywhere else `Allocator` forwards to `System`, so `--all-features` builds on every CI
+  target. `bore_alloc::configure()` MUST be the first statement of `main` (single-threaded):
+  it calls `mi_option_set_default(mi_option_purge_delay, 0)` through a C shim compiled
+  against mimalloc's own header (the option's enum index is not stable across mimalloc
+  majors and the Rust bindings do not export it). Without purge 0, RSS after a burst stays
+  at its high-water mark for the default delay and looks like a leak. `set_default` loses to
+  the environment by design (`MIMALLOC_PURGE_DELAY`). The lib keeps `#![forbid(unsafe_code)]`.
+- **A secret consumer's listener never waits for a UDP that is not there (N-4).**
+  `Proxy::new` runs the first direct negotiation in a task that OWNS the control stream
+  and waits in two stages. Stage 1, `INITIAL_DIRECT_PROBE_GRACE` (1.5 s): a SIGN that UDP
+  leaves the network — `GatherOptions::reflexive_seen`, a `Notify` fired on the first STUN
+  reflexive answer (or at once with `--udp-no-stun`). No sign ⇒ `new` returns on the relay
+  with `control: None` + `initial: Some(..)`. Stage 2, `INITIAL_DIRECT_VERDICT_GRACE`
+  (4 s more): the verdict. In time ⇒ exactly the old behaviour (`is_direct()` right after
+  `new`, same log lines, same `SecretPathReport`); late ⇒ same relay return. In both late
+  cases `Proxy::listen` serves relay connections while it waits, then calls the SAME
+  `adopt_initial_outcome`. Exactly one of `control`/`initial` is `Some`.
+  MEASURED before: 7.7 s of closed listener on a UDP-blocked network vs 0.3 s without
+  `--udp`. The deadline is on the sign, never on the verdict: a flat 1 s verdict deadline
+  was tried and sent HEALTHY direct paths to the relay (filtering probe 900 ms + check
+  round; 2.9–4.1 s in the NAT harness), failing four `udp_test.rs` `is_direct()`
+  assertions and silently moving `bore transfer --udp` (reads `is_direct()` right after
+  `new`) onto the relay. Never fire the sign after the filtering probe. S-2 unchanged —
+  the report is sent from wherever the verdict is adopted, bounded (P-9).
+- **Nothing a stranger can start is unbounded (N-5).** (a) TLS handshakes on the control port
+  (`server::bounded_tls_handshake`, both the legacy and the `--ssh-gateway` ALPN branch) and
+  on the HTTPS vhost port are bounded by `shared::TLS_HANDSHAKE_TIMEOUT` (10 s); a timeout
+  is `debug`. (b) The shared QUIC endpoint admits at most `MAX_PENDING_QUIC_HANDSHAKES` (256)
+  unauthenticated connections, refuses beyond that, and answers with a stateless Retry once
+  half are in use; the permit is dropped as soon as `vhost_server_handshake` returns.
+  (c) STUN names resolve in parallel, each bounded by `holepunch::STUN_RESOLVE_TIMEOUT`
+  (2 s), and are not resolved at all with `--udp-no-stun`; the direct-endpoint lookup in the
+  client control loop has the same bound. (d) `broker_udp`'s offer to the provider is
+  bounded (`NETWORK_TIMEOUT`): it runs in the loop that accepts the consumer's substreams.
+- **Carrier bookkeeping closes its own races (N-6).** (a) `TokenGuard` is built BEFORE the
+  `CarrierToken` send in `serve_provider` / the vhost provider: a failed send used to leave
+  the token registered forever. (b) `DirectPool::close_all` sets `closed` under the write
+  lock and `install` refuses afterwards — P-15's close was otherwise undone by a carrier
+  that authenticated a moment earlier. (c) Relay opens fail over across carriers on public
+  (`CarrierPool::open_ready`) and vhost (`open_relay_carrier`), one attempt per carrier, as
+  secret already did; the public relay carrier is chosen where the relay is used, not at
+  accept. (d) A public tunnel is held to its client's `--max-conns` (clamped to the
+  server's; `0` = undeclared = no cap) by a per-tunnel semaphore IN ADDITION to the global
+  one.
 - **Relay writes are COALESCED, and that is a cost change with no wire change
   (V-14a).** `link::relay_writer` drains its queue with `recv_many` (cap
   `RELAY_WRITE_BATCH` = 32) and concatenates; the format is a stream of

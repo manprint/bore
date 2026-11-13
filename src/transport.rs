@@ -307,6 +307,12 @@ fn default_root_store(ca_pem: Option<&[u8]>) -> Result<RootCertStore> {
 /// HTTP/2 would corrupt that path; the `bore` control-plane ALPN is deliberately
 /// NOT offered to a foreign server.
 pub(crate) fn insecure_tls_connector() -> Result<TlsConnector> {
+    // Built once: the configuration is constant, and this runs for every
+    // proxied request of a `--backend-tls` vhost.
+    static CONNECTOR: std::sync::OnceLock<TlsConnector> = std::sync::OnceLock::new();
+    if let Some(connector) = CONNECTOR.get() {
+        return Ok(connector.clone());
+    }
     let mut config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
         .with_safe_default_protocol_versions()
         .context("failed to configure backend TLS protocol versions")?
@@ -314,7 +320,9 @@ pub(crate) fn insecure_tls_connector() -> Result<TlsConnector> {
         .with_custom_certificate_verifier(Arc::new(NoVerifier))
         .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(TlsConnector::from(Arc::new(config)))
+    Ok(CONNECTOR
+        .get_or_init(|| TlsConnector::from(Arc::new(config)))
+        .clone())
 }
 
 /// Parse a backend TLS SNI/server name into an owned (`'static`) rustls

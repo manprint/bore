@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/bore-wintun", "crates/bore-android-tun"]
+members = [".", "crates/bore-wintun", "crates/bore-android-tun", "crates/bore-alloc"]
 
 [package]
 name = "bore-cli"
@@ -46,7 +46,11 @@ name = "windows_vpn_spike"
 required-features = ["vpn"]
 
 [features]
-default = ["udp"]
+default = ["udp", "mimalloc"]
+# Global allocator hook (`crates/bore-alloc`): mimalloc on the static musl
+# builds (x86_64/aarch64), the system allocator everywhere else. On by default;
+# `--no-default-features` drops it together with `udp`.
+mimalloc = ["dep:bore-alloc"]
 # Direct peer-to-peer secret tunnels via UDP hole-punching + STUN, carried over
 # QUIC, with automatic fallback to the server relay. On by default; pulls `quinn`
 # (and `quinn-udp`). Build with `--no-default-features` to drop it (e.g. for a
@@ -58,6 +62,7 @@ vpn = ["udp", "dep:tun-rs", "dep:bore-wintun", "dep:bore-android-tun"]
 ssh-gateway = ["dep:russh", "dep:argon2", "dep:password-hash", "dep:ssh-key", "dep:rand"]
 
 [dependencies]
+bore-alloc = { path = "crates/bore-alloc", optional = true }
 anyhow = { version = "1.0.56", features = ["backtrace"] }
 base64 = "0.22.1"
 bytes = "1"

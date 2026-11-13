@@ -338,8 +338,31 @@ fn log_connection_exit(err: &anyhow::Error) {
 /// preconnect socket it never used — the same behaviour that made the I-SSH9
 /// misroute possible — not an operator's problem. A certificate or protocol
 /// failure carries a different error kind and still warns.
+/// Runs a control-port TLS handshake under [`TLS_HANDSHAKE_TIMEOUT`]. A peer
+/// that connects and then stalls mid-handshake would otherwise keep its task
+/// and descriptor for the life of the process.
+///
+/// [`TLS_HANDSHAKE_TIMEOUT`]: crate::shared::TLS_HANDSHAKE_TIMEOUT
+/// Concurrent QUIC connections on the shared direct endpoint that have not
+/// authenticated yet. Legitimate carriers authenticate within milliseconds, so
+/// the figure is far above any real burst and only bounds abuse.
+#[cfg(feature = "udp")]
+const MAX_PENDING_QUIC_HANDSHAKES: usize = 256;
+
+async fn bounded_tls_handshake<T>(
+    handshake: impl std::future::Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+    match tokio::time::timeout(crate::shared::TLS_HANDSHAKE_TIMEOUT, handshake).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "TLS handshake timed out",
+        )),
+    }
+}
+
 fn log_tls_handshake_failure(err: &std::io::Error) {
-    if crate::shared::is_benign_io_error(err) {
+    if crate::shared::is_benign_io_error(err) || err.kind() == std::io::ErrorKind::TimedOut {
         debug!(%err, "TLS handshake abandoned by peer");
     } else {
         warn!(%err, "TLS handshake failed");
@@ -1797,8 +1820,30 @@ impl Server {
                         let direct_permits = this.udp_direct_permits.clone();
                         let budget_refusals = Arc::clone(&this.direct_budget_refusals);
                         let ep = endpoint.clone();
+                        // Bound on QUIC connections that have not authenticated yet.
+                        // The endpoint is public and each handshake costs a task,
+                        // TLS state and up to `NETWORK_TIMEOUT` of the auth wait;
+                        // nothing limited how many could be in flight.
+                        let handshakes = Arc::new(Semaphore::new(MAX_PENDING_QUIC_HANDSHAKES));
                         tokio::spawn(async move {
                             while let Some(incoming) = ep.accept().await {
+                                let Ok(handshake_permit) =
+                                    Arc::clone(&handshakes).try_acquire_owned()
+                                else {
+                                    debug!("QUIC handshake backlog full; refusing connection");
+                                    incoming.refuse();
+                                    continue;
+                                };
+                                // Under pressure, make the peer prove it owns its
+                                // source address before any handshake state exists
+                                // (one extra round trip, paid only then).
+                                if handshakes.available_permits() < MAX_PENDING_QUIC_HANDSHAKES / 2
+                                    && !incoming.remote_address_validated()
+                                    && incoming.may_retry()
+                                {
+                                    let _ = incoming.retry();
+                                    continue;
+                                }
                                 let vhost_reg = vhost_reg.clone();
                                 let vhost_pending = vhost_pending.clone();
                                 let jump_reg = jump_reg.clone();
@@ -1853,9 +1898,13 @@ impl Server {
                                         }
                                     };
 
-                                    match holepunch::vhost_server_handshake(conn, endpoint, lookup)
-                                        .await
-                                    {
+                                    let authenticated =
+                                        holepunch::vhost_server_handshake(conn, endpoint, lookup)
+                                            .await;
+                                    // Authenticated or rejected: either way it no
+                                    // longer counts as a pending handshake.
+                                    drop(handshake_permit);
+                                    match authenticated {
                                         Ok((key, direct)) => {
                                             // Server-wide direct-path memory
                                             // budget (F-13, phase 02.3). The
@@ -2122,9 +2171,11 @@ impl Server {
                                     // ALPN; a stock `openssl s_client` ProxyCommand
                                     // (SSH-over-TLS, D4) offers none and keeps the
                                     // silence-peek path.
-                                    Some(acceptor) => match sshgw::accept_tls_with_alpn(
-                                        Arc::clone(acceptor.config()),
-                                        prefixed,
+                                    Some(acceptor) => match bounded_tls_handshake(
+                                        sshgw::accept_tls_with_alpn(
+                                            Arc::clone(acceptor.config()),
+                                            prefixed,
+                                        ),
                                     )
                                     .await
                                     {
@@ -2190,13 +2241,15 @@ impl Server {
 
                     // The TLS handshake (if any) runs here, off the accept path.
                     let result = match &this.tls {
-                        Some(acceptor) => match acceptor.accept(stream).await {
-                            Ok(tls) => this.route_connection(tls, addr).await,
-                            Err(err) => {
-                                log_tls_handshake_failure(&err);
-                                return;
+                        Some(acceptor) => {
+                            match bounded_tls_handshake(acceptor.accept(stream)).await {
+                                Ok(tls) => this.route_connection(tls, addr).await,
+                                Err(err) => {
+                                    log_tls_handshake_failure(&err);
+                                    return;
+                                }
                             }
-                        },
+                        }
                         None => this.route_connection(stream, addr).await,
                     };
                     match result {
@@ -3054,7 +3107,11 @@ impl Server {
         // handshakes and deliver their substream openers through `carrier_rx`. The
         // data path is unchanged — only *which* connection opens each substream.
         let effective = opts.carriers.clamp(1, self.max_carriers.max(1));
-        let pool = CarrierPool::new(mux::LinkOpener::Mux(opener));
+        let pool = Arc::new(CarrierPool::new(mux::LinkOpener::Mux(opener)));
+        // Per-tunnel connection cap: the client's `--max-conns`, never above the
+        // server's. `0` (a client that predates the field) means no tunnel cap.
+        let tunnel_permits = (opts.max_conns != 0)
+            .then(|| Arc::new(Semaphore::new(opts.max_conns.min(self.max_conns.max(1)))));
         let mut carrier_rx = if opts.carriers > 1 {
             let extra = effective - 1;
             let token = Uuid::new_v4().to_string();
@@ -3340,17 +3397,28 @@ impl Server {
                             continue;
                         }
                     };
-                    info!(?addr, ?port, "new connection");
-
-                    // Round-robin across the live carriers (prunes dead ones); the
-                    // control connection is always carrier 0 and always live here.
-                    let opener = match pool.pick() {
-                        Some(opener) => opener,
-                        None => {
-                            warn!("no live carrier, dropping connection");
-                            continue;
-                        }
+                    // The tunnel's own cap, on top of the server-wide one: a
+                    // flood on this port must not spend every other tunnel's
+                    // share of `--max-conns`.
+                    let tunnel_permit = match &tunnel_permits {
+                        Some(permits) => match Arc::clone(permits).try_acquire_owned() {
+                            Ok(permit) => Some(permit),
+                            Err(_) => {
+                                self.conn_rejections
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                warn!(?addr, ?port, "tunnel at its --max-conns, dropping");
+                                continue;
+                            }
+                        },
+                        None => None,
                     };
+                    debug!(?addr, ?port, "new connection");
+
+                    // The relay carrier is chosen where the relay is used, not
+                    // here: a connection served on the direct path never needed
+                    // one, and choosing late lets the open fail over to another
+                    // live carrier.
+                    let pool = Arc::clone(&pool);
                     let tls = self.tls.clone();
                     let domain = self.bind_domain.clone();
                     let opts = opts.clone();
@@ -3374,6 +3442,7 @@ impl Server {
                     let _public_direct_entry: Option<Arc<()>> = None;
                     tokio::spawn(async move {
                         let _permit = permit;
+                        let _tunnel_permit = tunnel_permit;
                         let _active = ActiveGuard::new(active);
                         // Extract webserver_log before opts is moved (Phase 3).
                         let client_wants_logging = opts.webserver_log;
@@ -3509,7 +3578,7 @@ impl Server {
                         } else {
                             None
                         };
-                        match opener.open_ready(forward_ip.as_deref(), Some(addr)).await {
+                        match pool.open_ready(forward_ip.as_deref(), Some(addr)).await {
                             Ok(mut stream) => {
                                 let buf = proxy_buffer_size();
                                 // Count bytes LIVE as they flow (not only on close) so the
@@ -3619,6 +3688,16 @@ fn admit_direct(permits: &Option<Arc<Semaphore>>, refusals: &AtomicU64) -> Direc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A handshake that never completes is cut at the bound instead of holding
+    /// its task and descriptor for ever; a completed one passes through.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_tls_handshake_is_bounded() {
+        let stalled = bounded_tls_handshake(std::future::pending::<std::io::Result<()>>()).await;
+        assert_eq!(stalled.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        let done = bounded_tls_handshake(async { Ok::<_, std::io::Error>(7) }).await;
+        assert_eq!(done.unwrap(), 7);
+    }
 
     /// F-6 / phase 02.1: the admin config view must report the direct-UDP
     /// windows actually in force on a default-configured server. Three of these

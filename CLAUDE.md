@@ -132,4 +132,4 @@ Stock OpenSSH `-R`/`-L` → public/vhost/secret tunnels; SSH leg = TCP relay onl
 
 ## Deployment / perf review (2026-11)
 
-Staging server: `network_mode: host` + systemd `bore-443-redirect.service` (kernel `REDIRECT` tcp/443 → control port 7835, `--dst-type LOCAL`); rfw removed from the data path. Replication guide, measurements, open findings (allocator + yamux buffering prototype, secret `--udp` startup/DNS defects, review items): `OPTIMIZATION_NOVEMBER_2026.md`. Netns NAT harness needs a fast-failing resolver inside the namespaces (see that file, §8.5).
+Staging server: `network_mode: host` + systemd `bore-443-redirect.service` (kernel `REDIRECT` tcp/443 → control port 7835, `--dst-type LOCAL`); rfw removed from the data path. Staging runs 1.4.0-rc.1 (image tag only; rollback `compose.yml.bak-20261114-pre-1.4.0`). Replication guide, measurements, what 1.4.0 implemented and what stays open (§15, open list §15.8): `OPTIMIZATION_NOVEMBER_2026.md`. Known CI flakes, rerun: webkit `T-WEB-README-DIRECT`, macOS `t_web_fairness` (§15.6). Netns NAT harness needs a fast-failing resolver inside the namespaces (see that file, §8.5).

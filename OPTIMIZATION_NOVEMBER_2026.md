@@ -3,9 +3,10 @@
 Resoconto della review di `vhost`, `public` e `secret` (path relay TCP e path diretto QUIC/UDP), dei test reali su collaudo e della nuova configurazione del server.
 
 - Versione analizzata: `bore 1.3.1-rc.1 - main - 934aa940` (immagine `ghcr.io/manprint/bore:v1.3.1-rc.1`, binario musl statico).
-- Data dei test: 13 novembre 2026.
+- Versione prodotta: `bore 1.4.0-rc.1` (immagine `ghcr.io/manprint/bore:v1.4.0-rc.1`), che implementa le ottimizzazioni e le correzioni descritte qui. Vedi il capitolo 15.
+- Data dei test: 13–14 novembre 2026.
 - Agente: Claude Code, modello Fable 5.2, nessun sottoagente.
-- Nessuna modifica al codice, nessun commit e nessun push. Nel repository ci sono due sole variazioni, non committate: questo file e una sezione di cinque righe aggiunta in fondo a `CLAUDE.md` che rimanda qui.
+- I capitoli 1–14 e l'appendice A sono il resoconto della review, scritto **prima** di toccare il codice: dove dicono "non implementato" o "proposto" descrivono lo stato di allora. Lo stato attuale di ogni punto è nel capitolo 15.
 
 Convenzione usata in tutto il documento: **[misurato]** = numero ottenuto da un test eseguito in questa sessione; **[verificato]** = letto nel codice e, dove indicato, riprodotto; **[ipotesi]** = ragionamento non confermato da una misura.
 
@@ -20,6 +21,8 @@ Convenzione usata in tutto il documento: **[misurato]** = numero ottenuto da un 
 5. **Il path QUIC diretto è limitato dalla CPU a circa 1 Gbit/s per connessione** (un core per lato). Su un link pulito da 1 Gbit/s o più il relay TCP è più veloce; il diretto vince su latenza e carico del server. [misurato]
 6. **Trovati due difetti nuovi sul path `--udp` dei tunnel secret**, entrambi riprodotti: il consumer non apre la porta locale finché non finisce il primo tentativo diretto (7,8 s su una rete con UDP bloccato, contro 0,3 s senza `--udp`), e il provider resta bloccato su una risoluzione DNS senza timeout, anche con `--udp-no-stun`. Dettagli al capitolo 8.
 7. **La review del codice ha trovato 12 difetti o debolezze** (un possibile esaurimento dei permessi `--max-conns`, un leak di token, uno stallo del driver yamux, una race sul pool diretto, e altri). Elenco al capitolo 9.
+
+8. **Tutto questo è stato poi implementato nella 1.4.0-rc.1**, ora attiva su collaudo: sul link reale il relay passa da 1,0–1,9 a 3,4 Gbit/s su una connessione con un terzo della CPU, e il consumer `--udp` su una rete con UDP bloccato apre la porta in 1,7 s invece di 7,6. Capitolo 15. [misurato]
 
 Cosa **non** è stato possibile fare: il test P2P reale dietro un NAT domestico. La sandbox blocca tutto l'UDP in uscita. Il path diretto è stato coperto con il test reale tra le due VM e con l'harness netns del repository, che usa NAT veri del kernel (capitolo 8).
 
@@ -319,7 +322,7 @@ Client su C, attraverso il nome pubblico del servizio, due ripetizioni (Mbit/s).
 | connect+echo p50 | 1,3 ms | 0,9–1,1 ms |
 | echo p50 | 0,8 ms | 0,5–0,6 ms |
 
-Il QUIC è 2,2–2,4 volte più veloce. L'unico valore peggiore è l'upload relay su una singola connessione (1431 → 979–1065): con rfw il server bore riceveva da un socket locale, ora riceve dalla rete e il limite è il suo stesso core. È lo stesso collo di bottiglia che il prototipo del capitolo 7 rimuove (3466–3745 Mbit/s).
+Il QUIC è 2,2–2,4 volte più veloce. L'unico valore peggiore è l'upload relay su una singola connessione (1431 → 979–1065): con rfw il server bore riceveva da un socket locale, ora riceve dalla rete e il limite è il suo stesso core. È lo stesso collo di bottiglia che il prototipo del capitolo 7 rimuove (3466–3745 Mbit/s). Questa spiegazione è stata poi verificata con un test dedicato: capitolo 15.4.
 
 Tunnel secret attraverso il servizio reale in host mode (provider su C, consumer su A, una ripetizione, Mbit/s). [misurato]
 
@@ -490,6 +493,8 @@ Per coprire il traversal ho eseguito `scripts/udp_nat_netns_test.sh` nella sandb
 
 ### 8.5 Due difetti nuovi sul path `--udp` dei secret
 
+> Stato: entrambi corretti nella 1.4.0-rc.1 (capitolo 15.2 e 15.3).
+
 **A. Il consumer non apre la porta locale finché non finisce il primo tentativo diretto.** [verificato + misurato]
 
 `src/secret.rs:1318`: `negotiate_direct_consumer` viene atteso *prima* che il listener locale inizi ad accettare. Con UDP funzionante sono pochi millisecondi. Su una rete con UDP bloccato si sommano il budget STUN (3,6 s), il round di check (0,75 s) e il budget di connessione QUIC (3 s):
@@ -523,7 +528,7 @@ La catena STUN del client è: server STUN pubblici, poi il server bore all'indir
 
 ## 9. Review del codice: bug, race, leak, stalli
 
-Tutti i punti sono stati letti nel codice. Quelli marcati *riprodotto* sono stati anche osservati in un test.
+Tutti i punti sono stati letti nel codice. Quelli marcati *riprodotto* sono stati anche osservati in un test. Lo stato di ciascuno nella 1.4.0-rc.1 è nella tabella del capitolo 15.2.
 
 | # | Severità | Difetto | Dove |
 |---|---|---|---|
@@ -654,7 +659,7 @@ BORE_SECRET=... bore proxy --local-proxy-port 127.0.0.1:5432 --to https://<host>
 - **Server con 2 vCPU**: i tetti assoluti dipendono da questo.
 - **Inventario dei tunnel prima del cambio non salvato** (capitolo 6.2).
 - **Riavvio di collaudo non eseguito** (capitolo 5.8).
-- **Prototipi misurati ma non integrati**: nessun gate del progetto è stato eseguito su di essi.
+- **Prototipi misurati ma non integrati** al momento della review. Poi integrati nella 1.4.0-rc.1 e passati dalla CI completa (capitolo 15).
 - **Lo stallo osservato una volta con rfw** resta senza causa confermata.
 - **Latenza in loopback dei prototipi**: una sola esecuzione rumorosa, non conclusiva. Sul link reale la latenza è invariata.
 - Due ripetizioni per la maggior parte dei confronti, tre per i prototipi. Le differenze riportate come significative sono molto più grandi della dispersione tra ripetizioni; quelle entro il 10 % vanno lette come rumore.
@@ -665,26 +670,221 @@ BORE_SECRET=... bore proxy --local-proxy-port 127.0.0.1:5432 --to https://<host>
 
 **Server A (collaudo)**
 
-- Rimossa la cartella di test `/tmp/bore-review` (binari, script, certificato di test, copia del segreto). Nessun processo, container o rete di test rimasti; le porte di test (5201, 3478/udp, 31000–31050) sono chiuse.
-- Restano, per tua decisione: `compose.yml.bak-20261113-pre-hostmode` (è il rollback, tienilo finché non confermi), `compose.yml.hostmode` (copia, cancellabile), il container `rfw-tunnel` fermo e la cartella `rfw/`.
-- Stato finale verificato dopo la pulizia: `bore-server` attivo in host mode, 0 errori nel log, unit di redirect `enabled` e `active` con una regola per catena (anche dopo `systemctl restart`), 4 vhost e 1 provider secret registrati e funzionanti, gateway SSH sulla 443 raggiungibile. RSS del container a riposo: circa 4 MiB.
+- Rimossa la cartella di test `/tmp/bore-review` (binari, script, certificato di test, copia del segreto di test), ricreata e rimossa di nuovo per le prove del capitolo 15. Nessun processo, container o rete di test rimasti; le porte di test (5201, 3478/udp, 31000–31050) sono chiuse.
+- Restano, per tua decisione: `compose.yml.bak-20261114-pre-1.4.0` (rollback alla 1.3.1-rc.1), `compose.yml.bak-20261113-pre-hostmode` (rollback a prima di host mode), `compose.yml.hostmode` (copia, cancellabile), il container `rfw-tunnel` fermo, la cartella `rfw/` e l'immagine `v1.3.1-rc.1`.
+- Stato finale verificato dopo la pulizia: `bore-server` 1.4.0-rc.1 attivo in host mode, 0 errori nel log, unit di redirect `active`, 4 vhost e 1 provider secret registrati e funzionanti, gateway SSH sulla 443 raggiungibile. RSS del container a riposo: 38 MiB (era 4–13 MiB con la 1.3.1-rc.1, capitolo 15.7).
 
 **VM C**
 
-- Rimossa `/tmp/bore-review`. Nessun processo di test rimasto. I servizi in ascolto sulla macchina non sono stati toccati.
+- Rimossa `/tmp/bore-review` (anche dopo le prove del capitolo 15), compreso il backend di test sulla 19000 di loopback. Nessun processo di test rimasto. I servizi e i container in funzione sulla macchina non sono stati toccati.
 
 **Sandbox**
 
 - Rimossi il worktree del prototipo, le cartelle di build `target/review-bench` e `target/review-proto`, i binari di test e la copia locale del segreto.
 - Restano installati nella sandbox: `musl-tools`, il target rustup `x86_64-unknown-linux-musl`, `netcat-openbsd`, `socat` e `nftables` (servivano all'harness netns) e due voci in `~/.ssh/known_hosts` per A e C.
-- Repository: `git status` mostra solo `CLAUDE.md` modificato e questo file nuovo. Nessun commit, nessun push.
+- Repository: tutto committato e pubblicato. `dev` contiene la 1.4.0-rc.1 (cinque commit più quello di questo file), il tag `v1.4.0-rc.1` è pubblicato, `main` viene allineato a `dev` come ultimo passo.
 
 **Decisioni che restano a te**
 
 1. Confermare la configurazione host mode su collaudo, poi cancellare il backup del compose e rimuovere rfw (`docker compose -f rfw/compose.yml down`), rinominando `99-rfw-tunnel.conf`.
 2. Replicare in produzione con la procedura del capitolo 5.
-3. Decidere se implementare le ottimizzazioni del capitolo 7.6 e le correzioni dei capitoli 8.5 e 9. Ordine che suggerisco: punto 1 del capitolo 9 (sicurezza), mimalloc, difetti 8.5-A e 8.5-B, buffer sotto yamux, il resto.
-4. Decidere se committare questo file e la modifica a `CLAUDE.md`.
+3. ~~Decidere se implementare le ottimizzazioni e le correzioni.~~ Fatto: capitolo 15. Restano aperti i punti del capitolo 15.8.
+4. ~~Decidere se committare questo file.~~ Fatto.
+5. Confermare la 1.4.0-rc.1 su collaudo, poi cancellare `compose.yml.bak-20261114-pre-1.4.0` e l'immagine `v1.3.1-rc.1`. Quando la promuovi a 1.4.0 finale, il tag deve stare su un commit raggiungibile da `main` (il workflow di release lo verifica per le versioni non prerelease).
+
+---
+
+## 15. Implementazione: 1.4.0-rc.1
+
+Dopo la review hai chiesto di implementare tutto. Questo capitolo dice cosa è entrato nella 1.4.0-rc.1, cosa no, e cosa ho misurato sul binario definitivo. I riferimenti `N-1`…`N-6` sono le voci nuove di `docs/INVARIANTS.md`.
+
+### 15.1 Ottimizzazioni entrate
+
+| Modifica | Dove | Invariante |
+|---|---|---|
+| `mimalloc` come allocatore globale sulle build musl statiche x86_64 e aarch64 (quelle distribuite e quella dell'immagine), con purge immediato fissato a compile time: non serve nessuna variabile d'ambiente. Sugli altri target resta l'allocatore di sistema. | `crates/bore-alloc`, prima istruzione di `main` | N-3 |
+| Trasporto del mux bufferizzato (`BufStream`) e frame yamux grandi quanto il buffer: 256 KiB, regolabile con `BORE_MUX_BUFFER_SIZE` (16 KiB–1 MiB). Una scrittura per frame invece di header + corpo. Il contatore di attività usato dalla liveness (O-1) resta sotto il buffer, quindi continua a misurare i byte realmente passati sul socket. | `src/mux.rs` | N-1 |
+| Il driver yamux non attende più chi accetta gli stream: coda locale da 256 e invio non bloccante. | `src/mux.rs` | N-2 |
+| Vhost: testa della richiesta inoltrata senza copia; connettore TLS verso il backend costruito una volta sola. | `src/vhost.rs` | — |
+| Log per connessione portati da `info` a `debug` sui percorsi caldi (public, client, consumer secret). | `src/server.rs`, `src/client.rs`, `src/secret.rs` | — |
+
+Compatibilità: ogni lato dimensiona solo ciò che invia, non c'è negoziazione. Client 1.3.1 contro server 1.4.0 e viceversa funzionano; verificato in loopback in tutte le combinazioni e, su collaudo, con i client reali rimasti alla versione precedente (capitolo 15.7).
+
+### 15.2 Stato dei difetti
+
+Numerazione del capitolo 9.
+
+| # | Difetto | Stato nella 1.4.0-rc.1 |
+|---|---|---|
+| 1 | Handshake TLS senza timeout con un permesso `--max-conns` in mano | **Corretto.** 10 s su porta di controllo (entrambi i rami) e porta HTTPS dei vhost (N-5). |
+| 2 | Leak del token dei carrier | **Corretto.** `TokenGuard` costruito prima dell'invio (N-6). |
+| 3 | Driver yamux fermo con il canale pieno | **Corretto** (N-2). |
+| 4 | Accettazione del piano dati nello stesso loop del lavoro di controllo lento | **Mitigato, non ristrutturato.** Le attese che lo rendevano grave ora sono limitate: DNS della catena STUN in parallelo con tetto a 2 s, nessuna risoluzione con `--udp-no-stun`, offerta di `broker_udp` con timeout, prima negoziazione del consumer in background. La separazione in un task di accept e un attore di controllo non è stata fatta. |
+| 5 | Race install-dopo-close su `DirectPool` | **Corretto.** `install` rifiuta dopo `close_all` (N-6). |
+| 6 | Nessun failover tra carrier su public e vhost | **Corretto.** Apertura con failover; il public sceglie il carrier solo dopo aver escluso il path diretto (N-6). |
+| 7 | Log sincrono per connessione | **Corretto** per i messaggi `info`. Gli avvisi di capacità esaurita restano `warn`: sono rari per definizione e servono a chi gestisce il server. |
+| 8 | Il dial diretto risolve di nuovo il DNS | **Non fatto.** La risoluzione ora ha un tetto di 2 s; il riuso dell'indirizzo del peer di controllo resta da fare. |
+| 9 | Handshake QUIC non autenticati senza limite | **Corretto.** Al massimo 256 in corso, `Retry` oltre la metà (N-5). |
+| 10 | Dettagli vhost | **In parte.** Fatti `head.clone()` e connettore TLS. Non fatti: marker e testa in un solo frame, buffer del percorso con header iniettati. |
+| 11 | `max_conns` per tunnel solo mostrato | **Corretto.** Semaforo per tunnel public, limitato a quello del server (N-6). |
+| 12 | Avvio lento e blocco DNS sul path `--udp` dei secret | **Corretto** (capitolo 15.3). La discovery del provider resta nel costruttore, ma ora è limitata nel tempo. |
+| 8.6 | Fallback STUN verso la 443 UDP con `--to https://` | **Non fatto.** Rimedio invariato: `--stun-server <host>:7835`. |
+
+Le semplificazioni del capitolo 10 non sono state fatte: sono rifattorizzazioni senza effetto misurabile e ognuna attraversa invarianti documentati. Restano una proposta.
+
+### 15.3 Difetto 8.5-A: com'è stato risolto e verificato
+
+Il primo tentativo era un tetto fisso di 1 s sull'intera negoziazione. Ha fatto fallire quattro test di `udp_test.rs` e ha spostato `bore transfer --udp` sul relay: una negoziazione sana dura da 1 a 4 secondi, quindi un tetto fisso corto la tronca. L'ho scartato.
+
+La soluzione entrata (N-4) aspetta in due tempi:
+
+1. fino a 1,5 s un **segno** che l'UDP esce dalla rete: la prima risposta STUN, o subito con `--udp-no-stun`;
+2. se il segno arriva, fino a 4 s il **verdetto** della negoziazione.
+
+Senza segno il listener parte sul relay e il verdetto viene adottato in background, dallo stesso codice che gestisce gli upgrade successivi. Il log lo dice: `direct udp negotiation still running; serving on the relay meanwhile`.
+
+Verifica dal vivo, consumer nella sandbox (UDP in uscita bloccato), provider su C, server su A, tempo dall'avvio alla porta locale aperta. [misurato]
+
+| | 1.3.1-rc.1 | 1.4.0-rc.1 |
+|---|---|---|
+| `--udp`, UDP bloccato | 7,62 / 7,63 s | **1,66 / 1,68 s** |
+| relay puro, per riferimento | 0,15–0,26 s | 0,15–0,26 s |
+
+Caso sano (A↔C, UDP funzionante): `using direct udp path` arriva 0,02–1,14 s dopo l'inizio della discovery e il consumer non passa mai dal relay. Banda del diretto sul nuovo binario: 1144 Mbit/s in download, 1003 in upload, latenza p50 0,9 / 0,5 ms.
+
+### 15.4 Relay up ×1: perché era peggiorato dopo lo switch a host mode
+
+Era l'unico numero peggiorato nella tabella del capitolo 6.3 (1431 → 979–1065 Mbit/s) e lì la spiegazione era un'ipotesi. L'ho verificata con tre prove sul binario 1.3.1-rc.1, server su A, client su C.
+
+**Il link non è il limite.** TCP grezzo A→C su una connessione, senza bore: 4521–4971 Mbit/s su sei ripetizioni. [misurato]
+
+**Il limite è un core del server.** In upload il server 1.3.1 spende 7,4–9,2 s di CPU per GiB: a 1 Gbit/s è un core pieno. [misurato]
+
+**Un forwarder davanti alla porta di controllo riproduce l'effetto di rfw.** Ho messo un forwarder TCP in userspace tra il client e il server (lo stesso ruolo che aveva rfw) e alternato le due configurazioni. Mbit/s, CPU del processo server in s/GiB. [misurato]
+
+| Upload ×1, 1.3.1-rc.1 | r0 | r1 | r2 | r3 |
+|---|---|---|---|---|
+| diretto (host mode) | 984 (9,2) | 1078 (8,8) | 1222 (7,4) | 1057 (8,4) |
+| con forwarder | 1343 (6,1) | 1333 (6,0) | 1094 (8,2) | 1123 (7,7) |
+
+In due ripetizioni su quattro il forwarder dà +25–35 % e il costo per GiB del server scende da circa 9 a circa 6 secondi. La lettura che ne do, coerente con la CPU misurata ma non dimostrata con un profilo [ipotesi]: il forwarder legge dalla rete con il suo core e consegna al server su un socket locale in blocchi più grandi, quindi il server fa meno letture piccole e una parte del lavoro si sposta sull'altro core. Nelle ripetizioni r2 e r3 il vantaggio non c'è, e non so dire cosa le distingue dalle prime due. Il valore "1431 con rfw" del capitolo 6.3 era una sola misura e sta dentro questo intervallo.
+
+In download il forwarder non ha un effetto leggibile (1516 / 1406 / 2109 / 2014 contro 1613 / 1761 / 1623 / 1807).
+
+**Conclusione.** Non è sfuggito nulla nella configurazione host mode: sysctl, congestion control e buffer sono gli stessi. Con il vecchio binario l'upload su una connessione era limitato dalla CPU del server, con un costo per byte che varia da 6 a 9 s/GiB tra una ripetizione e l'altra; un forwarder in userspace ne assorbiva una parte, pagandola però con il 35–60 % di CPU dell'host in più e con il dimezzamento del QUIC (capitolo 3). La 1.4.0-rc.1 toglie la causa: lo stesso upload fa 3430 Mbit/s con 2,4 s/GiB.
+
+### 15.5 Vecchio contro nuovo sul link reale
+
+Stessa sessione, server su A e client su C, stesso binario sui due lati, varianti alternate. Cinque ripetizioni per ×1, due per ×4. Mediane in Mbit/s, tra parentesi minimo–massimo. [misurato]
+
+| Public, `--carriers 1` | 1.3.1-rc.1 | 1.4.0-rc.1 | |
+|---|---|---|---|
+| relay, down ×1 | 1855 (1522–1932) | **3385** (1878–3648) | ×1,8 |
+| relay, up ×1 | 1020 (1001–1082) | **3430** (3339–3682) | ×3,4 |
+| relay, down ×4 | 2093 | **3648** | ×1,7 |
+| relay, up ×4 | 1506 | **3448** | ×2,3 |
+| QUIC, down ×1 | 1026 | 1137 | +11 % |
+| QUIC, up ×1 | 871 | 982 | +13 % |
+| QUIC, down ×4 | 980 | 1177 | +20 % |
+| QUIC, up ×4 | 874 | 982 | +12 % |
+
+| CPU in s/GiB | 1.3.1-rc.1 | 1.4.0-rc.1 |
+|---|---|---|
+| server, relay up ×1 | 8,93 | 2,43 |
+| server, relay down ×1 | 4,62 | 2,36 |
+| client, relay up ×1 | 5,35 | 1,53 |
+| server, QUIC down ×1 | 6,44 | 4,35 |
+
+| RSS massimo durante i test | 1.3.1-rc.1 | 1.4.0-rc.1 |
+|---|---|---|
+| server | 12–14 MiB | 32–55 MiB |
+| client | 10–13 MiB | 37–94 MiB |
+
+Latenza invariata: connect+echo p50 0,9–1,0 ms, echo 0,5–0,6 ms.
+
+Lettura: sul relay il guadagno è quello del prototipo (capitolo 7.3). Sul QUIC è il solo allocatore, perché lì il limite è la crittografia per pacchetto. Il prezzo è memoria: qualche decina di MiB in più per processo sotto carico. Su un server con poca RAM e molte connessioni vale ancora il consiglio del capitolo 7.5 (`BORE_PROXY_BUFFER_SIZE=65536`), a cui si aggiunge `BORE_MUX_BUFFER_SIZE=65536`.
+
+Un download ×1 su cinque è uscito a 1878 Mbit/s contro i 3,3–3,6 degli altri: un campione isolato, che non ho riprodotto e non so spiegare.
+
+### 15.6 CI: cosa ho dovuto sistemare per averla verde
+
+Tre cose non dipendevano dalle modifiche al codice, una sì.
+
+- **Runner `macos-14` ritirato da GitHub.** I due job VPN macOS venivano annullati prima di partire, e con loro falliva il gate di release. Era già rosso sul commit di partenza. Ora girano su `macos-latest` (`ci.yml`, `release.yml`, README, `docs/INVARIANTS.md`, `CLAUDE.md`).
+- **Collisione di porta nel test Android `T-AND-E3`.** Il consumer usava la 40031, dentro il range pubblico del server di test (40000–40100). Spostata fuori (41031). Anche questo era già rosso.
+- **Gate di banda del fast link (`T-FL-PERF`): conseguenza diretta dell'ottimizzazione.** Il gate chiedeva che il fast link fosse almeno veloce quanto il relay vhost sulla stessa macchina. Con la 1.4.0-rc.1 il relay è più veloce e il fast link no, perché il suo codice non è cambiato. Misure, MiB/s (build glibc):
+
+  | Macchina | relay vhost 1.3.1 | relay vhost 1.4.0 | fast link | rapporto fast/relay con la 1.4.0 |
+  |---|---|---|---|---|
+  | runner CI condiviso, 4 vCPU | 512–554 | 747–784 | 584–719 | 0,85–0,88 |
+  | sandbox, 8 core, a riposo | 1219–1225 | 1031–1090 | 1583–1647 | 1,48–1,59 |
+
+  Sul runner a 4 vCPU il relay guadagna circa il 45 % e supera il fast link. Ho portato la soglia del gate da 1,0 a 0,65 con cinque campioni per braccio invece di tre, e ho riscritto la motivazione nello script e l'invariante I-11 in `docs/transfer/FAST_LINK.md` con questi numeri. Il gate continua a intercettare una regressione vera del fast link, non afferma più che sia il percorso più veloce su ogni macchina.
+
+  Due cose da sapere. La prima: in un commit intermedio avevo attribuito il risultato al rumore dei runner; la corsa successiva ha ripetuto lo stesso rapporto e l'ho corretto. La storia è nei due commit `ci(fast-link)`. La seconda: nella sandbox, in loopback, con build **glibc**, controllo TLS e buffer da 16 MiB, il relay 1.4.0 è il 12–15 % **più lento** dell'1.3.1 (seconda riga della tabella). Le build glibc non hanno mimalloc, e questa è l'unica misura in cui la 1.4.0 perde. Non l'ho approfondita: i binari distribuiti per Linux x86_64 e aarch64 sono musl, e sul link reale con musl il guadagno è quello del capitolo 15.5. Chi compila da sé su glibc dovrebbe misurare prima di aggiornare.
+- **Test instabili, preesistenti.** `T-WEB-README-DIRECT` su webkit fallisce in circa due corse su cinque da quando i runner sono passati a Ubuntu 26.04, anche sul commit di partenza: il lettore che dovrebbe usare il path diretto WebRTC finisce sul relay. `t_web_fairness` è fallito tre volte su runner macOS aarch64 nella notte del 14 novembre (due job sul commit `647d4eb`, uno nel gate di release): è un test a tempo, due stanze del relay web che devono chiudere ciascuna in circa 4 s e comunque sotto 7 s, e ha misurato 7,5–9,0 s con il round trip di controllo, che a riposo è sotto il millisecondo, salito a 0,9–1,8 s. Lo stesso test era passato 10 volte su 10 sul job macOS aarch64 di `Mean Bean CI` nelle settimane precedenti, 3 delle quali con il codice della 1.4.0, ed è passato a ogni rilancio. Il percorso che esercita (relay WebSocket su HTTP in chiaro, `src/web_transfer.rs`) non è stato toccato dalla 1.4.0 e su macOS l'allocatore resta quello di sistema: lo leggo come runner sovraccarico, ma tre fallimenti in una notte dopo 10 passaggi sono troppi per chiamarlo rumore senza una misura, e quella misura non l'ho fatta. [ipotesi] Ho rilanciato entrambi i test; non li ho corretti.
+
+**Stato finale della CI.** Sul commit `647d4eb` di `dev` i cinque workflow sono verdi (`CI`, `E2E (netns)`, `Mean Bean CI`, `Mean Bean Deploy`, `Docker (GHCR)`), dopo il rilancio dei due job macOS falliti su `t_web_fairness`. Il tag annotato `v1.4.0-rc.1` punta a quel commit. Il workflow `Release` ha rieseguito i tre gate (matrice CI, cross-architettura, netns bloccante): un job macOS è fallito sullo stesso test, è passato al rilancio, e solo allora sono stati pubblicati l'immagine multi-arch `ghcr.io/manprint/bore:v1.4.0-rc.1` e i binari della release GitHub. Questo file entra con un commit successivo, di sola documentazione, e il merge su `main` viene dopo: l'esito della CI su quei due passi è nel messaggio di chiusura in chat, non qui.
+
+### 15.7 Deploy su collaudo
+
+Eseguito il 14 novembre 2026 alle 03:02 UTC, con la procedura del capitolo 5.5 ridotta al solo cambio di immagine.
+
+1. **Inventario prima del cambio** (il passo che la volta scorsa avevo saltato, capitolo 6.2): 4 vhost e 1 provider secret registrati, server `1.3.1-rc.1`, 0 errori nel log, RSS 13 MiB dopo quattro ore di attività.
+2. `docker pull` della nuova immagine e controllo della versione dentro l'immagine (`bore 1.4.0-rc.1 - v1.4.0-rc.1 - 647d4eb2`) prima di fermare qualsiasi cosa.
+3. Backup: `compose.yml.bak-20261114-pre-1.4.0`, identico byte per byte al compose in uso.
+4. Una sola riga cambiata, il tag dell'immagine. Nessuna variabile d'ambiente toccata, host mode e unit di redirect invariati.
+5. `docker compose up -d`.
+
+Risultato: [misurato]
+
+| Controllo | Esito |
+|---|---|
+| versione servita dall'API di amministrazione | `1.4.0-rc.1 - v1.4.0-rc.1 - 647d4eb2` |
+| listener | gli stessi di prima: TCP 80, 443, 7835; UDP 443, 7835, 7836 |
+| unit `bore-443-redirect.service` | `active` |
+| tunnel risaliti | 4 vhost e 1 provider secret, gli stessi nomi dell'inventario, tutti registrati entro circa 1 s dall'avvio del server |
+| errori nel log | 0 (dopo 10 minuti); 2 avvisi, gli stessi di prima su `--udp-memory-budget` |
+| vhost visti da C | stessi codici dei backend in HTTPS e in HTTP (302, 302, 401, 401), 47–85 ms |
+| radice del dominio | 404 in HTTPS con certificato valido, 502 in HTTP (come prima, capitolo 6.2) |
+| gateway SSH sulla 443, controllo sulla 7835 | `Permission denied`; porta aperta |
+| RSS del server a riposo | 38 MiB (23 anonimi, 15 di file mappati) contro 13 MiB prima |
+
+I client dei cinque tunnel non sono stati toccati: sono quelli di prima, quindi più vecchi della 1.4.0, e si sono ricollegati da soli al server nuovo. È la verifica di compatibilità con client non aggiornati, fatta sul servizio reale.
+
+**La memoria a riposo è quasi triplicata** (13 → 38 MiB). È il costo atteso di mimalloc e dei buffer da 256 KiB sotto yamux, e sotto carico il server resta tra 28 e 55 MiB (capitolo 15.5 e prova qui sotto). Su questa macchina da 1,8 GiB non è un problema; su un server con poca RAM valgono le due variabili indicate al capitolo 15.5.
+
+**Banda dell'artefatto pubblicato.** I numeri del capitolo 15.5 venivano da un binario musl compilato nella sandbox. Dopo il deploy ho estratto il binario dall'immagine pubblicata e ripetuto la prova tra A e C, su un'istanza di test con porte e segreto propri, accanto al container di collaudo in funzione. Mbit/s, 1 GiB per prova: [misurato]
+
+| | up ×1 | down ×1 | down ×4 | up ×4 | CPU server (s/GiB) |
+|---|---|---|---|---|---|
+| relay `--carriers 1` (3 ripetizioni, 2 per ×4) | 3913 / 2897 / 3899 | 3823 / 3168 / 2068 | 3594 / 3379 | 3712 / 3021 | 2,1–3,1 |
+| QUIC `--udp` (2 ripetizioni) | 799 / 963 | 1088 / 1084 | 1111 / 1133 | 765 / 998 | 4,4–6,7 |
+
+Sono in linea con il capitolo 15.5. Il campione di download a 2068 Mbit/s è la seconda volta che un download ×1 esce a circa 2 Gbit/s invece di 3,2–3,8 (l'altra è il 1878 del capitolo 15.5): due campioni su otto. In quello di oggi la CPU del server per GiB (2,15 s) è la stessa degli altri: non è il server a lavorare di più. Non so cosa rallenti quei trasferimenti e non l'ho indagato. Latenza invariata: connect+echo p50 0,9 ms, echo p50 0,5 ms.
+
+Quello che **non** ho misurato: la banda attraverso il container di collaudo stesso, con il suo segreto. L'istanza di test usa lo stesso binario sulla stessa macchina, in host mode come il container, ma non passa dal `REDIRECT` della 443.
+
+**Rollback**, se servisse:
+
+```bash
+cd <cartella del compose>
+cp -p compose.yml.bak-20261114-pre-1.4.0 compose.yml
+docker compose up -d
+```
+
+L'immagine `v1.3.1-rc.1` è ancora in locale sul server. I client 1.4.0 parlano anche con un server 1.3.x (capitolo 15.1).
+
+### 15.8 Cosa resta aperto
+
+1. **Punto 4 del capitolo 9, strutturale**: separare l'accettazione degli stream dal lavoro di controllo nel client e nel consumer. Le attese ora sono limitate, ma il disegno è lo stesso.
+2. **Punto 8**: riusare l'indirizzo del peer di controllo per il dial diretto.
+3. **Punto 10**, parte rimanente, e **nota 8.6** sul fallback STUN con `--to https://`.
+4. **Fast link**: il suo pump non è cambiato, e sulle VM piccole ora è il relay a essere più veloce (capitolo 15.6). Per riportarlo davanti serve prima un profilo su una VM a 4 vCPU: non so se il limite è nel server o nel `curl` che carica.
+5. **Build glibc**: vedi capitolo 15.6. Chi compila da sé su glibc non ha mimalloc.
+6. **Semplificazioni del capitolo 10.**
+7. **Flake del test webkit** `T-WEB-README-DIRECT` (capitolo 15.6): preesistente, non indagato.
+8. **Flake di `t_web_fairness` su macOS** (capitolo 15.6): tre fallimenti in una notte, causa non misurata. Da rendere indipendente dal carico del runner, o da capire.
 
 ---
 

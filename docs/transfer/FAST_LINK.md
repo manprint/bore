@@ -212,7 +212,7 @@ Link" card (every value tested `!= null`, so a gauge at 0 still renders).
 | I-8 | Slot removed and gauges settled on every exit | every session test (`slots_len() == 0`) |
 | I-9 | TLS only | `plain_connections_are_refused_or_redirected`, `plain_http_frontend_refuses_uploads_and_redirects_downloads`, T-FL-E11 |
 | I-10 | Nobody can register the fast label | `native_vhost_registration_of_the_fast_label_is_rejected`, `t_ssh_fast_link_label_is_reserved` |
-| I-11 | Bandwidth ≥ 1.0 × the vhost relay on the same host | T-FL-PERF (`scripts/fast_link_perf.sh`) |
+| I-11 | Bandwidth ≥ 1.0 × the vhost relay on the same host (gate fails below 0.80 ×, the measured CI-runner spread; 0.80–1.0 warns) | T-FL-PERF (`scripts/fast_link_perf.sh`) |
 
 Acceptance scripts: `scripts/fast_link_e2e.sh` (T-FL-E1..E13, real curl and wget),
 `scripts/fast_link_perf.sh` (T-FL-PERF, T-FL-TRANSIT), and the Playwright spec
@@ -236,7 +236,8 @@ job and the existing browser job).
 
 `scripts/fast_link_perf.sh`, 2026-09-25, one workstation (Intel Core 7 240H, 16 threads,
 Linux 7.0), release build, loopback, tmpfs payload, `BORE_PROXY_BUFFER_SIZE=16M` for both
-arms, interleaved `VHOST FAST FAST VHOST VHOST FAST`, downloader speed in MiB/s. The vhost
+arms, interleaved `VHOST FAST FAST VHOST VHOST FAST` (three samples per arm at the time; the
+gate takes five since 1.4.0), downloader speed in MiB/s. The vhost
 baseline's provider reaches the server over a TLS control connection, as in production:
 
 | CPU | payload | vhost relay (raw) | fast link (raw) | median ratio | server CPU s/GiB vhost → fast |

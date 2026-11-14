@@ -953,7 +953,7 @@ async fn secret_consumer_on_direct_survives_a_server_outage() -> Result<()> {
     tokio::spawn(provider.listen());
     time::sleep(Duration::from_millis(300)).await;
 
-    let consumer = Proxy::new(
+    let mut consumer = Proxy::new(
         &proxy.to(),
         "127.0.0.1:0".parse()?,
         "p2p",
@@ -969,6 +969,7 @@ async fn secret_consumer_on_direct_survives_a_server_outage() -> Result<()> {
         false,
     )
     .await?;
+    consumer.settle_initial().await?;
     assert!(
         consumer.is_direct(),
         "the consumer must negotiate the direct path"
@@ -1038,7 +1039,7 @@ async fn secret_provider_trip_keeps_its_live_direct_path() -> Result<()> {
     let provider_task = tokio::spawn(provider.listen());
     time::sleep(Duration::from_millis(300)).await;
 
-    let consumer = Proxy::new(
+    let mut consumer = Proxy::new(
         &format!("127.0.0.1:{CONTROL}"),
         "127.0.0.1:0".parse()?,
         "p2p",
@@ -1054,6 +1055,7 @@ async fn secret_provider_trip_keeps_its_live_direct_path() -> Result<()> {
         false,
     )
     .await?;
+    consumer.settle_initial().await?;
     assert!(
         consumer.is_direct(),
         "the consumer must negotiate the direct path"

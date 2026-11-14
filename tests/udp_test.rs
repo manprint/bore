@@ -161,7 +161,7 @@ async fn udp_direct_round_trip() -> Result<()> {
     // Let the provider register and offer its candidates to the server.
     time::sleep(Duration::from_millis(300)).await;
 
-    let proxy = Proxy::new(
+    let mut proxy = Proxy::new(
         "localhost",
         "127.0.0.1:0".parse()?,
         "udpsvc",
@@ -177,6 +177,7 @@ async fn udp_direct_round_trip() -> Result<()> {
         false,
     )
     .await?;
+    proxy.settle_initial().await?;
     assert!(
         proxy.is_direct(),
         "consumer should negotiate a direct UDP path"
@@ -186,6 +187,85 @@ async fn udp_direct_round_trip() -> Result<()> {
     time::sleep(Duration::from_millis(100)).await;
 
     assert_eq!(round_trip(addr, b"udp hello").await?, b"udp hello");
+    Ok(())
+}
+
+/// N-4: a consumer whose STUN server never answers gets no sign, so
+/// `Proxy::new` returns on the relay after the probe grace with the first
+/// negotiation still running. `settle_initial` must wait for that verdict and
+/// leave a proxy that serves, whichever path the negotiation ended on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_settle_initial_adopts_a_verdict_that_outlived_the_grace() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_server(true).await;
+    let stun = format!("127.0.0.1:{CONTROL_PORT}");
+    // Bound and never read: every STUN request to it goes unanswered.
+    let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let silent_stun = silent.local_addr()?.to_string();
+
+    let echo = spawn_echo_service().await?;
+    let provider = Client::new_secret_provider(
+        "localhost",
+        echo,
+        "localhost",
+        "settlesvc",
+        None,
+        false,
+        true,
+        Some(&stun),
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
+        0,
+        0, // release timeout
+        1024,
+        1, // carriers
+        ProviderMeta::default(),
+        None,
+    )
+    .await?;
+    tokio::spawn(provider.listen());
+    time::sleep(Duration::from_millis(300)).await;
+
+    let started = std::time::Instant::now();
+    let mut proxy = Proxy::new(
+        "localhost",
+        "127.0.0.1:0".parse()?,
+        "settlesvc",
+        None,
+        false,
+        true,
+        Some(&silent_stun),
+        bore_cli::holepunch::GatherOptions::from_flags(false, false),
+        0,
+        0, // release timeout
+        1, // carriers
+        None,
+        false,
+    )
+    .await?;
+    // No sign ever arrives, so `new` cannot have returned before the probe
+    // grace (1.5 s) and cannot hold a verdict yet.
+    assert!(
+        started.elapsed() >= Duration::from_millis(1400),
+        "new returned before the probe grace: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        !proxy.is_direct(),
+        "new must return on the relay while the negotiation runs"
+    );
+    proxy.settle_initial().await?;
+    assert!(
+        proxy.is_direct(),
+        "the settled verdict should be the direct path (host candidates)"
+    );
+    // A no-op once the verdict is adopted.
+    proxy.settle_initial().await?;
+    assert!(proxy.is_direct());
+    let addr = proxy.local_addr()?;
+    tokio::spawn(proxy.listen());
+    time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(round_trip(addr, b"settled").await?, b"settled");
+    drop(silent);
     Ok(())
 }
 
@@ -220,7 +300,7 @@ async fn udp_direct_many_concurrent_streams() -> Result<()> {
     tokio::spawn(provider.listen());
     time::sleep(Duration::from_millis(300)).await;
 
-    let proxy = Proxy::new(
+    let mut proxy = Proxy::new(
         "localhost",
         "127.0.0.1:0".parse()?,
         "udpmany",
@@ -236,6 +316,7 @@ async fn udp_direct_many_concurrent_streams() -> Result<()> {
         false,
     )
     .await?;
+    proxy.settle_initial().await?;
     assert!(proxy.is_direct(), "consumer should negotiate a direct path");
     let addr = proxy.local_addr()?;
     tokio::spawn(proxy.listen());
@@ -290,7 +371,7 @@ async fn udp_direct_survives_consumer_reconnect() -> Result<()> {
     let mk_proxy = || {
         let stun = stun.clone();
         async move {
-            Proxy::new(
+            let mut proxy = Proxy::new(
                 "localhost",
                 "127.0.0.1:0".parse().unwrap(),
                 "rc",
@@ -305,7 +386,9 @@ async fn udp_direct_survives_consumer_reconnect() -> Result<()> {
                 None,
                 false,
             )
-            .await
+            .await?;
+            proxy.settle_initial().await?;
+            anyhow::Ok(proxy)
         }
     };
 
@@ -364,7 +447,7 @@ async fn udp_consumer_detects_provider_drop() -> Result<()> {
     let h_provider = tokio::spawn(provider.listen());
     time::sleep(Duration::from_millis(300)).await;
 
-    let proxy = Proxy::new(
+    let mut proxy = Proxy::new(
         "localhost",
         "127.0.0.1:0".parse()?,
         "drop",
@@ -380,6 +463,7 @@ async fn udp_consumer_detects_provider_drop() -> Result<()> {
         false,
     )
     .await?;
+    proxy.settle_initial().await?;
     assert!(proxy.is_direct(), "consumer should be direct");
     let addr = proxy.local_addr()?;
     let h_proxy = tokio::spawn(proxy.listen());
@@ -558,7 +642,7 @@ async fn udp_multiple_consumers_concurrent_direct() -> Result<()> {
 
     let mut addrs = Vec::new();
     for n in 0..3u8 {
-        let proxy = Proxy::new(
+        let mut proxy = Proxy::new(
             "localhost",
             "127.0.0.1:0".parse()?,
             "multidirect",
@@ -574,6 +658,7 @@ async fn udp_multiple_consumers_concurrent_direct() -> Result<()> {
             false,
         )
         .await?;
+        proxy.settle_initial().await?;
         assert!(
             proxy.is_direct(),
             "consumer {n} should negotiate a direct path"
@@ -633,7 +718,7 @@ async fn udp_mixed_direct_and_relay_consumers() -> Result<()> {
     tokio::spawn(provider.listen());
     time::sleep(Duration::from_millis(300)).await;
 
-    let direct = Proxy::new(
+    let mut direct = Proxy::new(
         "localhost",
         "127.0.0.1:0".parse()?,
         "mix",
@@ -649,6 +734,7 @@ async fn udp_mixed_direct_and_relay_consumers() -> Result<()> {
         false,
     )
     .await?;
+    direct.settle_initial().await?;
     assert!(direct.is_direct(), "udp consumer should be direct");
     let direct_addr = direct.local_addr()?;
     tokio::spawn(direct.listen());
@@ -718,7 +804,7 @@ async fn udp_consumer_reconnects_while_others_active() -> Result<()> {
     let mk = || {
         let stun = stun.clone();
         async move {
-            Proxy::new(
+            let mut proxy = Proxy::new(
                 "localhost",
                 "127.0.0.1:0".parse().unwrap(),
                 "rcmulti",
@@ -733,7 +819,9 @@ async fn udp_consumer_reconnects_while_others_active() -> Result<()> {
                 None,
                 false,
             )
-            .await
+            .await?;
+            proxy.settle_initial().await?;
+            anyhow::Ok(proxy)
         }
     };
 
@@ -813,7 +901,7 @@ async fn udp_multiple_consumers_detect_provider_drop() -> Result<()> {
     let mut handles = Vec::new();
     let mut addrs = Vec::new();
     for n in 0..3u8 {
-        let proxy = Proxy::new(
+        let mut proxy = Proxy::new(
             "localhost",
             "127.0.0.1:0".parse()?,
             "multidrop",
@@ -829,6 +917,7 @@ async fn udp_multiple_consumers_detect_provider_drop() -> Result<()> {
             false,
         )
         .await?;
+        proxy.settle_initial().await?;
         assert!(proxy.is_direct(), "consumer {n} should be direct");
         addrs.push(proxy.local_addr()?);
         handles.push(tokio::spawn(proxy.listen()));
@@ -913,7 +1002,7 @@ async fn udp_direct_respects_max_conns() -> Result<()> {
     tokio::spawn(provider.listen());
     time::sleep(Duration::from_millis(300)).await;
 
-    let proxy = Proxy::new(
+    let mut proxy = Proxy::new(
         "localhost",
         "127.0.0.1:0".parse()?,
         "cap",
@@ -929,6 +1018,7 @@ async fn udp_direct_respects_max_conns() -> Result<()> {
         false,
     )
     .await?;
+    proxy.settle_initial().await?;
     assert!(proxy.is_direct(), "consumer should be direct");
     let addr = proxy.local_addr()?;
     tokio::spawn(proxy.listen());

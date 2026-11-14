@@ -117,6 +117,15 @@ Authoritative detailed invariants (rationale, field measurements, gates, red-che
   assertions and silently moving `bore transfer --udp` (reads `is_direct()` right after
   `new`) onto the relay. Never fire the sign after the filtering probe. S-2 unchanged —
   the report is sent from wherever the verdict is adopted, bounded (P-9).
+  `is_direct()` right after `new` is therefore "direct WITHIN the grace", not "direct":
+  a caller that needs the final verdict before serving (tests; a library user) calls
+  `Proxy::settle_initial`, which waits for the pending negotiation and adopts it through
+  the same `adopt_initial_outcome` (no-op when `new` already had it; cancel-safe; accepts
+  nothing meanwhile). A test must never assert `is_direct()` straight after `new` — on a
+  stalled runner the verdict outlives the grace (CI macOS, `udp_direct_round_trip`,
+  2026-11-14). Gate: `udp_settle_initial_adopts_a_verdict_that_outlived_the_grace`
+  (silent STUN ⇒ `new` on the relay at 1.5 s, direct after settling at ~3 s). The binary
+  does not call it: `bore proxy` adopts in `listen`, `bore transfer` keeps the bounded read.
 - **Nothing a stranger can start is unbounded (N-5).** (a) TLS handshakes on the control port
   (`server::bounded_tls_handshake`, both the legacy and the `--ssh-gateway` ALPN branch) and
   on the HTTPS vhost port are bounded by `shared::TLS_HANDSHAKE_TIMEOUT` (10 s); a timeout

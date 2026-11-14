@@ -1600,6 +1600,42 @@ impl Proxy {
         self.direct
     }
 
+    /// Waits for a first direct negotiation that outlived the grace window of
+    /// [`Proxy::new`] (N-4) and adopts its verdict, so [`Proxy::is_direct`] is
+    /// final. A no-op when `new` already had the verdict. Nothing is accepted
+    /// on the local listener meanwhile; a caller that must serve during the
+    /// wait calls [`Proxy::listen`], which adopts the same verdict itself.
+    /// Bounded by the negotiation's own budgets. Cancel-safe: the pending
+    /// negotiation stays in place until its verdict is in hand.
+    pub async fn settle_initial(&mut self) -> Result<()> {
+        let Some(initial) = self.initial.as_mut() else {
+            return Ok(());
+        };
+        let joined = (&mut initial.task).await;
+        let Some(initial) = self.initial.take() else {
+            return Ok(());
+        };
+        let (mut control, outcome, accepts_report) =
+            joined.context("initial direct negotiation task failed")?;
+        #[cfg(feature = "udp")]
+        {
+            self.path_report = accepts_report;
+        }
+        adopt_initial_outcome(
+            &mut control,
+            outcome,
+            accepts_report,
+            &initial.tcp_secret_id,
+            initial.carriers,
+            &mut self.data_path,
+            &mut self.direct,
+            &mut self.direct_closed_rx,
+        )
+        .await;
+        self.control = Some(control);
+        Ok(())
+    }
+
     /// Start forwarding: accept local connections, relay each to the provider.
     #[cfg_attr(not(feature = "udp"), allow(unused_mut))]
     pub async fn listen(self) -> Result<()> {

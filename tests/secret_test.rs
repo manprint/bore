@@ -362,7 +362,7 @@ async fn secret_tunnel_websocket_direct_udp_round_trip() -> Result<()> {
     tokio::spawn(provider.listen());
     time::sleep(Duration::from_millis(200)).await;
 
-    let proxy = Proxy::new(
+    let mut proxy = Proxy::new(
         "localhost",
         "127.0.0.1:0".parse()?,
         "ws-direct",
@@ -378,6 +378,7 @@ async fn secret_tunnel_websocket_direct_udp_round_trip() -> Result<()> {
         false,
     )
     .await?;
+    proxy.settle_initial().await?;
     assert!(
         proxy.is_direct(),
         "expected the secret websocket test to negotiate direct UDP"

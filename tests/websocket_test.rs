@@ -475,7 +475,7 @@ async fn secret_proxy_websocket_direct_udp_round_trip() -> Result<()> {
     tokio::spawn(provider.listen());
     time::sleep(Duration::from_millis(250)).await;
 
-    let proxy = Proxy::new(
+    let mut proxy = Proxy::new(
         &format!("localhost:{CONTROL}"),
         "127.0.0.1:0".parse()?,
         "secret-ws-udp",
@@ -491,6 +491,7 @@ async fn secret_proxy_websocket_direct_udp_round_trip() -> Result<()> {
         false,
     )
     .await?;
+    proxy.settle_initial().await?;
     ensure!(
         proxy.is_direct(),
         "expected secret websocket test to use direct UDP"

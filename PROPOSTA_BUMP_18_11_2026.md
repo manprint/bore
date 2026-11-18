@@ -340,3 +340,4 @@ Commit `344d4d9`.
 - Nuovo invariante **W-2** (chunk size di zip.js) in `CLAUDE.md` e `docs/INVARIANTS.md`.
 - Push su `dev`; esito CI sotto.
 - CI su `4ffc146`: Docker, Docker SSH client, E2E (netns) verdi. `Workflow lint (actionlint)` rosso: `setup-go@v7` esporta `GOTOOLCHAIN=local` e actionlint v1.7.12 richiede go ≥ 1.25.0 → `go-version: "1.25"`. Job macOS cancellati da GitHub ("not acquired by Runner ... capacity constraints"): infrastruttura, rilanciati.
+- CI su `911f962`: tutti verdi — CI, E2E (netns), Mean Bean CI (macOS inclusi), Mean Bean Deploy, Docker (GHCR); Docker SSH client verde su `4ffc146` (stessi input, non ri-triggerato). Unico rosso al primo tentativo: `T-WEB-CROSS direct webkit` ("webkit committed the wrong path"), flake noto, verde al rerun.

@@ -511,10 +511,8 @@ impl UpnpBackend {
 
         let local_ip = crate::holepunch::primary_local_ip().context("no local IPv4 for UPnP")?;
         let local = SocketAddr::new(local_ip, local_port);
-        let options = SearchOptions {
-            timeout: Some(Duration::from_secs(2)),
-            ..Default::default()
-        };
+        let mut options = SearchOptions::default();
+        options.timeout = Some(Duration::from_secs(2));
         let gateway = igd::search_gateway(options)
             .await
             .context("no UPnP-IGD gateway found")?;

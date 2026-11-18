@@ -12,8 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use anyhow::{bail, Result};
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use argon2::Argon2;
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use russh::keys::ssh_key::authorized_keys::{AuthorizedKeys, Entry};
 use russh::keys::ssh_key::public::KeyData;
 use russh::keys::{HashAlg, PublicKey};
@@ -446,9 +445,8 @@ pub fn hash_password(password: &str) -> Result<String> {
     if password.is_empty() {
         bail!("empty password");
     }
-    let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
     let hash = Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map_err(|error| anyhow::anyhow!("argon2 hash failed: {error}"))?
         .to_string();
     Ok(hash)
@@ -650,6 +648,34 @@ mod tests {
             store.check("correct horse battery staple").await,
             Some("alice".to_string())
         );
+    }
+
+    /// Password files written before the argon2 0.6 bump must keep working:
+    /// these lines were produced by `bore hash-password` built on argon2 0.5
+    /// (`m=19456,t=2,p=1`, the defaults then and now).
+    #[tokio::test]
+    async fn argon2_0_5_hashes_still_verify() {
+        const PASSWORD: &str = "argon2-0.5 compat check";
+        const HASHES: [&str; 2] = [
+            "$argon2id$v=19$m=19456,t=2,p=1$bOAlUPKXjb7nTRnTG9yoYw$inX7Q9aO9x8U37E8y+AAvoN5vnpI9nmXEDch40JLHok",
+            "$argon2id$v=19$m=19456,t=2,p=1$90oLvo098VI775UMX6GcFg$TxFMvOSMNVcoCHad1dh9wZQgwSpHo6vtuPdb4JrvtxM",
+        ];
+        for hash in HASHES {
+            assert!(verify_argon2id(PASSWORD, hash), "{hash}");
+            assert!(!verify_argon2id("argon2-0.5 compat check!", hash));
+        }
+
+        let fresh = hash_password(PASSWORD).unwrap();
+        assert!(
+            fresh.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
+            "{fresh}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("passwords");
+        std::fs::write(&path, format!("legacy:{}\n", HASHES[0])).unwrap();
+        let store = PasswordStore::new(path);
+        assert_eq!(store.check(PASSWORD).await, Some("legacy".to_string()));
     }
 
     #[tokio::test]

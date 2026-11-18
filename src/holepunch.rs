@@ -2894,10 +2894,8 @@ async fn probe_one(socket: &UdpSocket, hostport: &str) -> Result<SocketAddr> {
 async fn upnp_external_ip() -> Result<IpAddr> {
     use igd_next::aio::tokio as igd;
     use igd_next::SearchOptions;
-    let options = SearchOptions {
-        timeout: Some(Duration::from_secs(2)),
-        ..Default::default()
-    };
+    let mut options = SearchOptions::default();
+    options.timeout = Some(Duration::from_secs(2));
     let gateway = igd::search_gateway(options)
         .await
         .context("no UPnP-IGD gateway found")?;

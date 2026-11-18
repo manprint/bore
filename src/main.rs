@@ -3717,7 +3717,7 @@ fn enable_windows_ansi() -> bool {
     };
     unsafe {
         let handle = GetStdHandle(STD_ERROR_HANDLE);
-        if handle == 0 || handle == INVALID_HANDLE_VALUE {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             return false;
         }
         let mut mode: u32 = 0;

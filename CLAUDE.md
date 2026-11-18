@@ -99,6 +99,7 @@ Each line = the rule. `docs/INVARIANTS.md` = why, field measurements, gates, red
 
 ### Transfer
 - Bounded manifests, `with_stall` pre-manifest, first-frame validation on worker accept, idempotent `commit_stage`, fsync before rename, `ProgressTracker` `Drop`, hashing in `hash_planned_entries` (never inline in `scan_entry`).
+- **W-2 (web):** `web/transfer/src/zip-stream.js` pins zip.js `chunkSize` to 64 KiB via the GLOBAL `configure` (`ZIP_CHUNK_BYTES`): read-ahead ≈ 12 chunks; zip.js ≥ 2.19 defaults to 256 KiB (3 MiB ahead, red-check `tests/unit/zip.test.mjs`). A reader-side `createReadable` does not reach the internal re-chunk.
 
 ### VPN (Linux; macOS/Android twins)
 - Relay queue applies backpressure (never drops); the ctrl actor is the single owner of the control stream; server heartbeat 500 ms; client beats only after the server proves it decodes them.

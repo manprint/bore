@@ -17,10 +17,10 @@
     "perf:crypto": "node tests/perf/crypto-bench.mjs"
   },
   "dependencies": {
-    "@zip.js/zip.js": "2.15.0"
+    "@zip.js/zip.js": "2.25.0"
   },
   "devDependencies": {
-    "@playwright/test": "1.63.0",
+    "@playwright/test": "1.65.1",
     "esbuild": "0.28.2"
   }
 }

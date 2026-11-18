@@ -88,6 +88,9 @@ These were decided with the project owner. Build to them.
 5. **One new dependency only:** a YAML parser for `vhost.yml`. Use `serde_yaml`
    (or the maintained fork `serde_yml` if you prefer; pick one, note it in the PR).
    Everything else uses `std::sync::RwLock<Arc<T>>` — no extra dependency for swapping.
+   *(2026-11-18: `serde_yaml` was replaced by `serde-saphyr` 2.2 — `serde_yaml` is
+   unmaintained and pulled `unsafe-libyaml`, RUSTSEC-2024-0449. Same `from_str` entry
+   point.)*
 
 ---
 

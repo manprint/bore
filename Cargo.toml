@@ -15,6 +15,9 @@ keywords = ["network", "cli", "tunnel", "tcp"]
 categories = ["network-programming", "web-programming", "command-line-utilities"]
 readme = "README.md"
 edition = "2021"
+# Proven with `cargo +1.89.0 check --all-features --all-targets` (the dependency
+# floor: serde-saphyr, russh 0.65.2, uuid). Raise it only after the same check.
+rust-version = "1.89"
 # What ships in the crate, stated rather than inherited. `web/transfer/dist`
 # is COMMITTED and MUST travel: the binary embeds it at compile time
 # (`build.rs`), which is what makes `cargo install bore-cli` work with no
@@ -85,7 +88,9 @@ unicode-normalization = "0.1"
 ring = "0.17"
 serde = { version = "1.0.136", features = ["derive"] }
 serde_json = "1.0.79"
-serde_yaml = "0.9"
+# YAML for `vhost.yml` (deserialize only). Replaces serde_yaml (unmaintained,
+# pulled unsafe-libyaml, RUSTSEC-2024-0449); pure Rust, forbids unsafe.
+serde-saphyr = { version = "2.2.0", default-features = false, features = ["deserialize"] }
 sha2 = "0.11.1"
 socket2 = "0.6.4"
 blake3 = "1.5.5"

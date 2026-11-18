@@ -30,7 +30,7 @@
 ARG BORE_IMAGE=ghcr.io/manprint/bore:latest
 FROM ${BORE_IMAGE} AS bin
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes \
        ca-certificates tar gzip xz-utils zstd lz4 \

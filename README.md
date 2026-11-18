@@ -212,7 +212,7 @@ outage or an IP change — see
 Server-side UDP, relay, Docker networking, carrier, and file-descriptor tuning notes are in
 [`docs/server/SERVER_UDP_OPTIMIZATION.md`](docs/server/SERVER_UDP_OPTIMIZATION.md).
 
-**Build from source:**
+**Build from source** (Rust 1.89 or newer, `rust-version` in `Cargo.toml`):
 
 ```shell
 cargo install --git https://github.com/manprint/bore --locked bore-cli --features vpn,ssh-gateway
@@ -1838,7 +1838,7 @@ Server flags (all `#[cfg(feature = "ssh-gateway")]`; also listed in the
 | `--ssh-gateway` | `BORE_SSH_GATEWAY` | yes (to activate) | Enables the gateway. Requires **at least one** of `--ssh-authorized-keys-dir`/`--ssh-passwords-file` (fails fast otherwise). |
 | `--ssh-jump-base-domain <DOMAIN>` | `BORE_SSH_JUMP_BASE_DOMAIN` | no | Enables exact `<alias>.<domain>` ProxyJump dispatch. Requires `--ssh-gateway`. |
 | `--ssh-port <PORT>` | `BORE_SSH_PORT` | no | Extra dedicated SSH port. Without it, SSH is demuxed on the **same** control/vhost port (443/7835) — no extra port to open. |
-| `--ssh-host-key-file <PATH>` | `BORE_SSH_HOST_KEY_FILE` | no (default `bore_ssh_host_key.pem`) | ed25519 host key, generated on first run if absent. **Persist it on a volume** — otherwise the fingerprint changes on every restart and breaks every `autossh` client pinned with `StrictHostKeyChecking`. Keep it ed25519: the `rsa` crate (RUSTSEC-2023-0071, Marvin timing side-channel, no upstream patch) is linked only to verify client RSA signatures, and an operator-supplied RSA host key would make the gateway perform RSA signing. |
+| `--ssh-host-key-file <PATH>` | `BORE_SSH_HOST_KEY_FILE` | no (default `bore_ssh_host_key.pem`) | ed25519 host key, generated on first run if absent. **Persist it on a volume** — otherwise the fingerprint changes on every restart and breaks every `autossh` client pinned with `StrictHostKeyChecking`. Prefer ed25519; an operator-supplied RSA host key also works (`rsa` 0.10.0 fixes RUSTSEC-2023-0071, the Marvin timing side-channel). |
 | `--ssh-authorized-keys-dir <DIR>` | `BORE_SSH_AUTHORIZED_KEYS_DIR` | one of two | Directory of `authorized_keys`-format files (one or more), re-read on **every** auth attempt — free hot-reload. |
 | `--ssh-passwords-file <PATH>` | `BORE_SSH_PASSWORDS_FILE` | one of two | `label:$argon2id$...` lines, one credential per line. Generate with `bore hash-password`. |
 | `--ssh-banner <TEXT>` | `BORE_SSH_BANNER` | no | Text shown before authentication. |

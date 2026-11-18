@@ -150,7 +150,7 @@ impl VhostMode {
 
 /// Parse a `vhost.yml` string into a [`VhostConfig`].
 pub fn parse_config(yaml: &str) -> Result<VhostConfig> {
-    let cfg: VhostConfig = serde_yaml::from_str(yaml)?;
+    let cfg: VhostConfig = serde_saphyr::from_str(yaml)?;
     Ok(cfg)
 }
 

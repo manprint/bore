@@ -48,13 +48,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # `--features vpn,ssh-gateway` is additive (keeps default `udp`); the
       # one binary drives every script (vpn/vhost/secret/local/admin/ssh_gateway).
       - run: cargo build --release --features vpn,ssh-gateway
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bore-bin
           path: target/release/bore
@@ -112,10 +112,10 @@ jobs:
           # teardown helper -- never a gate
           - { script: vhost_cleanup,              secs: 120,  gate: false }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download bore binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: bore-bin
           path: target/release
@@ -159,7 +159,7 @@ jobs:
 
       - name: Upload log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-log-${{ matrix.script }}
           path: e2e-${{ matrix.script }}.log

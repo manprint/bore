@@ -78,14 +78,14 @@ fn deploy_examples_add_no_udp_port_and_no_payload_volume_for_web_transfer() {
     const KNOWN_UDP: &[&str] = &["7835", "80", "443"];
     for path in COMPOSE {
         let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        let doc: serde_yaml::Value = serde_yaml::from_str(&text).expect("compose parses");
+        let doc: serde_json::Value = serde_saphyr::from_str(&text).expect("compose parses");
         let services = doc
             .get("services")
-            .and_then(|s| s.as_mapping())
+            .and_then(|s| s.as_object())
             .expect("compose has services");
         for (name, service) in services {
-            let name = name.as_str().unwrap_or("<service>");
-            if let Some(ports) = service.get("ports").and_then(|p| p.as_sequence()) {
+            let name = name.as_str();
+            if let Some(ports) = service.get("ports").and_then(|p| p.as_array()) {
                 for port in ports {
                     let Some(text) = port.as_str() else { continue };
                     if !text.ends_with("/udp") {
@@ -98,7 +98,7 @@ fn deploy_examples_add_no_udp_port_and_no_payload_volume_for_web_transfer() {
                     );
                 }
             }
-            if let Some(volumes) = service.get("volumes").and_then(|v| v.as_sequence()) {
+            if let Some(volumes) = service.get("volumes").and_then(|v| v.as_array()) {
                 for volume in volumes {
                     let Some(text) = volume.as_str() else {
                         continue;

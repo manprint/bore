@@ -33,7 +33,7 @@ jobs:
     if: inputs.only != 'web-transfer'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -88,7 +88,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -111,7 +111,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -126,7 +126,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -149,7 +149,7 @@ jobs:
           - macos-latest
           - windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -174,15 +174,15 @@ jobs:
     name: Web transfer (browser slice)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: web/transfer/package-lock.json
 
@@ -245,7 +245,7 @@ jobs:
       - name: Crate artifact serves the shell (T-WEB-PACKAGE)
         run: bash scripts/web_transfer_package_test.sh
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: web-transfer-playwright
@@ -263,15 +263,15 @@ jobs:
       matrix:
         project: [chromium, firefox, webkit]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: web/transfer/package-lock.json
 
@@ -317,7 +317,7 @@ jobs:
           npx playwright test --project=${{ matrix.project }}
           --grep-invert "T-WEB-CROSS" --workers=1 --reporter=line
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: web-transfer-playwright-${{ matrix.project }}
@@ -335,15 +335,15 @@ jobs:
       || (github.event_name == 'workflow_dispatch' && inputs.only == 'web-transfer')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: web/transfer/package-lock.json
 
@@ -396,7 +396,7 @@ jobs:
         working-directory: web/transfer
         run: npm run test:e2e:branded
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: web-transfer-branded
@@ -420,7 +420,7 @@ jobs:
           - target: x86_64-linux-android
             os: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -471,7 +471,7 @@ jobs:
     if: inputs.only != 'web-transfer'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -503,7 +503,7 @@ jobs:
     if: inputs.only != 'web-transfer'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -561,7 +561,7 @@ jobs:
     if: inputs.only != 'web-transfer'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -591,7 +591,7 @@ jobs:
     # Independent of macos-vpn-build: the real device tests (utun/PF) are the
     # point and should run even while unrelated test-corpus clippy is cleaned up.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -636,7 +636,7 @@ jobs:
     env:
       ANDROID_API: "24" # must match Justfile's android_api
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -683,7 +683,7 @@ jobs:
     env:
       ANDROID_API: "24" # must match Justfile's android_api
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -742,14 +742,14 @@ jobs:
     if: inputs.only != 'web-transfer'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # `go install`, not `taiki-e/install-action`: actionlint is a Go program
       # and has no crates.io crate, so install-action does not carry it and
       # falls back to cargo-binstall, which fails with `For crate actionlint:
       # actionlint is not found` and exit code 76 (measured, run 34771148278).
       # The version is PINNED and the Go checksum database verifies the module,
       # so this step cannot silently start linting with different rules.
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.24"
       - run: |
@@ -762,19 +762,10 @@ jobs:
     if: inputs.only != 'web-transfer'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
-      # RUSTSEC-2023-0071 (Marvin Attack, rsa crate, no fixed upgrade available):
-      # pulled in transitively by russh's `rsa` feature (ssh-gateway), used only
-      # for SSH pubkey/hostkey signing and verification — the advisory's timing
-      # side-channel is in PKCS#1v1.5 *decryption*, an operation SSH never
-      # performs with RSA (SSH only signs/verifies with it). Not exploitable here:
-      # the gateway host key is generated as ed25519 (`sshgw::load_or_generate_host_key`),
-      # so by default bore runs no RSA private-key operation — RSA is only used to
-      # VERIFY client signatures against authorized keys (public-key op). An
-      # operator who supplies their own RSA `--ssh-host-key-file` opts into RSA
-      # signing and should use ed25519 instead (README/SSH_GATEWAY.md). Still
-      # unpatched upstream as of rsa 0.10.0-rc.18 (re-check on each russh bump).
-      - run: cargo audit --ignore RUSTSEC-2023-0071
+      # No ignores: RUSTSEC-2023-0071 (rsa, Marvin) is fixed by rsa 0.10.0
+      # (vendored russh 0.65.2). Add an --ignore only with a written rationale.
+      - run: cargo audit

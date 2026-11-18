@@ -16,8 +16,23 @@
 // comment, no variable extra field -- and every timestamp comes from the
 // MANIFEST, which is signed, rather than from the file on disk, which is
 // not.
+import { configure } from "@zip.js/zip.js/lib/zip-core-custom.js";
 import { ZipWriter } from "@zip.js/zip.js/lib/zip-core-writer.js";
 import { CHUNK_BYTES } from "./framing.js";
+
+/**
+ * zip.js's internal chunk size, pinned. It is the read-ahead bound: zip.js
+ * re-chunks every source to its global `chunkSize` (`codec-worker.js`
+ * `ChunkStream`) and about a dozen of those chunks sit in its pipeline queues
+ * at once, so the size of one IS how far the reader runs ahead of the sink.
+ * 2.19 raised the default from 64 KiB to 256 KiB: MEASURED 3.0 MiB ahead
+ * instead of 0.75 MiB on the 16 MiB red-check in `tests/unit/zip.test.mjs`.
+ * Only the library-wide setting reaches the internal re-chunk (a reader-side
+ * `createReadable` override measured 2.4 MiB still). Store mode, so the
+ * archive bytes do not depend on it; zip.js is used by this module only.
+ */
+export const ZIP_CHUNK_BYTES = 64 * 1024;
+configure({ chunkSize: ZIP_CHUNK_BYTES });
 
 /**
  * The options that make the output deterministic. Frozen because they are a

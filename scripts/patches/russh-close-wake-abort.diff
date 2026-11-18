@@ -344,25 +344,3 @@
  
      Ok(RunningSession { handle, join })
  }
---- a/tests/auth_signer_failure.rs
-+++ b/tests/auth_signer_failure.rs
-@@ -34,7 +34,7 @@
-     async fn auth_publickey(
-         &mut self,
-         _user: &str,
--        _public_key: &ssh_key::PublicKey,
-+        _public_key: russh::server::VerifiedPublicKey<'_>,
-     ) -> Result<server::Auth, Self::Error> {
-         Ok(server::Auth::Accept)
-     }
---- a/tests/test_window_adjust.rs
-+++ b/tests/test_window_adjust.rs
-@@ -109,7 +109,7 @@
-     async fn auth_publickey(
-         &mut self,
-         _: &str,
--        _: &ssh_key::PublicKey,
-+        _: russh::server::VerifiedPublicKey<'_>,
-     ) -> Result<Auth, Self::Error> {
-         Ok(Auth::Accept)
-     }

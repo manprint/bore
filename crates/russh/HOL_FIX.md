@@ -1,10 +1,10 @@
 # Vendored `russh` — per-channel head-of-line-blocking fix
 
-This is a copy of **pristine `russh` 0.65.0** (crates.io) plus two local
+This is a copy of **pristine `russh` 0.65.2** (crates.io) plus two local
 deltas (below): a fix for **per-channel head-of-line (HOL) blocking** in the
 SSH session read loop, and a close-wake/abort delta. The security fixes that
 bore used to backport into 0.62.1 (GHSA-3hm4, -5xvq, -cqjc, -g6xm) are native
-in 0.65.0 and no longer carried. It is wired into
+in 0.65.0+ and no longer carried. It is wired into
 `bore` via `[patch.crates-io]` in the workspace root `Cargo.toml`, so every
 `russh` dependency (direct and transitive) resolves to this tree.
 
@@ -65,12 +65,12 @@ Mechanism:
 `bore` only uses the `russh` **server**; the PR's symmetric **client**-side
 changes are carried too, solely so the shared `session.rs` split compiles.
 
-## Files changed vs pristine 0.65.0 (HOL delta)
+## Files changed vs pristine 0.65.2 (HOL delta)
 
 `src/channels/mod.rs`, `src/channels/io/rx.rs`, `src/session.rs`,
 `src/server/session.rs`, `src/server/mod.rs`, `src/server/encrypted.rs`,
 `src/client/mod.rs`, `src/client/encrypted.rs`. Everything else is byte-for-byte
-upstream 0.65.0. A diff against a fresh 0.65.0 checkout isolates the change.
+upstream 0.65.2. A diff against a fresh 0.65.2 checkout isolates the change.
 
 ## Regression coverage
 
@@ -84,7 +84,7 @@ upstream 0.65.0. A diff against a fresh 0.65.0 checkout isolates the change.
 
 ## Re-applying on a `russh` version bump
 
-Both deltas are preserved as diffs against pristine **0.65.0**, applied in
+Both deltas are preserved as diffs against pristine **0.65.2**, applied in
 order, both with `-p1` from inside `crates/russh`:
 
 1. Replace `crates/russh` with the new pristine crate source.
@@ -92,7 +92,7 @@ order, both with `-p1` from inside `crates/russh`:
    (or port by hand if the flow-control internals moved).
 3. `patch -p1 --fuzz=3 < ../../scripts/patches/russh-close-wake-abort.diff`
    (close-wake + abort, section below; also carries the Cargo.toml
-   `[workspace]` block and the test-signature fixes).
+   `[workspace]` block).
 4. Rebuild + run all three regression suites above (now incl. the I-SSH10
    pair in `tests/ssh_gateway_test.rs`) plus the netns `T-SSH-*` harness.
 5. If upstream has since merged an equivalent fix, drop the vendored crate and
@@ -101,12 +101,16 @@ order, both with `-p1` from inside `crates/russh`:
 Rebase log: 0.62.1 -> 0.65.0 (2026-10-26) was done from the pristine tree, not
 by 3-way merge (the flow-control files drifted too far); the diffs were
 re-derived and verified to reproduce `crates/russh` byte for byte.
+0.65.0 -> 0.65.2 (2026-11-18): both diffs applied to the pristine 0.65.2 tree
+with zero fuzz on the source hunks; the HOL diff body is unchanged, the
+close-wake diff lost its two test-file hunks (upstream now ships the
+`VerifiedPublicKey<'_>` signatures). Re-derived, verified byte for byte.
 
 ---
 
 ## Second vendored delta (2026-07-06, I-SSH10): close-wake for blocked writers + abortable sessions
 
-Two further deviations from pristine 0.62.1 (carried unchanged onto 0.65.0), made for the bore ssh-gateway
+Two further deviations from pristine 0.62.1 (carried unchanged onto 0.65.0 and 0.65.2), made for the bore ssh-gateway
 resilience fix (wedged-but-TCP-alive clients; see `CLAUDE.md` I-SSH10):
 
 1. **`WindowSizeRef.closed` + `close()` (`src/channels/mod.rs`,
@@ -145,11 +149,10 @@ certificates, GHSA-5xvq low-order curve25519, GHSA-cqjc `pty-req` modes,
 GHSA-g6xm `max_auth_attempts`) is deleted: 0.65.0 contains all four fixes.
 `sshgw::SSH_MAX_AUTH_ATTEMPTS` stays 6 (`none` probe plus wrong keys count).
 
-## Local test fixes (not behaviour)
+## Local test notes
 
-Upstream 0.65.0 ships `tests/test_window_adjust.rs` and
-`tests/auth_signer_failure.rs` with a stale `auth_publickey(&ssh_key::PublicKey)`
-handler signature and they do not compile; both are changed to
-`russh::server::VerifiedPublicKey<'_>` (in `russh-close-wake-abort.diff`).
 `tests/auth_agent_req_channel_reply.rs` needs `/usr/sbin/sshd` and fails without it
 (environmental, identical on pristine).
+The doctest on `keys::load_public_key` reads `../files/id_ed25519.pub`, a fixture of
+the upstream git workspace that the crates.io tarball does not ship: it fails in this
+tree exactly as on pristine (`cargo test --doc -- --skip load_public_key` for the rest).

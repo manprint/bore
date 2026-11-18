@@ -129,10 +129,10 @@ russh = { version = "0.65", default-features = false, features = ["ring", "flate
 # Default features include `getrandom` (salt generation in `hash_password`).
 argon2 = { version = "0.6", optional = true }
 # Pulled in transitively by russh, but pinned here directly (exact-pinned to
-# match russh's own `=0.7.0-rc.11` requirement) to turn on its "rand_core"
+# match russh's own `=0.7.0-rc.12` requirement) to turn on its "rand_core"
 # feature — needed for `PrivateKey::random` (ed25519 host-key auto-gen, D9).
 # russh's own feature set has no passthrough for it.
-ssh-key = { version = "=0.7.0-rc.11", optional = true, features = ["rand_core"] }
+ssh-key = { version = "=0.7.0-rc.12", optional = true, features = ["rand_core"] }
 rand = { version = "0.10", optional = true }
 
 [target.'cfg(unix)'.dependencies]
@@ -166,7 +166,7 @@ lto = true
 codegen-units = 1
 strip = true
 
-# Vendored russh 0.65.0 carrying an UNMERGED upstream fix (Eugeny/russh#730,
+# Vendored russh 0.65.2 carrying an UNMERGED upstream fix (Eugeny/russh#730,
 # "gate WINDOW_ADJUST on consumption to fix per-channel HOL blocking") plus the
 # I-SSH10 close-wake/abort delta. Stock
 # russh forwards inbound CHANNEL_DATA to the per-channel mpsc with a blocking

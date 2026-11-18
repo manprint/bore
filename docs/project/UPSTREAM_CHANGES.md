@@ -508,7 +508,8 @@ aarch64-musl, android via NDK).
   `SSH_MAX_ENV_REQUESTS` (64) variables per connection. The tokio runtime's workers run
   on 8 MiB stacks (`WORKER_THREAD_STACK_SIZE`, defence in depth). Do not lower the auth
   cap below 6 and do not drop the vendored guards when merging a russh bump without
-  re-checking that the target version has them (0.65.0 does).
+  re-checking that the target version has them (0.65.0 does). Rebased onto pristine 0.65.2
+  on 2026-11-18 (same two deltas, `ssh-key` `=0.7.0-rc.12`, `rsa` 0.10 closes RUSTSEC-2023-0071).
 
 ## Known limitations / candidate next steps
 

@@ -73,7 +73,7 @@ fastrand = "2"
 futures-util = { version = "0.3.21", features = ["sink", "io"] }
 futures-lite = "2.6.1"
 hex = "0.4.3"
-hmac = "0.12.1"
+hmac = "0.13.0"
 # Reuses the lockfile's subtle 2.x resolution; canonical constant-time digest
 # comparison (`token_digests_equal`) without homebrew timing logic.
 subtle = "2.6"
@@ -86,7 +86,7 @@ ring = "0.17"
 serde = { version = "1.0.136", features = ["derive"] }
 serde_json = "1.0.79"
 serde_yaml = "0.9"
-sha2 = "0.10.2"
+sha2 = "0.11.1"
 socket2 = "0.6.4"
 blake3 = "1.5.5"
 httparse = "1.8"

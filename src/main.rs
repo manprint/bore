@@ -3830,6 +3830,41 @@ mod tests {
 
     const MIB: u64 = 1024 * 1024;
 
+    /// Production builds and parses the CLI on `main`'s explicitly sized
+    /// 8 MiB thread; the test harness runs each test on a 2 MiB thread. The
+    /// derive-generated builders are stack-heavy in a debug build, and
+    /// clap_derive 4.6.8 pushed building the command tree past 2 MiB. Tests
+    /// touch the CLI on a thread sized like production instead of the
+    /// harness default.
+    const CLI_STACK: usize = 8 * 1024 * 1024;
+
+    fn on_cli_stack<R: Send>(build: impl FnOnce() -> R + Send) -> R {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(CLI_STACK)
+                .spawn_scoped(scope, build)
+                .expect("spawn CLI thread")
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
+    }
+
+    fn try_parse_args<I, T>(argv: I) -> std::result::Result<Args, clap::Error>
+    where
+        I: IntoIterator<Item = T> + Send,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        on_cli_stack(|| Args::try_parse_from(argv))
+    }
+
+    fn parse_args<I, T>(argv: I) -> Args
+    where
+        I: IntoIterator<Item = T> + Send,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        try_parse_args(argv).unwrap_or_else(|error| error.exit())
+    }
+
     /// The two hosts the campaign actually covered must both be warned, and a
     /// well-provisioned host must stay quiet — otherwise the warning is either
     /// useless or noise.
@@ -3884,7 +3919,7 @@ mod tests {
     #[test]
     fn server_udp_memory_budget_flag_derives_windows_and_slots() {
         let _guard = ENV_GUARD.lock().unwrap();
-        let args = Args::parse_from(["bore", "server", "--udp-memory-budget", "512MiB"]);
+        let args = parse_args(["bore", "server", "--udp-memory-budget", "512MiB"]);
         let Command::Server {
             udp_memory_budget,
             max_carriers,
@@ -3975,7 +4010,7 @@ mod tests {
             "--udp-stream-receive-window",
             "--udp-send-window",
         ] {
-            let err = Args::try_parse_from([
+            let err = try_parse_args([
                 "bore",
                 "server",
                 "--udp-memory-budget",
@@ -3987,13 +4022,13 @@ mod tests {
             assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "{flag}");
         }
         // And the defaults are not "explicit", so the budget alone is fine.
-        assert!(Args::try_parse_from(["bore", "server", "--udp-memory-budget", "512MiB"]).is_ok());
+        assert!(try_parse_args(["bore", "server", "--udp-memory-budget", "512MiB"]).is_ok());
     }
 
     #[test]
     fn server_udp_tuning_defaults_match_current_values() {
         let _guard = ENV_GUARD.lock().unwrap();
-        let args = Args::parse_from(["bore", "server"]);
+        let args = parse_args(["bore", "server"]);
         let Command::Server {
             udp_stream_receive_window,
             udp_connection_receive_window,
@@ -4021,7 +4056,7 @@ mod tests {
     #[test]
     fn server_udp_tuning_flags_override_defaults() {
         let _guard = ENV_GUARD.lock().unwrap();
-        let args = Args::parse_from([
+        let args = parse_args([
             "bore",
             "server",
             "--udp-stream-receive-window",
@@ -4074,7 +4109,7 @@ mod tests {
     #[test]
     fn vhost_backend_tls_flags_parse() {
         let _guard = ENV_GUARD.lock().unwrap();
-        let args = Args::parse_from([
+        let args = parse_args([
             "bore",
             "vhost",
             "localhost:3005",
@@ -4101,7 +4136,7 @@ mod tests {
     #[test]
     fn vhost_backend_tls_defaults_off() {
         let _guard = ENV_GUARD.lock().unwrap();
-        let args = Args::parse_from([
+        let args = parse_args([
             "bore",
             "vhost",
             "localhost:3000",
@@ -4159,7 +4194,7 @@ mod tests {
         std::env::set_var("BORE_UDP_SOCKET_SEND_BUFFER", "20MiB");
         std::env::set_var("BORE_UDP_MAX_STREAMS", "2048");
 
-        let args = Args::parse_from(["bore", "server"]);
+        let args = parse_args(["bore", "server"]);
         let Command::Server {
             udp_stream_receive_window,
             udp_connection_receive_window,
@@ -4207,7 +4242,7 @@ mod tests {
         let saved = std::env::var_os("BORE_SERVER");
         std::env::remove_var("BORE_SERVER");
 
-        let args = Args::parse_from(["bore", "test-udp", "--udp-only"]);
+        let args = parse_args(["bore", "test-udp", "--udp-only"]);
         let Command::TestUdp { to, udp_only, .. } = args.command else {
             panic!("expected test-udp command");
         };
@@ -4249,7 +4284,7 @@ mod tests {
         let saved = std::env::var_os("BORE_SERVER");
         std::env::remove_var("BORE_SERVER");
 
-        let args = Args::parse_from(["bore", "local", "8080"]);
+        let args = parse_args(["bore", "local", "8080"]);
         let Command::Local { to, .. } = args.command else {
             panic!("expected local command");
         };
@@ -4267,7 +4302,7 @@ mod tests {
         let saved = std::env::var_os("BORE_SERVER");
         std::env::remove_var("BORE_SERVER");
 
-        let args = Args::parse_from([
+        let args = parse_args([
             "bore",
             "proxy",
             "--local-proxy-port",
@@ -4300,7 +4335,7 @@ mod tests {
         std::env::remove_var("BORE_PREFER_UDP");
         std::env::remove_var("BORE_TCP_SECRET_ID");
 
-        let args = Args::parse_from(["bore", "local", "8080", "--udp"]);
+        let args = parse_args(["bore", "local", "8080", "--udp"]);
         let Command::Local {
             udp, tcp_secret_id, ..
         } = args.command
@@ -4344,7 +4379,7 @@ mod tests {
     }
 
     fn local_https(argv: &[&str]) -> Option<HttpsPolicy> {
-        let args = Args::parse_from(argv);
+        let args = parse_args(argv);
         let Command::Local { https, .. } = args.command else {
             panic!("expected local command");
         };
@@ -4389,7 +4424,7 @@ mod tests {
     #[test]
     fn parse_vhost_https_redirect() {
         with_https_env_cleared(|| {
-            let args = Args::parse_from([
+            let args = parse_args([
                 "bore",
                 "vhost",
                 "localhost:5000",
@@ -4442,7 +4477,7 @@ mod tests {
         let saved = std::env::var_os("BORE_SERVER");
         std::env::set_var("BORE_SERVER", "https://env.example.test");
 
-        let args = Args::parse_from(["bore", "local", "8080"]);
+        let args = parse_args(["bore", "local", "8080"]);
         let Command::Local { to, .. } = args.command else {
             panic!("expected local command");
         };
@@ -4467,7 +4502,7 @@ mod tests {
         std::env::remove_var("BORE_SERVER");
 
         // Bare command: valid, with the project's public default endpoint.
-        let args = Args::parse_from(["bore", "transfer", "web"]);
+        let args = parse_args(["bore", "transfer", "web"]);
         let Command::Transfer {
             command:
                 TransferCommand::Web {
@@ -4491,7 +4526,7 @@ mod tests {
         assert!(!relay_only);
 
         // All five documented flags together.
-        let args = Args::parse_from([
+        let args = parse_args([
             "bore",
             "transfer",
             "web",
@@ -4539,7 +4574,7 @@ mod tests {
             let mut argv = vec!["bore", "transfer", "web"];
             argv.extend(bad.iter().copied());
             assert!(
-                Args::try_parse_from(&argv).is_err(),
+                try_parse_args(&argv).is_err(),
                 "`bore transfer web` must refuse {bad:?}"
             );
         }
@@ -4555,7 +4590,7 @@ mod tests {
     /// the command line: a moved or renamed flag breaks somebody's script.
     #[test]
     fn transfer_listener_sender_cli_snapshots_unchanged() {
-        let command = Args::command();
+        let command = on_cli_stack(Args::command);
         let transfer = command
             .get_subcommands()
             .find(|sub| sub.get_name() == "transfer")
@@ -4649,7 +4684,7 @@ mod tests {
         let saved = std::env::var_os("BORE_SERVER");
         std::env::remove_var("BORE_SERVER");
 
-        let args = Args::parse_from(["bore", "transfer", "link", "backup.bin"]);
+        let args = parse_args(["bore", "transfer", "link", "backup.bin"]);
         let Command::Transfer { command } = args.command else {
             panic!("expected transfer command");
         };
@@ -4691,7 +4726,7 @@ mod tests {
 
     #[test]
     fn transfer_link_accepts_adaptive_carriers() {
-        let args = Args::parse_from(["bore", "transfer", "link", "--carriers", "0", "backup.bin"]);
+        let args = parse_args(["bore", "transfer", "link", "--carriers", "0", "backup.bin"]);
         let Command::Transfer { command } = args.command else {
             panic!("expected transfer command");
         };
@@ -4707,7 +4742,7 @@ mod tests {
         let saved = std::env::var_os("BORE_SERVER");
         std::env::remove_var("BORE_SERVER");
 
-        let args = Args::parse_from([
+        let args = parse_args([
             "bore",
             "transfer",
             "listener",
@@ -4743,7 +4778,7 @@ mod tests {
         let saved = std::env::var_os("BORE_SERVER");
         std::env::remove_var("BORE_SERVER");
 
-        let args = Args::parse_from([
+        let args = parse_args([
             "bore",
             "transfer",
             "sender",
@@ -4901,7 +4936,7 @@ mod tests {
     #[test]
     fn ssh_jump_cli_standard_and_nonstandard_ports_parse() {
         for (target, expected_port) in [("localhost:22", 22), ("localhost:2222", 2222)] {
-            let args = Args::try_parse_from([
+            let args = try_parse_args([
                 "bore",
                 "sshjhost",
                 target,
@@ -4947,7 +4982,7 @@ mod tests {
 
     #[test]
     fn ssh_jump_cli_rejects_invalid_alias() {
-        assert!(Args::try_parse_from([
+        assert!(try_parse_args([
             "bore",
             "sshjhost",
             "localhost:22",
@@ -5001,7 +5036,7 @@ mod tests {
         std::env::set_var("BORE_PREFER_UDP", "true");
         std::env::set_var("BORE_AUTO_RECONNECT", "true");
         std::env::set_var("BORE_INSECURE", "true");
-        let args = Args::parse_from(["bore", "sshjhost", "localhost:2222"]);
+        let args = parse_args(["bore", "sshjhost", "localhost:2222"]);
         let Command::SshJHost {
             subdomain,
             to,
@@ -5026,7 +5061,7 @@ mod tests {
         std::env::set_var("BORE_SSH_JUMP_BASE_DOMAIN", "SSH.Env.Test.");
         #[cfg(feature = "ssh-gateway")]
         std::env::set_var("BORE_SSH_GATEWAY", "true");
-        let args = Args::parse_from(["bore", "server"]);
+        let args = parse_args(["bore", "server"]);
         let Command::Server {
             ssh_jump_base_domain,
             #[cfg(feature = "ssh-gateway")]
@@ -5053,7 +5088,7 @@ mod tests {
         // The exact reported repro: `bore local -p 9005 --https 10.10.16.138:5000
         // --udp --auto-reconnect -s mysecret` must parse (clap-level), not fail
         // with "invalid digit found in string" on the PORT positional.
-        let args = Args::parse_from([
+        let args = parse_args([
             "bore",
             "local",
             "-p",
@@ -5094,7 +5129,7 @@ mod tests {
         // With no --vhost-http-port/--vhost-https-port flags, the options are None
         // so the dispatch leaves the vhost.yml ports untouched (regression: the old
         // u16 defaults of 80/443 silently clobbered the config).
-        let args = Args::parse_from(["bore", "server"]);
+        let args = parse_args(["bore", "server"]);
         let Command::Server {
             vhost_http_port,
             vhost_https_port,
@@ -5117,7 +5152,7 @@ mod tests {
         std::env::remove_var("BORE_VHOST_HTTPS_PORT");
         std::env::remove_var("BORE_VHOST_QUIC_PORT");
 
-        let args = Args::parse_from([
+        let args = parse_args([
             "bore",
             "server",
             "--vhost-http-port",
@@ -5161,7 +5196,7 @@ mod tests {
         let saved = std::env::var_os("BORE_VHOST_UDP");
         std::env::remove_var("BORE_VHOST_UDP");
 
-        let args = Args::parse_from([
+        let args = parse_args([
             "bore",
             "vhost",
             "127.0.0.1:8080",
@@ -5188,7 +5223,7 @@ mod tests {
         // The vhost frontend is fully configurable without a yaml file: base domain,
         // cert and key all come from flags (env-backed), so a Docker/compose
         // deployment needs no mounted config file for the common case.
-        let args = Args::parse_from([
+        let args = parse_args([
             "bore",
             "server",
             "--vhost-base-domain",
@@ -5224,7 +5259,7 @@ mod tests {
         let saved = std::env::var_os("BORE_VHOST_BASE_DOMAIN");
         std::env::set_var("BORE_VHOST_BASE_DOMAIN", "env.example.com");
 
-        let args = Args::parse_from(["bore", "server"]);
+        let args = parse_args(["bore", "server"]);
         let Command::Server {
             vhost_base_domain, ..
         } = args.command
@@ -5253,7 +5288,7 @@ mod tests {
     #[test]
     fn cli_vpn_help_renders() {
         // --help exits with a non-zero code; clap returns Err(DisplayHelp).
-        let result = Args::try_parse_from(["bore", "vpn", "--help"]);
+        let result = try_parse_args(["bore", "vpn", "--help"]);
         assert!(result.is_err(), "vpn --help should exit (clap Err)");
     }
 
@@ -5268,7 +5303,7 @@ mod tests {
     ))]
     #[test]
     fn cli_vpn_requires_secret() {
-        let result = Args::try_parse_from([
+        let result = try_parse_args([
             "bore",
             "vpn",
             "listen",
@@ -5292,7 +5327,7 @@ mod tests {
     #[test]
     fn cli_vpn_static_requires_peer_addr() {
         // --vpn-peer-addr requires --vpn-addr (clap `requires` constraint).
-        let result = Args::try_parse_from([
+        let result = try_parse_args([
             "bore",
             "vpn",
             "connect",
@@ -5322,7 +5357,7 @@ mod tests {
     ))]
     #[test]
     fn cli_vpn_parses_advertise_list() {
-        let args = Args::parse_from([
+        let args = parse_args([
             "bore",
             "vpn",
             "listen",
@@ -5358,7 +5393,7 @@ mod tests {
         ] {
             std::env::remove_var(var);
         }
-        let args = Args::parse_from(["bore", "server"]);
+        let args = parse_args(["bore", "server"]);
         let Command::Server {
             web_transfer_base_url,
             web_transfer_stun,
@@ -5381,7 +5416,7 @@ mod tests {
     #[test]
     fn web_transfer_no_stun_conflicts_with_stun_at_parse_time() {
         let _guard = ENV_GUARD.lock().unwrap();
-        let result = Args::try_parse_from([
+        let result = try_parse_args([
             "bore",
             "server",
             "--web-transfer-no-stun",
@@ -5405,7 +5440,7 @@ mod tests {
         }
 
         // No flags: every value at its default, feature off.
-        let args = Args::parse_from(["bore", "server"]);
+        let args = parse_args(["bore", "server"]);
         let Command::Server {
             fast_link_transfer,
             fast_link_transfer_vhost,
@@ -5431,7 +5466,7 @@ mod tests {
 
         // All 5 flags: parsed values, and `BORE_FAST_LINK_TRANSFER_AUTH` must
         // never leak into a `--help`/error message (`hide_env_values = true`).
-        let args = Args::parse_from([
+        let args = parse_args([
             "bore",
             "server",
             "--fast-link-transfer",
@@ -5467,7 +5502,7 @@ mod tests {
         // `hide_env_values = true`: with the credential set via env, `--help`
         // must never echo it.
         std::env::set_var("BORE_FAST_LINK_TRANSFER_AUTH", "u:supersecretpassword");
-        let err = Args::try_parse_from(["bore", "server", "--help"]).unwrap_err();
+        let err = try_parse_args(["bore", "server", "--help"]).unwrap_err();
         assert!(!err.to_string().contains("supersecretpassword"));
         std::env::remove_var("BORE_FAST_LINK_TRANSFER_AUTH");
     }

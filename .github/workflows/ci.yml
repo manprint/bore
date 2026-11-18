@@ -749,9 +749,12 @@ jobs:
       # actionlint is not found` and exit code 76 (measured, run 34771148278).
       # The version is PINNED and the Go checksum database verifies the module,
       # so this step cannot silently start linting with different rules.
+      # setup-go v6+ exports GOTOOLCHAIN=local (no automatic toolchain
+      # download), and actionlint v1.7.12 requires go >= 1.25.0: the Go
+      # version here must satisfy the pinned module's `go` directive.
       - uses: actions/setup-go@v7
         with:
-          go-version: "1.24"
+          go-version: "1.25"
       - run: |
           go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
           echo "$(go env GOPATH)/bin" >>"$GITHUB_PATH"

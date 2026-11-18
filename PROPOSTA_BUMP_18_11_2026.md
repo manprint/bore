@@ -339,3 +339,4 @@ Commit `344d4d9`.
 - `bore-cli` 1.4.0-rc.1 → **1.4.0-rc.2** (`Cargo.toml`, `Cargo.lock`). Nessun tag: il workflow `release` parte solo su tag `v*`.
 - Nuovo invariante **W-2** (chunk size di zip.js) in `CLAUDE.md` e `docs/INVARIANTS.md`.
 - Push su `dev`; esito CI sotto.
+- CI su `4ffc146`: Docker, Docker SSH client, E2E (netns) verdi. `Workflow lint (actionlint)` rosso: `setup-go@v7` esporta `GOTOOLCHAIN=local` e actionlint v1.7.12 richiede go ≥ 1.25.0 → `go-version: "1.25"`. Job macOS cancellati da GitHub ("not acquired by Runner ... capacity constraints"): infrastruttura, rilanciati.

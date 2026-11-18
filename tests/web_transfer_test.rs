@@ -653,13 +653,15 @@ where
     Ok(head)
 }
 
+/// The key must decode to 16 bytes (RFC 6455 §4.1): tungstenite 0.30 rejects
+/// any other length server-side by closing without a response.
 fn ws_upgrade_request(host: &str, path: &str, origin: &str, protocol: Option<&str>) -> String {
     let proto = protocol
         .map(|p| format!("Sec-WebSocket-Protocol: {p}\r\n"))
         .unwrap_or_default();
     format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-         Sec-WebSocket-Key: dGVzdC1ib3JlLXdz\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGVzdC1ib3JlLXdzLWtleQ==\r\nSec-WebSocket-Version: 13\r\n\
          Origin: {origin}\r\n{proto}\r\n"
     )
 }

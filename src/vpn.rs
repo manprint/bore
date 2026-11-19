@@ -106,6 +106,13 @@ pub struct VpnListenArgs {
     /// daemon `-P FORWARD DROP`, ufw, …). Off ⇒ bore only DETECTS a default-deny
     /// FORWARD and warns with the manual remediation. See [`VpnListenArgs`] docs.
     pub forward_accept: bool,
+    /// Install only the connector-advertised routes these CIDRs cover
+    /// (exact-or-subset). Empty = every advertised route (historical default).
+    pub accept_routes: Vec<crate::shared::Ipv4Net>,
+    /// Subtract these routes from the installed set.
+    pub refuse_routes: Vec<crate::shared::Ipv4Net>,
+    /// Install no connector-advertised route at all.
+    pub refuse_all_routes: bool,
 }
 
 /// Public arg struct for `bore vpn connect` (converted from CLI args).
@@ -193,7 +200,8 @@ fn is_fatal(err: &anyhow::Error) -> bool {
 
 /// Classify a server-sent `VpnError` message.
 ///
-/// Two `VpnError`s are deliberately retryable; the rest are fatal config errors.
+/// Reconnect races and capacity limits are retryable; the rest are fatal
+/// config errors.
 ///
 /// - "vpn id already in use": during a reconnect the server-side handler of the
 ///   previous session can take a few seconds to die and release the id.
@@ -203,23 +211,75 @@ fn is_fatal(err: &anyhow::Error) -> bool {
 ///   backoff lets the listener catch up. (Without `--auto-reconnect` the
 ///   connector still exits on first error, so a genuinely-missing listener is
 ///   not retried.)
+/// - Capacity (F-CAP): hub at `--max-clients`, hub subnet full, pool exhausted,
+///   `--vpn-max-links`, server connection limit. A slot frees the moment another
+///   link leaves — and the link that leaves is often this client's OWN previous
+///   session, not yet reaped when it reconnects. Giving up there turned a
+///   routine reconnect into a permanent outage.
 ///
-/// Every other `VpnError` (pool exhausted, overlap, mode mismatch, static
-/// mismatch, no vpn pool, max-links) reflects configuration and would fail
+/// Every other `VpnError` (overlap, mode mismatch, static mismatch, no vpn
+/// pool, hub-mode constraints) reflects configuration and would fail
 /// identically forever.
 fn vpn_error_is_retryable(msg: &str) -> bool {
-    msg.contains("already in use") || msg.contains("not found")
+    const RETRYABLE: [&str; 7] = [
+        "already in use",
+        "not found",
+        "at capacity",
+        "subnet full",
+        "pool exhausted",
+        "vpn-max-links reached",
+        "connection limit reached",
+    ];
+    RETRYABLE.iter().any(|needle| msg.contains(needle))
 }
 
 /// Build the error for a server-sent `VpnError`, fatal or retryable per
 /// [`vpn_error_is_retryable`].
 fn classify_vpn_error(msg: String) -> anyhow::Error {
     if vpn_error_is_retryable(&msg) {
-        tracing::warn!(error = %msg, "retryable vpn error (stale server-side session?)");
+        tracing::warn!(error = %msg, "retryable vpn error (stale server-side session or server at capacity)");
         anyhow!("{msg}")
     } else {
         anyhow::Error::new(FatalVpnError(msg))
     }
+}
+
+/// The bore server's IPv4 address as seen by the control connection, if any
+/// (IPv4-mapped IPv6 included). `None` on an IPv6 control connection: an IPv4
+/// peer route cannot capture it.
+fn control_peer_v4(addr: std::io::Result<std::net::SocketAddr>) -> Option<std::net::Ipv4Addr> {
+    match addr.ok()?.ip() {
+        std::net::IpAddr::V4(v4) => Some(v4),
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+    }
+}
+
+/// Peer routes this host may install (F-T): never one that covers the bore
+/// server (it would steer the control connection into the tunnel), and on
+/// Linux never one whose exact prefix the host already routes elsewhere
+/// (`ip route replace` would destroy the host's own route for good).
+async fn vet_peer_routes(
+    link_id: &str,
+    tun_name: &str,
+    routes: Vec<crate::shared::Ipv4Net>,
+    server: Option<std::net::Ipv4Addr>,
+) -> Vec<crate::shared::Ipv4Net> {
+    let protected: Vec<std::net::Ipv4Addr> = server.into_iter().collect();
+    let (routes, refused) = routes::guard_protected(&routes, &protected);
+    for (net, ip) in refused {
+        tracing::warn!(
+            %link_id,
+            route = %net,
+            server = %ip,
+            "peer route {net} NOT installed: it covers the bore server {ip}; routing it into the tunnel would cut the control connection"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    let routes =
+        hostcfg::drop_conflicting_routes(&hostcfg::RealRunner, link_id, tun_name, routes).await;
+    #[cfg(not(target_os = "linux"))]
+    let _ = tun_name;
+    routes
 }
 
 /// Compose a short route-policy summary for display (e.g. "accept-all", "refuse-all", "accept:2 refuse:1").
@@ -305,6 +365,43 @@ mod routes {
         result
     }
 
+    /// Listener-side route policy (F-T). Unlike the connector (default deny),
+    /// the 1:1 listener keeps its historical default: with no flag every route
+    /// the connector advertises is installed. `--accept-routes` narrows that to
+    /// the covered entries, `--refuse-routes` subtracts, `--refuse-all-routes`
+    /// installs nothing.
+    pub fn filter_listener(
+        advertised: &[Ipv4Net],
+        refuse_all: bool,
+        accept: &[Ipv4Net],
+        refuse: &[Ipv4Net],
+    ) -> Vec<Ipv4Net> {
+        filter_accepted(advertised, accept.is_empty(), refuse_all, accept, refuse)
+    }
+
+    /// Split peer routes into those safe to install and those that would
+    /// capture one of the `protected` addresses (F-T).
+    ///
+    /// `protected` holds the addresses this very link depends on — the bore
+    /// server the control connection is pinned to. A route covering one of
+    /// them (a `/0`, a split-default `/1`, or simply the server's own subnet)
+    /// would steer the control connection into the tunnel it carries, and the
+    /// link would flap forever. Such routes are never installed.
+    pub fn guard_protected(
+        routes: &[Ipv4Net],
+        protected: &[std::net::Ipv4Addr],
+    ) -> (Vec<Ipv4Net>, Vec<(Ipv4Net, std::net::Ipv4Addr)>) {
+        let mut keep = Vec::with_capacity(routes.len());
+        let mut refused = Vec::new();
+        for net in routes {
+            match protected.iter().find(|ip| net.contains(**ip)) {
+                Some(ip) => refused.push((*net, *ip)),
+                None => keep.push(*net),
+            }
+        }
+        (keep, refused)
+    }
+
     use crate::shared::AdvertiseEntry;
 
     /// The local "real" subnets to drive route/NAT/LAN-iface detection (N7/I-NAT9).
@@ -333,6 +430,66 @@ mod routes {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn nets(v: &[&str]) -> Vec<Ipv4Net> {
+            v.iter().map(|s| s.parse().unwrap()).collect()
+        }
+
+        #[test]
+        fn listener_policy_defaults_to_accept_all() {
+            let adv = nets(&["192.168.4.0/24", "10.10.0.0/16"]);
+            assert_eq!(filter_listener(&adv, false, &[], &[]), adv);
+        }
+
+        #[test]
+        fn listener_policy_accept_narrows_refuse_subtracts() {
+            let adv = nets(&["192.168.4.0/24", "10.10.0.0/16", "172.20.0.0/24"]);
+            let accept = nets(&["192.168.0.0/16", "10.10.0.0/16"]);
+            let refuse = nets(&["10.0.0.0/8"]);
+            assert_eq!(
+                filter_listener(&adv, false, &accept, &refuse),
+                nets(&["192.168.4.0/24"])
+            );
+            assert_eq!(
+                filter_listener(&adv, false, &[], &refuse),
+                nets(&["192.168.4.0/24", "172.20.0.0/24"])
+            );
+            assert!(filter_listener(&adv, true, &accept, &[]).is_empty());
+        }
+
+        #[test]
+        fn guard_protected_drops_routes_covering_the_server() {
+            let server: std::net::Ipv4Addr = "203.0.113.7".parse().unwrap();
+            let routes = nets(&[
+                "0.0.0.0/0",
+                "128.0.0.0/1",
+                "0.0.0.0/1",
+                "203.0.113.0/24",
+                "203.0.113.7/32",
+                "10.10.0.0/16",
+                "203.0.114.0/24",
+            ]);
+            let (keep, refused) = guard_protected(&routes, &[server]);
+            assert_eq!(keep, nets(&["0.0.0.0/1", "10.10.0.0/16", "203.0.114.0/24"]));
+            assert_eq!(
+                refused.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+                nets(&[
+                    "0.0.0.0/0",
+                    "128.0.0.0/1",
+                    "203.0.113.0/24",
+                    "203.0.113.7/32"
+                ])
+            );
+            assert!(refused.iter().all(|(_, ip)| *ip == server));
+        }
+
+        #[test]
+        fn guard_protected_without_protected_addresses_keeps_everything() {
+            let routes = nets(&["0.0.0.0/0", "10.10.0.0/16"]);
+            let (keep, refused) = guard_protected(&routes, &[]);
+            assert_eq!(keep, routes);
+            assert!(refused.is_empty());
+        }
 
         #[test]
         fn default_no_flags_returns_empty() {
@@ -847,6 +1004,7 @@ async fn run_listen_once(args: VpnListenArgs, progress: LinkProgress) -> Result<
     // Connect to server
     let endpoint = crate::transport::Endpoint::parse(&args.to);
     let control_stream = crate::transport::connect(&endpoint, args.insecure).await?;
+    let server_v4 = control_peer_v4(control_stream.peer_addr());
 
     let (opener, mut acceptor) = crate::mux::client(control_stream);
     let live = CtrlLiveness::new(acceptor.activity());
@@ -931,6 +1089,15 @@ async fn run_listen_once(args: VpnListenArgs, progress: LinkProgress) -> Result<
 
     // Hub mode (I-MC1: early branch preserves legacy 1:1 path unchanged)
     if args.max_clients > 1 {
+        if !args.accept_routes.is_empty()
+            || !args.refuse_routes.is_empty()
+            || args.refuse_all_routes
+        {
+            tracing::warn!(
+                link_id = %args.id,
+                "--accept-routes/--refuse-routes/--refuse-all-routes are ignored in hub mode (--max-clients > 1): a hub installs no spoke-advertised route"
+            );
+        }
         return hub::run_listen_hub(
             args, acceptor, opener, ctrl, assigned, prefix, admin_v2, carriers, live, beats,
         )
@@ -956,7 +1123,19 @@ async fn run_listen_once(args: VpnListenArgs, progress: LinkProgress) -> Result<
     // nat_maps drives the optional 1:1 netmap (empty = today's path, N8/I-NAT1).
     let advertised_nets = routes::advertised_reals(&args.advertise_entries);
     let nat_maps = routes::nat_maps(&args.advertise_entries);
-    let peer_routes = peer_advertised.to_vec();
+    let peer_routes = routes::filter_listener(
+        &peer_advertised,
+        args.refuse_all_routes,
+        &args.accept_routes,
+        &args.refuse_routes,
+    );
+    let peer_routes = vet_peer_routes(&args.id, &tun_name, peer_routes, server_v4).await;
+    info!(
+        link_id = %args.id,
+        advertised = ?peer_advertised,
+        installed = ?peer_routes,
+        "resolved listener route policy"
+    );
     for (real, exposed) in &nat_maps {
         info!(
             link_id = %args.id,
@@ -1033,7 +1212,7 @@ async fn run_listen_once(args: VpnListenArgs, progress: LinkProgress) -> Result<
                 carriers,
             },
             admin_v2,
-            peer_routes.clone(),
+            tunneled_with_overlay(&peer_routes, assigned, prefix),
         );
         Some(tokio::spawn(direct_upgrade_task(
             ctx,
@@ -1062,8 +1241,11 @@ async fn run_listen_once(args: VpnListenArgs, progress: LinkProgress) -> Result<
     )
     .await;
 
+    // Abort AND await: the task owns the punch socket (and, mid-attempt, QUIC
+    // carriers); the reconnect may rebind `--nat-udp-preferred-port` at once.
     if let Some(task) = direct_task {
         task.abort();
+        let _ = task.await;
     }
 
     info!(link_id = %args.id, "vpn link bridge closed");
@@ -1456,12 +1638,119 @@ const DIRECT_CARRIER_WAIT: std::time::Duration = std::time::Duration::from_secs(
 /// overlap and the two sides stay on the same 30 s grid.
 const DIRECT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How much earlier than a full [`DIRECT_RETRY_INTERVAL`] the next round starts
+/// after a re-sync (see [`wait_next_direct_round`]). The peer whose punch we
+/// saw started its round a candidate-gathering time ago; leading by a little
+/// keeps both offers inside the server's pairing window even when our own
+/// gathering is slow.
+const DIRECT_RESYNC_LEAD: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Wait for the next direct-upgrade round. Returns `false` when the control
+/// actor is gone (the link is closing).
+///
+/// The server brokers a punch only when both peers offer within its pairing
+/// window, so the two retry grids must stay aligned. They drift apart whenever
+/// the peers notice a path loss at different times, and nothing in the wire
+/// protocol re-aligns them. The one observable signal is a punch arriving while
+/// we are IDLE: the server sends it the moment the peer offers, using whatever
+/// candidates we last gave it. Those are stale (that socket is long closed) so
+/// the punch itself is useless — but it dates the peer's round exactly. We
+/// re-anchor our grid on it, so the NEXT round has both peers offering together
+/// (F-D). Every event is consumed here: nothing may linger in the channel for
+/// [`try_direct_upgrade`] to mistake for the answer to its own offer.
+async fn wait_next_direct_round(
+    ticker: &mut tokio::time::Interval,
+    event_rx: &mut tokio::sync::mpsc::Receiver<CtrlEvent>,
+) -> bool {
+    loop {
+        tokio::select! {
+            biased;
+            _ = ticker.tick() => return true,
+            ev = event_rx.recv() => match ev {
+                None => return false,
+                Some(CtrlEvent::Punch { .. }) => {
+                    let next = tokio::time::Instant::now() + DIRECT_RETRY_INTERVAL
+                        - DIRECT_RESYNC_LEAD;
+                    ticker.reset_at(next);
+                    tracing::debug!("punch arrived between direct rounds: peer is offering now; re-aligned the retry grid");
+                }
+                Some(CtrlEvent::Unavailable) => {}
+            },
+        }
+    }
+}
+
+/// Discard control events queued before our offer goes out. Whatever is there
+/// answers an EARLIER offer (the server cannot answer one it has not received);
+/// taking it as this round's punch would pair our fresh socket with the peer's
+/// previous-round candidates, on every round from then on (F-D). Returns the
+/// number of discarded events.
+fn drain_stale_ctrl_events(event_rx: &mut tokio::sync::mpsc::Receiver<CtrlEvent>) -> usize {
+    let mut n = 0;
+    while event_rx.try_recv().is_ok() {
+        n += 1;
+    }
+    n
+}
+
 /// Decide whether the direct-upgrade loop should run another round. It stops
 /// once direct is achieved (`succeeded`) or the bridge's upgrade channel is gone
 /// (`upgrade_closed` — the link is tearing down); otherwise it keeps retrying
 /// while on relay when `retry_enabled`.
 fn should_retry_direct(succeeded: bool, retry_enabled: bool, upgrade_closed: bool) -> bool {
     retry_enabled && !succeeded && !upgrade_closed
+}
+
+/// Tell an admin-v2 server which path the link's data is on. A no-op against
+/// an older server, which would not decode the message.
+async fn report_vpn_path(
+    out_tx: &tokio::sync::mpsc::Sender<crate::shared::ClientMessage>,
+    admin_v2: bool,
+    path: &str,
+) {
+    if admin_v2 {
+        let _ = out_tx
+            .send(crate::shared::ClientMessage::VpnPathReport { path: path.into() })
+            .await;
+    }
+}
+
+/// Park the direct-upgrade task while the bridge runs on the direct path.
+///
+/// Returns `true` when the bridge fell back to the relay (re-arm the retry
+/// loop) and `false` when the link is closing. `on_direct` is set for exactly
+/// the parked span. On a fallback the server is told the link is back on the
+/// relay (F-B6): the upgrade reported `direct`, and without this the admin
+/// page showed `direct` for the rest of the link's life.
+///
+/// Control events are consumed throughout: this task is the channel's only
+/// reader, and a full channel would block the control actor (heartbeats
+/// included).
+async fn park_on_direct(
+    downgrade_rx: &mut tokio::sync::mpsc::Receiver<()>,
+    event_rx: &mut tokio::sync::mpsc::Receiver<CtrlEvent>,
+    on_direct: &std::sync::atomic::AtomicBool,
+    out_tx: &tokio::sync::mpsc::Sender<crate::shared::ClientMessage>,
+    admin_v2: bool,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    on_direct.store(true, Ordering::SeqCst);
+    let fell_back = loop {
+        tokio::select! {
+            biased;
+            fell_back = downgrade_rx.recv() => break fell_back.is_some(),
+            ev = event_rx.recv() => {
+                if ev.is_none() {
+                    break false;
+                }
+            }
+        }
+    };
+    on_direct.store(false, Ordering::SeqCst);
+    if fell_back {
+        report_vpn_path(out_tx, admin_v2, "relay").await;
+    }
+    fell_back
 }
 
 /// Background task that attempts the relay → direct upgrade and, while the link
@@ -1486,12 +1775,14 @@ async fn direct_upgrade_task(
     // (revision 1d(a)): set while the bridge runs on the direct path.
     on_direct: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    use std::sync::atomic::Ordering;
     let mut ticker = tokio::time::interval(DIRECT_RETRY_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut attempt: u32 = 0;
     'retry: loop {
-        ticker.tick().await; // immediate on the first iteration
+        // Immediate on the first iteration.
+        if !wait_next_direct_round(&mut ticker, &mut event_rx).await {
+            return; // control actor gone → link closing
+        }
         attempt += 1;
         match try_direct_upgrade(
             &ctx,
@@ -1505,16 +1796,19 @@ async fn direct_upgrade_task(
         {
             Ok(()) => {
                 // Direct is up. Block until the bridge tells us it fell back, then re-arm.
-                on_direct.store(true, Ordering::SeqCst);
-                let fell_back = downgrade_rx.recv().await;
-                on_direct.store(false, Ordering::SeqCst);
-                match fell_back {
-                    Some(()) => {
-                        info!(link_id=%ctx.link_id, "direct path lost; re-arming relay→direct retry");
-                        continue 'retry;
-                    }
-                    None => return, // bridge gone → link closing
+                let fell_back = park_on_direct(
+                    &mut downgrade_rx,
+                    &mut event_rx,
+                    &on_direct,
+                    &out_tx,
+                    ctx.admin_v2,
+                )
+                .await;
+                if !fell_back {
+                    return; // bridge or control actor gone → link closing
                 }
+                info!(link_id=%ctx.link_id, path = "relay", "direct path lost; re-arming relay→direct retry");
+                continue 'retry;
             }
             Err(e) => {
                 let will_retry = should_retry_direct(false, true, upgrade_tx.is_closed());
@@ -1553,6 +1847,26 @@ async fn direct_upgrade_task(
 /// subnet is *also* reachable off-tunnel via a more-specific connected route,
 /// it is still dropped and the link stays on relay. Relay is correct (just not
 /// optimal); a looped "direct" path that silently dies is not.
+/// The subnets whose addresses route into the TUN: the installed peer routes
+/// plus the overlay itself.
+///
+/// A peer whose route to the internet goes through another tunnel (or through
+/// this one) can offer its OVERLAY address as a host candidate. Dialling it
+/// runs the "direct" path inside the VPN it is meant to replace — the same
+/// loop as a candidate inside a tunneled subnet.
+fn tunneled_with_overlay(
+    peer_routes: &[crate::shared::Ipv4Net],
+    assigned: std::net::Ipv4Addr,
+    prefix: u8,
+) -> Vec<crate::shared::Ipv4Net> {
+    let mut tunneled = peer_routes.to_vec();
+    tunneled.push(crate::shared::Ipv4Net {
+        addr: assigned,
+        prefix,
+    });
+    tunneled
+}
+
 fn filter_tunneled_candidates(
     peers: &[std::net::SocketAddr],
     tunneled: &[crate::shared::Ipv4Net],
@@ -1617,6 +1931,10 @@ async fn try_direct_upgrade(
     //    can compute the adaptive plan and the peers can run authenticated
     //    connectivity checks (Fase 3 VPN adoption). `generation` counts the
     //    retry-grid rounds; the broker normalizes it across both riders.
+    let stale = drain_stale_ctrl_events(event_rx);
+    if stale > 0 {
+        tracing::debug!(link_id = %ctx.link_id, stale, "discarded control events from an earlier direct round");
+    }
     out_tx
         .send(crate::shared::ClientMessage::UdpCandidateOffer(
             disc.to_offer(0, generation),
@@ -1931,12 +2249,19 @@ fn pmtu_link_set_mtu_argv(tun_name: &str, mtu: u16) -> Vec<String> {
     hostcfg_cmd::windows::cmd_link_set_mtu(tun_name, mtu)
 }
 
+/// The MTU to put back on the TUN when the direct path closes: the configured
+/// one, if the monitor moved away from it. `None` when pinned (the monitor
+/// never resized) or already there.
+fn pmtu_restore_target(current: u16, initial: u16, pin: bool) -> Option<u16> {
+    (!pin && current != initial).then_some(initial)
+}
+
 /// Background task: track the direct path's QUIC datagram limit and follow it
 /// with the per-OS "set TUN MTU" command (C2; see `pmtu_link_set_mtu_argv`).
 /// Started only after the switch to direct; exits when the QUIC connection
-/// closes (link teardown or path death). No MTU
-/// revert is needed: the TUN is destroyed at teardown (DEC-5), and the nft MSS
-/// clamp uses `rt mtu`, adapting on its own.
+/// closes (link teardown or path death), restoring the configured MTU on the
+/// way out: after a fallback the SAME TUN keeps serving the relay path, which
+/// has no such limit. The nft MSS clamp uses `rt mtu`, adapting on its own.
 async fn pmtu_monitor(
     conn: crate::holepunch::DirectConn,
     tun_name: String,
@@ -1972,7 +2297,19 @@ async fn pmtu_monitor(
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
-            _ = conn.closed() => return,
+            _ = conn.closed() => {
+                // Back on relay (or tearing down): the relay carries the
+                // configured MTU, so undo whatever this path made us shrink to.
+                // Best-effort — at teardown the TUN is already gone.
+                if let Some(mtu) = pmtu_restore_target(current, initial_mtu, pin) {
+                    let argv = pmtu_link_set_mtu_argv(&tun_name, mtu);
+                    match crate::vpn::hostcfg::CommandRunner::run(&runner, &argv).await {
+                        Ok(_) => info!(old = current, new = mtu, "direct path closed; tun MTU restored"),
+                        Err(e) => tracing::debug!(error = %e, mtu, "tun MTU restore skipped; link closing"),
+                    }
+                }
+                return;
+            }
         }
         ticks_since_grow = ticks_since_grow.saturating_add(1);
         // The QUIC datagram limit minus AEAD-free overhead IS the usable IP
@@ -2297,6 +2634,7 @@ async fn run_connect_once(args: VpnConnectArgs, progress: LinkProgress) -> Resul
     // Connect to server
     let endpoint = crate::transport::Endpoint::parse(&args.to);
     let control_stream = crate::transport::connect(&endpoint, args.insecure).await?;
+    let server_v4 = control_peer_v4(control_stream.peer_addr());
 
     let (opener, _acceptor) = crate::mux::client(control_stream);
     let live = CtrlLiveness::new(opener.activity());
@@ -2414,6 +2752,7 @@ async fn run_connect_once(args: VpnConnectArgs, progress: LinkProgress) -> Resul
         &args.accept_routes,
         &args.refuse_routes,
     );
+    let peer_routes = vet_peer_routes(&args.id, &tun_name, peer_routes, server_v4).await;
     info!(
         link_id = %args.id,
         advertised = ?peer_advertised,
@@ -2504,7 +2843,7 @@ async fn run_connect_once(args: VpnConnectArgs, progress: LinkProgress) -> Resul
                 carriers,
             },
             admin_v2,
-            peer_routes.clone(),
+            tunneled_with_overlay(&peer_routes, assigned, prefix),
         );
         Some(tokio::spawn(direct_upgrade_task(
             ctx,
@@ -2533,8 +2872,11 @@ async fn run_connect_once(args: VpnConnectArgs, progress: LinkProgress) -> Resul
     )
     .await;
 
+    // Abort AND await: the task owns the punch socket (and, mid-attempt, QUIC
+    // carriers); the reconnect may rebind `--nat-udp-preferred-port` at once.
     if let Some(task) = direct_task {
         task.abort();
+        let _ = task.await;
     }
 
     info!(link_id = %args.id, "vpn link bridge closed");
@@ -3192,6 +3534,19 @@ pub mod hostcfg_cmd {
         ]
     }
 
+    /// Build `ip -4 route show exact <subnet>` argv: the main-table routes whose
+    /// prefix is EXACTLY `subnet` — the ones `ip route replace` would overwrite.
+    pub fn cmd_route_show_exact(subnet: &str) -> Vec<String> {
+        vec![
+            "ip".into(),
+            "-4".into(),
+            "route".into(),
+            "show".into(),
+            "exact".into(),
+            subnet.into(),
+        ]
+    }
+
     /// Build the `sh -c "echo <v> | sudo -n tee /proc/sys/net/ipv4/ip_forward"` argv.
     ///
     /// Fallback used when the process holds CAP_NET_ADMIN but not UID 0: writing
@@ -3583,35 +3938,49 @@ pub mod hostcfg_cmd {
         ]
     }
 
-    /// Build iptables spoke-isolation drop rule for hub mode: `-A FORWARD -i <tun> -o <tun> -j DROP`.
-    pub fn cmd_iptables_spoke_isolation_add(id: &str, tun: &str) -> Vec<String> {
+    /// Build the hub spoke-isolation filter chain name: `bore_<id>_iso`.
+    ///
+    /// A per-link chain (like `bore_<id>_fwd`) so teardown and SIGKILL reclaim
+    /// need only the id: a comment-matched `-D FORWARD` with a partial spec never
+    /// matches the rule it is meant to delete.
+    pub fn ipt_iso_chain(id: &str) -> String {
+        format!("bore_{id}_iso")
+    }
+
+    /// Build `iptables -A <chain> -i <tun> -o <tun> -j DROP` argv.
+    pub fn cmd_iptables_iso_drop(chain: &str, tun: &str) -> Vec<String> {
         vec![
             "iptables".into(),
             "-A".into(),
-            "FORWARD".into(),
+            chain.into(),
             "-i".into(),
             tun.into(),
             "-o".into(),
             tun.into(),
             "-j".into(),
             "DROP".into(),
-            "-m".into(),
-            "comment".into(),
-            "--comment".into(),
-            format!("bore_vpn_{id}_spoke_iso"),
         ]
     }
 
-    /// Build iptables spoke-isolation drop rule deletion.
-    pub fn cmd_iptables_spoke_isolation_del(id: &str, _tun: &str) -> Vec<String> {
+    /// Ordered iptables commands installing hub spoke isolation: create the
+    /// chain, add the drop, then jump from the TOP of FORWARD (an appended rule
+    /// would sit behind any earlier ACCEPT).
+    pub fn spoke_isolation_iptables_cmds(id: &str, tun: &str) -> Vec<Vec<String>> {
+        let iso = ipt_iso_chain(id);
         vec![
-            "iptables".into(),
-            "-D".into(),
-            "FORWARD".into(),
-            "-m".into(),
-            "comment".into(),
-            "--comment".into(),
-            format!("bore_vpn_{id}_spoke_iso"),
+            cmd_iptables_filter_new_chain(&iso),
+            cmd_iptables_iso_drop(&iso, tun),
+            cmd_iptables_forward_jump(&iso),
+        ]
+    }
+
+    /// Ordered nft commands installing hub spoke isolation on a hub that is not
+    /// a gateway (no NAT chain, no MSS clamp: nothing is forwarded to a LAN).
+    pub fn spoke_isolation_nft_cmds(id: &str, tun: &str) -> Vec<Vec<String>> {
+        vec![
+            cmd_nft_add_table(id),
+            cmd_nft_add_forward_chain(id),
+            cmd_nft_add_spoke_isolation(id, tun),
         ]
     }
 
@@ -5132,6 +5501,9 @@ pub mod hostcfg {
     #[cfg(target_os = "linux")]
     use std::collections::HashSet;
     use std::net::Ipv4Addr;
+    // Bare `Command` is the Linux `stale_reclaim`'s; `RealRunner` runs through
+    // tokio (`run_host_cmd`).
+    #[cfg(target_os = "linux")]
     use std::process::Command;
 
     /// Resolve a requested TUN name. "auto" → first free `boreN` (N=0..=255) per `exists`.
@@ -5158,7 +5530,42 @@ pub mod hostcfg {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>>;
     }
 
-    /// Real runner: calls std::process::Command (blocking, suitable for root operations).
+    /// Upper bound on one host command (`ip`, `nft`, `iptables`, `pfctl`, …).
+    ///
+    /// They return in milliseconds; the bound is for the one that never does
+    /// (an xtables lock held by another process, a wedged netlink socket).
+    const HOST_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Run `argv` to completion, off the runtime's worker threads, within
+    /// `timeout`. A command still running at the deadline is killed.
+    pub(crate) async fn run_host_cmd(
+        argv: &[String],
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<String> {
+        anyhow::ensure!(!argv.is_empty(), "empty argv");
+        let child = tokio::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        let out = tokio::time::timeout(timeout, child)
+            .await
+            .map_err(|_| anyhow!("command {:?} did not finish within {:?}", argv, timeout))?
+            .with_context(|| format!("failed to run {:?}", argv))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            bail!(
+                "command {:?} failed ({}): {}",
+                argv,
+                out.status,
+                stderr.trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// Real runner: spawns the command and waits for it without blocking a
+    /// runtime worker, bounded by [`HOST_CMD_TIMEOUT`].
     pub struct RealRunner;
 
     impl CommandRunner for RealRunner {
@@ -5167,23 +5574,7 @@ pub mod hostcfg {
             argv: &'a [String],
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>>
         {
-            Box::pin(async move {
-                anyhow::ensure!(!argv.is_empty(), "empty argv");
-                let out = Command::new(&argv[0])
-                    .args(&argv[1..])
-                    .output()
-                    .with_context(|| format!("failed to run {:?}", argv))?;
-                if !out.status.success() {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    bail!(
-                        "command {:?} failed ({}): {}",
-                        argv,
-                        out.status,
-                        stderr.trim()
-                    );
-                }
-                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-            })
+            Box::pin(run_host_cmd(argv, HOST_CMD_TIMEOUT))
         }
     }
 
@@ -5232,6 +5623,76 @@ pub mod hostcfg {
                 Ok(String::new())
             })
         }
+    }
+
+    /// The route that already owns a prefix, when it is not ours (F-T).
+    ///
+    /// `show_exact` is the output of `ip -4 route show exact <subnet>`. A line
+    /// naming `dev <tun_name>` is a leftover of this very link and is safe to
+    /// replace; anything else (a connected LAN, a static route, a `blackhole`)
+    /// belongs to the host and must survive this link.
+    #[cfg(target_os = "linux")]
+    pub fn foreign_route_owner(show_exact: &str, tun_name: &str) -> Option<String> {
+        show_exact
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .find(|line| {
+                let mut tokens = line.split_whitespace();
+                let dev = loop {
+                    match tokens.next() {
+                        Some("dev") => break tokens.next(),
+                        Some(_) => {}
+                        None => break None,
+                    }
+                };
+                dev != Some(tun_name)
+            })
+            .map(str::to_string)
+    }
+
+    /// Drop the peer routes this host already routes elsewhere (F-T).
+    ///
+    /// Routes are installed with `ip route replace` (idempotent against our own
+    /// leftovers). On a prefix the host already owns, `replace` silently
+    /// OVERWRITES that route and the later `ip route del` revert does not bring
+    /// it back: the host loses its LAN until someone restores it by hand. So a
+    /// conflicting prefix is skipped, loudly. The probe is read-only; when it
+    /// cannot run the route is kept (the install then fails or succeeds on its
+    /// own, exactly as before).
+    #[cfg(target_os = "linux")]
+    pub async fn drop_conflicting_routes<R: CommandRunner>(
+        runner: &R,
+        id: &str,
+        tun_name: &str,
+        routes: Vec<crate::shared::Ipv4Net>,
+    ) -> Vec<crate::shared::Ipv4Net> {
+        let mut keep = Vec::with_capacity(routes.len());
+        for net in routes {
+            let subnet = net.to_string();
+            let owner = match runner
+                .run(&super::hostcfg_cmd::cmd_route_show_exact(&subnet))
+                .await
+            {
+                Ok(out) => foreign_route_owner(&out, tun_name),
+                Err(err) => {
+                    tracing::debug!(%id, %subnet, %err, "route conflict probe failed; keeping route");
+                    None
+                }
+            };
+            match owner {
+                Some(owner) => tracing::warn!(
+                    %id,
+                    %subnet,
+                    existing = %owner,
+                    "peer route {subnet} NOT installed: this host already routes that exact prefix ({owner}). \
+                     Installing it would replace the host's own route. Have the advertising side remap it \
+                     with a 1:1 NAT entry (--advertise {subnet}@<free-virtual-cidr>)"
+                ),
+                None => keep.push(net),
+            }
+        }
+        keep
     }
 
     /// Check that we have privileges to manage the VPN device and host routes.
@@ -5352,7 +5813,11 @@ pub mod hostcfg {
         // Includes the --forward-accept filter chain (bore_<id>_fwd): torn down by
         // id alone, no lan_if/tun needed (the whole point of the custom-chain form).
         let fwd = ipt_fwd_chain(id);
+        let iso = ipt_iso_chain(id);
         let teardown_cmds = vec![
+            cmd_iptables_forward_jump_del(&iso),
+            cmd_iptables_filter_flush_chain(&iso),
+            cmd_iptables_filter_del_chain(&iso),
             cmd_iptables_nat_jump_del("POSTROUTING", &post),
             cmd_iptables_nat_jump_del("PREROUTING", &pre),
             cmd_iptables_nat_flush_chain(&post),
@@ -6521,8 +6986,6 @@ pub mod hostcfg {
             nat_masquerade: bool,
             forward_accept: bool,
         ) -> anyhow::Result<Self> {
-            use super::hostcfg_cmd::*;
-
             let mut cfg = NetConfig {
                 id: id.to_string(),
                 role: role.to_string(),
@@ -6534,7 +6997,88 @@ pub mod hostcfg {
                 ip_forward_saved: None,
                 applied_ops: Vec::new(),
             };
+            // A failed step drops `cfg` here, and its `Drop` reverts whatever
+            // was registered up to that step (F-RV).
+            cfg.apply_into(
+                runner,
+                peer_routes,
+                advertised,
+                nat_maps,
+                hub,
+                nat_masquerade,
+                forward_accept,
+            )
+            .await?;
+            Ok(cfg)
+        }
 
+        /// Register one teardown step. Steps run in REVERSE order on `Drop`.
+        #[cfg(target_os = "linux")]
+        fn push_revert(&mut self, argv: Vec<String>, label: String) {
+            self.revert_cmds.push(argv);
+            self.revert_labels.push(label);
+        }
+
+        /// Hub spoke isolation on the iptables backend: a per-link filter chain
+        /// jumped to from the top of FORWARD.
+        #[cfg(target_os = "linux")]
+        async fn install_iptables_spoke_isolation<R: CommandRunner>(
+            &mut self,
+            runner: &R,
+        ) -> anyhow::Result<()> {
+            use super::hostcfg_cmd::*;
+            let iso = ipt_iso_chain(&self.id);
+            runner
+                .run(&cmd_iptables_filter_new_chain(&iso))
+                .await
+                .context("iptables new spoke-isolation chain")?;
+            self.push_revert(
+                cmd_iptables_filter_del_chain(&iso),
+                format!("delete iptables filter chain {iso}"),
+            );
+            self.push_revert(
+                cmd_iptables_filter_flush_chain(&iso),
+                format!("flush iptables filter chain {iso}"),
+            );
+            runner
+                .run(&cmd_iptables_iso_drop(&iso, &self.tun_name))
+                .await
+                .context("iptables add spoke isolation")?;
+            runner
+                .run(&cmd_iptables_forward_jump(&iso))
+                .await
+                .context("iptables spoke-isolation jump")?;
+            self.push_revert(
+                cmd_iptables_forward_jump_del(&iso),
+                format!("delete FORWARD jump -> {iso}"),
+            );
+            tracing::info!(id = %self.id, tun_name = %self.tun_name, "added iptables spoke-isolation rule");
+            Ok(())
+        }
+
+        /// The body of [`NetConfig::apply`], working on a `cfg` the caller owns.
+        ///
+        /// Every teardown step is registered the moment the thing it undoes
+        /// exists (F-RV), never after the whole sequence: a step failing halfway
+        /// must not leave an nft table or an iptables chain behind.
+        #[allow(clippy::too_many_arguments)]
+        #[cfg(target_os = "linux")]
+        async fn apply_into<R: CommandRunner>(
+            &mut self,
+            runner: &R,
+            peer_routes: &[crate::shared::Ipv4Net],
+            advertised: &[crate::shared::Ipv4Net],
+            nat_maps: &[(crate::shared::Ipv4Net, crate::shared::Ipv4Net)],
+            hub: bool,
+            nat_masquerade: bool,
+            forward_accept: bool,
+        ) -> anyhow::Result<()> {
+            use super::hostcfg_cmd::*;
+
+            let cfg = self;
+            let (id, role, tun_name) = (cfg.id.clone(), cfg.role.clone(), cfg.tun_name.clone());
+            let (id, role, tun_name) = (id.as_str(), role.as_str(), tun_name.as_str());
+            let no_route_manage = cfg.no_route_manage;
             let is_gateway = !advertised.is_empty();
 
             // ── Routes ────────────────────────────────────────────────────────────
@@ -6615,7 +7159,9 @@ pub mod hostcfg {
                 let sample_host: std::net::Ipv4Addr = {
                     let net = &advertised[0];
                     let base = u32::from(net.network());
-                    std::net::Ipv4Addr::from(base + 1)
+                    // A /31 or /32 has no "first host" above the network
+                    // address, and `base + 1` overflows on 255.255.255.255/32.
+                    std::net::Ipv4Addr::from(if net.prefix >= 31 { base } else { base + 1 })
                 };
                 let route_out = runner
                     .run(&cmd_route_get(&sample_host.to_string()))
@@ -6643,6 +7189,13 @@ pub mod hostcfg {
                         .run(&cmd_nft_add_table(id))
                         .await
                         .context("nft add table")?;
+                    // Single table delete reverts every rule below, netmap
+                    // included. Registered NOW: a later rule failing must not
+                    // leave the table (and its live NAT rules) behind (F-RV).
+                    cfg.push_revert(
+                        cmd_nft_delete_table(id),
+                        format!("delete nft table bore_vpn_{id}"),
+                    );
                     runner
                         .run(&cmd_nft_add_postrouting_chain(id))
                         .await
@@ -6721,10 +7274,6 @@ pub mod hostcfg {
                     }
 
                     tracing::info!(%id, "created nft table bore_vpn_{}", id);
-                    // Single table delete reverts every rule above, netmap included.
-                    cfg.revert_cmds.push(cmd_nft_delete_table(id));
-                    cfg.revert_labels
-                        .push(format!("delete nft table bore_vpn_{id}"));
                 } else {
                     // iptables fallback path (F3/F4 fix): custom chains instead of
                     // direct POSTROUTING/PREROUTING rules. Chain teardown via -X
@@ -6736,10 +7285,24 @@ pub mod hostcfg {
                         .run(&cmd_iptables_nat_new_chain(&post))
                         .await
                         .context("iptables nat new postrouting chain")?;
+                    // Teardown is registered step by step (F-RV); reversed it
+                    // reads del jump, flush chain, delete chain.
+                    cfg.push_revert(
+                        cmd_iptables_nat_del_chain(&post),
+                        format!("delete iptables nat chain {post}"),
+                    );
+                    cfg.push_revert(
+                        cmd_iptables_nat_flush_chain(&post),
+                        format!("flush iptables nat chain {post}"),
+                    );
                     runner
                         .run(&cmd_iptables_nat_jump("POSTROUTING", &post))
                         .await
                         .context("iptables nat jump postrouting")?;
+                    cfg.push_revert(
+                        cmd_iptables_nat_jump_del("POSTROUTING", &post),
+                        format!("delete jump postrouting -> {post}"),
+                    );
 
                     if nat_maps.is_empty() {
                         // N8/I-NAT1: byte-for-byte today's path — blanket masquerade,
@@ -6756,10 +7319,22 @@ pub mod hostcfg {
                             .run(&cmd_iptables_nat_new_chain(&pre))
                             .await
                             .context("iptables nat new prerouting chain")?;
+                        cfg.push_revert(
+                            cmd_iptables_nat_del_chain(&pre),
+                            format!("delete iptables nat chain {pre}"),
+                        );
+                        cfg.push_revert(
+                            cmd_iptables_nat_flush_chain(&pre),
+                            format!("flush iptables nat chain {pre}"),
+                        );
                         runner
                             .run(&cmd_iptables_nat_jump("PREROUTING", &pre))
                             .await
                             .context("iptables nat jump prerouting")?;
+                        cfg.push_revert(
+                            cmd_iptables_nat_jump_del("PREROUTING", &pre),
+                            format!("delete jump prerouting -> {pre}"),
+                        );
 
                         for (real, exposed) in nat_maps {
                             let (r, v) = (real.to_string(), exposed.to_string());
@@ -6806,55 +7381,17 @@ pub mod hostcfg {
                         .run(&cmd_iptables_mss_clamp_add(id))
                         .await
                         .context("iptables mss clamp add")?;
+                    cfg.push_revert(
+                        cmd_iptables_mss_clamp_del(id),
+                        format!("del iptables mss clamp bore_vpn_{id}"),
+                    );
 
                     // Hub mode: add spoke-isolation rule
                     if hub {
-                        runner
-                            .run(&cmd_iptables_spoke_isolation_add(id, tun_name))
-                            .await
-                            .context("iptables add spoke isolation")?;
-                        tracing::info!(%id, %tun_name, "added iptables spoke-isolation rule");
-                        cfg.revert_cmds
-                            .push(cmd_iptables_spoke_isolation_del(id, tun_name));
-                        cfg.revert_labels
-                            .push(format!("del iptables spoke isolation bore_vpn_{id}"));
+                        cfg.install_iptables_spoke_isolation(runner).await?;
                     }
 
                     tracing::info!(%id, "applied iptables NAT rules");
-
-                    // Build revert command stack in reverse order for correct cleanup:
-                    // (reversed sequence = del jumps, flush chains, delete chains).
-                    // MSS clamp del (unchanged behavior, pushed first so reversed = last).
-                    cfg.revert_cmds.push(cmd_iptables_mss_clamp_del(id));
-                    cfg.revert_labels
-                        .push(format!("del iptables mss clamp bore_vpn_{id}"));
-
-                    if !nat_maps.is_empty() {
-                        // Pre chain: delete jump, flush, delete chain.
-                        let pre = ipt_nat_pre_chain(id);
-                        cfg.revert_cmds.push(cmd_iptables_nat_del_chain(&pre));
-                        cfg.revert_labels
-                            .push(format!("delete iptables nat chain {}", pre));
-                        cfg.revert_cmds.push(cmd_iptables_nat_flush_chain(&pre));
-                        cfg.revert_labels
-                            .push(format!("flush iptables nat chain {}", pre));
-                        cfg.revert_cmds
-                            .push(cmd_iptables_nat_jump_del("PREROUTING", &pre));
-                        cfg.revert_labels
-                            .push(format!("delete jump prerouting -> {}", pre));
-                    }
-
-                    // Post chain: delete jump, flush, delete chain.
-                    cfg.revert_cmds.push(cmd_iptables_nat_del_chain(&post));
-                    cfg.revert_labels
-                        .push(format!("delete iptables nat chain {}", post));
-                    cfg.revert_cmds.push(cmd_iptables_nat_flush_chain(&post));
-                    cfg.revert_labels
-                        .push(format!("flush iptables nat chain {}", post));
-                    cfg.revert_cmds
-                        .push(cmd_iptables_nat_jump_del("POSTROUTING", &post));
-                    cfg.revert_labels
-                        .push(format!("delete jump postrouting -> {}", post));
                 }
 
                 // ── FORWARD default-deny gap (Docker/ufw) ─────────────────────
@@ -6868,6 +7405,15 @@ pub mod hostcfg {
                             .run(&cmd_iptables_filter_new_chain(&fwd))
                             .await
                             .context("iptables new forward-accept chain")?;
+                        // Reversed: del jump, flush chain, del chain.
+                        cfg.push_revert(
+                            cmd_iptables_filter_del_chain(&fwd),
+                            format!("delete iptables filter chain {fwd}"),
+                        );
+                        cfg.push_revert(
+                            cmd_iptables_filter_flush_chain(&fwd),
+                            format!("flush iptables filter chain {fwd}"),
+                        );
                         runner
                             .run(&cmd_iptables_fwd_accept(&fwd, tun_name, &lan_if))
                             .await
@@ -6884,17 +7430,10 @@ pub mod hostcfg {
                             %id, tun = %tun_name, lan_if = %lan_if,
                             "forward-accept: inserted FORWARD ACCEPT for tun<->LAN (--forward-accept)"
                         );
-                        // Revert reverse-order: del jump, flush chain, del chain
-                        // (pushed so `.rev()` yields exactly that order).
-                        cfg.revert_cmds.push(cmd_iptables_filter_del_chain(&fwd));
-                        cfg.revert_labels
-                            .push(format!("delete iptables filter chain {fwd}"));
-                        cfg.revert_cmds.push(cmd_iptables_filter_flush_chain(&fwd));
-                        cfg.revert_labels
-                            .push(format!("flush iptables filter chain {fwd}"));
-                        cfg.revert_cmds.push(cmd_iptables_forward_jump_del(&fwd));
-                        cfg.revert_labels
-                            .push(format!("delete FORWARD jump -> {fwd}"));
+                        cfg.push_revert(
+                            cmd_iptables_forward_jump_del(&fwd),
+                            format!("delete FORWARD jump -> {fwd}"),
+                        );
                     } else {
                         tracing::warn!(
                             %id, tun = %tun_name, lan_if = %lan_if,
@@ -6941,9 +7480,51 @@ pub mod hostcfg {
                         println!("# (skipped, --no-route-manage): {}", cmd.join(" "));
                     }
                 }
+            } else if hub {
+                // F-S: a hub that advertises nothing still has to keep its spokes
+                // apart. Spoke→spoke packets come out of the TUN and the kernel
+                // routes them straight back in whenever the host forwards IPv4 for
+                // ANY reason (Docker, another VPN, a router role) — bore never
+                // enabling ip_forward here is not a guarantee that it is off.
+                let nft = check_binary_exists("nft")
+                    && std::env::var_os("BORE_VPN_FORCE_IPTABLES").is_none();
+                if no_route_manage {
+                    for cmd in spoke_isolation_nft_cmds(id, tun_name) {
+                        println!("# (skipped, --no-route-manage): {}", cmd.join(" "));
+                    }
+                } else if nft {
+                    cfg.nft_available = true;
+                    runner
+                        .run(&cmd_nft_add_table(id))
+                        .await
+                        .context("nft add table (spoke isolation)")?;
+                    cfg.push_revert(
+                        cmd_nft_delete_table(id),
+                        format!("delete nft table bore_vpn_{id}"),
+                    );
+                    runner
+                        .run(&cmd_nft_add_forward_chain(id))
+                        .await
+                        .context("nft add forward chain (spoke isolation)")?;
+                    runner
+                        .run(&cmd_nft_add_spoke_isolation(id, tun_name))
+                        .await
+                        .context("nft add spoke isolation")?;
+                    tracing::info!(%id, %tun_name, "added nft spoke-isolation rule (host-only hub)");
+                } else if check_binary_exists("iptables") {
+                    cfg.install_iptables_spoke_isolation(runner).await?;
+                } else {
+                    tracing::warn!(
+                        %id, tun = %tun_name,
+                        "hub spoke isolation NOT installed: neither `nft` nor `iptables` found. \
+                         Spokes can reach each other through this host if it forwards IPv4 \
+                         (net.ipv4.ip_forward=1). Install nftables, or drop \
+                         {tun_name}->{tun_name} forwarding manually."
+                    );
+                }
             }
 
-            Ok(cfg)
+            Ok(())
         }
 
         /// Windows host-config runtime (§2.8): routes, IP forwarding refcount,
@@ -7487,6 +8068,93 @@ pub mod hostcfg {
     #[cfg(target_os = "linux")]
     mod tests {
         use super::*;
+
+        /// Runner answering `ip -4 route show exact <subnet>` from a canned
+        /// table; any other command fails the test (the probe is read-only).
+        struct RouteTableRunner {
+            table: Vec<(&'static str, &'static str)>,
+            fail: bool,
+        }
+
+        impl CommandRunner for RouteTableRunner {
+            fn run<'a>(
+                &'a self,
+                argv: &'a [String],
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>,
+            > {
+                Box::pin(async move {
+                    assert_eq!(&argv[..5], ["ip", "-4", "route", "show", "exact"]);
+                    anyhow::ensure!(!self.fail, "ip: command failed");
+                    Ok(self
+                        .table
+                        .iter()
+                        .find(|(net, _)| *net == argv[5])
+                        .map(|(_, out)| out.to_string())
+                        .unwrap_or_default())
+                })
+            }
+        }
+
+        #[test]
+        fn foreign_route_owner_tells_ours_from_the_hosts() {
+            // Nothing there, or a leftover of this very link: safe to replace.
+            assert_eq!(foreign_route_owner("", "bore0"), None);
+            assert_eq!(foreign_route_owner("\n  \n", "bore0"), None);
+            assert_eq!(
+                foreign_route_owner("192.168.50.0/24 dev bore0 scope link\n", "bore0"),
+                None
+            );
+            // The host's own routes must survive.
+            let connected = "192.168.50.0/24 dev eth0 proto kernel scope link src 192.168.50.10";
+            assert_eq!(
+                foreign_route_owner(connected, "bore0").as_deref(),
+                Some(connected)
+            );
+            assert!(foreign_route_owner("10.0.0.0/8 via 192.168.1.1 dev eth0", "bore0").is_some());
+            assert!(foreign_route_owner("blackhole 10.0.0.0/8", "bore0").is_some());
+            // A name that merely starts like ours is not ours.
+            assert!(foreign_route_owner("10.0.0.0/8 dev bore01 scope link", "bore0").is_some());
+            // Two routes on the prefix (different metrics): one foreign is enough.
+            let both = "10.0.0.0/8 dev bore0 scope link\n10.0.0.0/8 dev eth1 metric 100";
+            assert_eq!(
+                foreign_route_owner(both, "bore0").as_deref(),
+                Some("10.0.0.0/8 dev eth1 metric 100")
+            );
+        }
+
+        #[tokio::test]
+        async fn conflicting_peer_routes_are_never_installed() {
+            let runner = RouteTableRunner {
+                table: vec![
+                    (
+                        "192.168.50.0/24",
+                        "192.168.50.0/24 dev eth0 proto kernel scope link src 192.168.50.10\n",
+                    ),
+                    ("10.20.0.0/16", "10.20.0.0/16 dev bore0 scope link\n"),
+                ],
+                fail: false,
+            };
+            let routes: Vec<crate::shared::Ipv4Net> =
+                ["192.168.50.0/24", "10.20.0.0/16", "172.30.0.0/24"]
+                    .iter()
+                    .map(|s| s.parse().unwrap())
+                    .collect();
+            let kept = drop_conflicting_routes(&runner, "t", "bore0", routes).await;
+            let kept: Vec<String> = kept.iter().map(|n| n.to_string()).collect();
+            assert_eq!(kept, ["10.20.0.0/16", "172.30.0.0/24"]);
+        }
+
+        #[tokio::test]
+        async fn route_probe_failure_keeps_the_route() {
+            let runner = RouteTableRunner {
+                table: vec![],
+                fail: true,
+            };
+            let routes: Vec<crate::shared::Ipv4Net> = vec!["192.168.50.0/24".parse().unwrap()];
+            let kept = drop_conflicting_routes(&runner, "t", "bore0", routes.clone()).await;
+            assert_eq!(kept, routes);
+        }
 
         #[test]
         fn netconfig_rollback_is_reverse_order() {
@@ -8063,48 +8731,203 @@ pub mod hostcfg {
 
         #[test]
         fn netconfig_hub_isolation_rule_cmd() {
-            // Unit test: check that the isolation rule commands are built correctly
             use crate::vpn::hostcfg_cmd::*;
-            let tun = "bore0";
-            let id = "testhub";
-            let nft_cmd = cmd_nft_add_spoke_isolation(id, tun);
-            let iptables_cmd = cmd_iptables_spoke_isolation_add(id, tun);
-
-            // NFT command should contain "drop" and both interfaces
-            assert!(nft_cmd.contains(&"add".to_string()));
-            assert!(nft_cmd.contains(&"rule".to_string()));
-            assert!(nft_cmd.contains(&"drop".to_string()));
-            assert!(nft_cmd.contains(&tun.to_string()));
-
-            // Iptables command should contain "-A FORWARD" and "-D FORWARD" (del variant)
-            assert!(iptables_cmd.contains(&"-A".to_string()));
-            assert!(iptables_cmd.contains(&"FORWARD".to_string()));
-            assert!(iptables_cmd.contains(&tun.to_string()));
-
-            let iptables_del = cmd_iptables_spoke_isolation_del(id, tun);
-            assert!(iptables_del.contains(&"-D".to_string()));
-            assert!(iptables_del.contains(&"FORWARD".to_string()));
+            let (id, tun) = ("testhub", "bore0");
+            assert_eq!(
+                cmd_nft_add_spoke_isolation(id, tun).join(" "),
+                "nft add rule inet bore_vpn_testhub bore_fw iif bore0 oif bore0 drop"
+            );
+            // iptables: a per-link chain jumped to from the TOP of FORWARD, so
+            // the teardown names only the chain (a comment-matched `-D FORWARD`
+            // with a partial spec never matched the rule it had appended).
+            let cmds: Vec<String> = spoke_isolation_iptables_cmds(id, tun)
+                .iter()
+                .map(|c| c.join(" "))
+                .collect();
+            assert_eq!(
+                cmds,
+                [
+                    "iptables -N bore_testhub_iso",
+                    "iptables -A bore_testhub_iso -i bore0 -o bore0 -j DROP",
+                    "iptables -I FORWARD -j bore_testhub_iso",
+                ]
+            );
+            let host_only: Vec<String> = spoke_isolation_nft_cmds(id, tun)
+                .iter()
+                .map(|c| c.join(" "))
+                .collect();
+            assert_eq!(
+                host_only,
+                [
+                    "nft add table inet bore_vpn_testhub",
+                    "nft add chain inet bore_vpn_testhub bore_fw { type filter hook forward priority -10 ; }",
+                    "nft add rule inet bore_vpn_testhub bore_fw iif bore0 oif bore0 drop",
+                ]
+            );
         }
 
-        #[test]
-        fn netconfig_non_hub_no_isolation_rule() {
-            // Verify that the isolation rule commands are only added in hub mode
-            // by checking the conditional code path
+        // A host command that never returns is killed at the deadline instead
+        // of freezing the link setup (and a runtime worker) with it.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn host_commands_are_bounded_and_report_their_output() {
+            let argv = |script: &str| vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+            let long = std::time::Duration::from_secs(30);
+
+            assert_eq!(
+                super::run_host_cmd(&argv("echo hi"), long).await.unwrap(),
+                "hi\n"
+            );
+
+            let err = super::run_host_cmd(&argv("echo nope >&2; exit 3"), long)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("nope"), "{err}");
+
+            let started = std::time::Instant::now();
+            let err = super::run_host_cmd(&argv("sleep 30"), std::time::Duration::from_millis(200))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("did not finish"), "{err}");
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+            assert!(super::run_host_cmd(&[], long).await.is_err());
+        }
+
+        /// A `NetConfig` that has run nothing yet (what `apply` starts from).
+        #[cfg(target_os = "linux")]
+        fn blank_cfg(id: &str, no_route_manage: bool) -> NetConfig {
+            NetConfig {
+                id: id.to_string(),
+                role: "listen".to_string(),
+                tun_name: "bore0".to_string(),
+                no_route_manage,
+                nft_available: false,
+                revert_cmds: Vec::new(),
+                revert_labels: Vec::new(),
+                ip_forward_saved: None,
+                applied_ops: Vec::new(),
+            }
+        }
+
+        /// Records every command and fails the first one `fail` matches.
+        #[cfg(target_os = "linux")]
+        struct FailingRunner<F> {
+            inner: TestRunner,
+            fail: F,
+        }
+
+        #[cfg(target_os = "linux")]
+        impl<F: Fn(&[String]) -> bool + Send + Sync> CommandRunner for FailingRunner<F> {
+            fn run<'a>(
+                &'a self,
+                argv: &'a [String],
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>,
+            > {
+                Box::pin(async move {
+                    let out = self.inner.run(argv).await?;
+                    if (self.fail)(argv) {
+                        anyhow::bail!("injected failure: {}", argv.join(" "));
+                    }
+                    Ok(out)
+                })
+            }
+        }
+
+        // F-S: a hub that advertises nothing still isolates its spokes.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn apply_host_only_hub_installs_spoke_isolation() {
             use crate::vpn::hostcfg_cmd::*;
-            let tun = "bore0";
-            let id = "test1to1";
+            let runner = TestRunner::new();
+            let mut cfg = blank_cfg("iso", false);
+            cfg.apply_into(&runner, &[], &[], &[], true, false, false)
+                .await
+                .expect("apply ok");
+            let calls = runner.get_calls().await;
+            if cfg.nft_available {
+                assert_eq!(calls, spoke_isolation_nft_cmds("iso", "bore0"));
+                assert_eq!(cfg.revert_cmds, [cmd_nft_delete_table("iso")]);
+            } else if check_binary_exists("iptables") {
+                let iso = ipt_iso_chain("iso");
+                assert_eq!(calls, spoke_isolation_iptables_cmds("iso", "bore0"));
+                // Reversed on Drop: del jump, flush chain, delete chain.
+                assert_eq!(
+                    cfg.revert_cmds,
+                    [
+                        cmd_iptables_filter_del_chain(&iso),
+                        cmd_iptables_filter_flush_chain(&iso),
+                        cmd_iptables_forward_jump_del(&iso),
+                    ]
+                );
+            } else {
+                assert!(calls.is_empty());
+            }
+            assert_eq!(cfg.revert_cmds.len(), cfg.revert_labels.len());
+            cfg.revert_cmds.clear(); // nothing real to undo
+            cfg.revert_labels.clear();
+        }
 
-            // These commands should exist (they're the hub-mode builders)
-            let nft_hub = cmd_nft_add_spoke_isolation(id, tun);
-            let iptables_hub = cmd_iptables_spoke_isolation_add(id, tun);
+        // 1:1 host-only link: no hub, no gateway — nothing touches the firewall.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn apply_host_only_non_hub_touches_no_firewall() {
+            let runner = TestRunner::new();
+            let mut cfg = blank_cfg("p2p", false);
+            cfg.apply_into(&runner, &[], &[], &[], false, false, false)
+                .await
+                .expect("apply ok");
+            assert!(runner.get_calls().await.is_empty());
+            assert!(cfg.revert_cmds.is_empty());
+        }
 
-            // Both should mention the isolation concept
-            assert!(nft_hub.contains(&"drop".to_string()));
-            assert!(iptables_hub.contains(&"-A".to_string()));
+        // `--no-route-manage` prints the isolation commands and runs none.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn apply_host_only_hub_no_route_manage_runs_nothing() {
+            let runner = TestRunner::new();
+            let mut cfg = blank_cfg("iso2", true);
+            cfg.apply_into(&runner, &[], &[], &[], true, false, false)
+                .await
+                .expect("apply ok");
+            assert!(runner.get_calls().await.is_empty());
+            assert!(cfg.revert_cmds.is_empty());
+        }
 
-            // In non-hub mode, these would NOT be called (verified by code inspection)
-            // This is a unit test of the command builders, not the NetConfig apply path
-            // (which would require full gateway setup including ip route get mocking).
+        // F-RV: the gateway firewall setup failing halfway still leaves every
+        // already-created object registered for teardown.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn apply_failing_halfway_keeps_the_teardown_registered() {
+            use crate::vpn::hostcfg_cmd::*;
+            // Fails the MSS clamp: the last-but-one step on both backends.
+            let runner = FailingRunner {
+                inner: TestRunner::new(),
+                fail: |argv: &[String]| argv.iter().any(|a| a == "maxseg" || a == "TCPMSS"),
+            };
+            let mut cfg = blank_cfg("rv", false);
+            let advertised = vec![net("192.168.1.0/24")];
+            let err = cfg
+                .apply_into(&runner, &[], &advertised, &[], true, false, false)
+                .await
+                .expect_err("the injected failure must surface");
+            assert!(format!("{err:#}").contains("mss clamp"), "{err:#}");
+            if cfg.nft_available {
+                assert!(cfg.revert_cmds.contains(&cmd_nft_delete_table("rv")));
+            } else {
+                let post = ipt_nat_post_chain("rv");
+                for cmd in [
+                    cmd_iptables_nat_jump_del("POSTROUTING", &post),
+                    cmd_iptables_nat_flush_chain(&post),
+                    cmd_iptables_nat_del_chain(&post),
+                ] {
+                    assert!(cfg.revert_cmds.contains(&cmd), "missing {cmd:?}");
+                }
+            }
+            assert_eq!(cfg.revert_cmds.len(), cfg.revert_labels.len());
+            cfg.revert_cmds.clear(); // nothing real to undo
+            cfg.revert_labels.clear();
         }
 
         // Root-required tests (skipped by default).
@@ -8425,8 +9248,10 @@ pub mod link {
             rr: usize,
         },
         /// Relay path: AEAD-framed substreams (one writer task each).
-        /// Frames are distributed round-robin **per datagram** (DEC-7):
-        /// out-of-order arrival is fine, IP is best-effort.
+        /// Frames are FLOW-PINNED to a carrier (`flow_carrier`, like the direct
+        /// path): relay carriers are substreams of ONE TCP connection, so the
+        /// former per-datagram round-robin (DEC-7) bought no parallelism and only
+        /// reordered a flow across writer tasks (F-Z2).
         Relay {
             /// Channels to the background relay writer tasks (one per carrier).
             txs: Vec<mpsc::Sender<Bytes>>,
@@ -8435,8 +9260,6 @@ pub mod link {
             key: std::sync::Arc<super::crypto::SealKey>,
             /// Shared per-packet counter for nonce derivation (I-5).
             counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
-            /// Round-robin cursor (local to this clone).
-            rr: usize,
         },
     }
 
@@ -8447,13 +9270,10 @@ pub mod link {
                     conns: conns.clone(),
                     rr: 0,
                 },
-                LinkSender::Relay {
-                    txs, key, counter, ..
-                } => LinkSender::Relay {
+                LinkSender::Relay { txs, key, counter } => LinkSender::Relay {
                     txs: txs.clone(),
                     key: std::sync::Arc::clone(key),
                     counter: std::sync::Arc::clone(counter),
-                    rr: 0,
                 },
             }
         }
@@ -8468,6 +9288,9 @@ pub mod link {
         Direct {
             /// Parallel QUIC carrier connections; the downlink reads from all.
             conns: Vec<DirectConn>,
+            /// Carrier the next batch starts draining from (F-Z5): rotated per
+            /// batch so no carrier is always served last.
+            next: usize,
         },
         /// Relay path: fan-in of the per-carrier reader tasks. Each reader owns
         /// one ingress substream (I-1), decrypts frames, and pushes plaintext
@@ -8495,7 +9318,7 @@ pub mod link {
                 conns: conns.clone(),
                 rr: 0,
             },
-            LinkRecver::Direct { conns },
+            LinkRecver::Direct { conns, next: 0 },
         )
     }
 
@@ -8512,8 +9335,8 @@ pub mod link {
     ///
     /// Per carrier: one background writer task owns its `egress` substream and
     /// one reader task owns its `ingress` substream (I-1). Egress frames are
-    /// sealed with a **shared** atomic counter (I-5) and distributed
-    /// round-robin per datagram (DEC-7); ingress readers decrypt and fan into
+    /// sealed with a **shared** atomic counter (I-5) and flow-pinned to a
+    /// carrier (F-Z2); ingress readers decrypt and fan into
     /// one channel. A reader hitting EOF/error pushes the error into the
     /// fan-in, killing the link cleanly (no silent half-degraded state).
     pub fn make_relay_multi(
@@ -8556,7 +9379,6 @@ pub mod link {
                 txs,
                 key: egress_key,
                 counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                rr: 0,
             },
             LinkRecver::Relay { rx: fan_rx },
         )
@@ -8816,8 +9638,11 @@ pub mod link {
     impl LinkSender {
         /// Send a batch of IP packets. For Direct: QUIC datagrams. For Relay: AEAD frames.
         ///
-        /// Returns the number of packets DROPPED because they exceeded the
-        /// current QUIC path-MTU (`DatagramSend::TooLarge`). Such drops are a
+        /// Returns the number of packets DROPPED: on the direct path because they
+        /// exceeded the current QUIC path-MTU (`DatagramSend::TooLarge`), on the
+        /// relay path because the carrier's write queue was full (F-HUB-HOL —
+        /// this call NEVER waits, so a stalled peer cannot hold the caller; the
+        /// queue is a drop-tail buffer like any router's). Such drops are a
         /// transient per-packet condition — never a link failure — so they must
         /// not abort the rest of the batch nor tear the link down; the caller
         /// counts them and continues. `Err` is reserved for genuine link death.
@@ -8825,9 +9650,10 @@ pub mod link {
             self.send_batch_inner(pkts, false).await
         }
 
-        /// Like [`send_batch`] but applies BACKPRESSURE on the direct path (VPN
-        /// F3): when the QUIC datagram send buffer is full the call AWAITS room
-        /// instead of letting quinn silently drop the oldest queued datagram.
+        /// Like [`send_batch`] but applies BACKPRESSURE (VPN F3): when the QUIC
+        /// datagram send buffer — or the relay write queue — is full the call
+        /// AWAITS room instead of dropping (quinn would silently drop the oldest
+        /// queued datagram; the relay path never drops here).
         /// Dropping looks like loss to the tunnelled TCP and collapses its window;
         /// awaiting pauses the TUN read so the kernel TUN queue backpressures the
         /// inner senders to the real drain rate. Use ONLY from a dedicated per-link
@@ -8866,30 +9692,58 @@ pub mod link {
                     }
                     Ok(dropped)
                 }
-                LinkSender::Relay {
-                    txs,
-                    key,
-                    counter,
-                    rr,
-                } => {
-                    // Relay carriers are independent RELIABLE streams: per-datagram
-                    // round-robin is kept (DEC-7 — reorder is bounded and the replay
-                    // window is sized for it), and the bounded channel already
-                    // applies backpressure, so `backpressure` is a no-op here.
-                    let _ = backpressure;
+                LinkSender::Relay { txs, key, counter } => {
+                    let writer_exited =
+                        || anyhow::anyhow!("relay writer exited (write error on relay stream)");
+                    let n = txs.len();
+                    let mut dropped = 0usize;
                     for pkt in pkts {
+                        // Flow-pinned (F-Z2): one inner flow stays on one carrier,
+                        // in order. `n == 1` → 0, the single-carrier path.
+                        let tx = &txs[flow_carrier(pkt, n)];
+                        // Room is reserved BEFORE sealing, so a refused packet
+                        // consumes no nonce. With backpressure (1:1 uplink) a full
+                        // queue is awaited; without (hub router) it is a drop for
+                        // THIS peer only — the router never parks on one spoke
+                        // (F-HUB-HOL).
+                        let permit = if backpressure {
+                            tx.reserve().await.map_err(|_| writer_exited())?
+                        } else {
+                            match tx.try_reserve() {
+                                Ok(permit) => permit,
+                                Err(mpsc::error::TrySendError::Full(())) => {
+                                    dropped += 1;
+                                    continue;
+                                }
+                                Err(mpsc::error::TrySendError::Closed(())) => {
+                                    return Err(writer_exited())
+                                }
+                            }
+                        };
                         // Shared atomic counter: unique nonce even with multiple
                         // producers on the same egress key (I-5, DEC-6).
                         let ctr = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let frame = key.seal_with_counter(ctr, pkt)?;
-                        *rr = (*rr + 1) % txs.len();
-                        txs[*rr].send(Bytes::from(frame)).await.map_err(|_| {
-                            anyhow::anyhow!("relay writer exited (write error on relay stream)")
-                        })?;
+                        permit.send(Bytes::from(frame));
                     }
-                    // Relay frames are length-prefixed and never size-limited
-                    // like QUIC datagrams: nothing is ever dropped here.
-                    Ok(0)
+                    Ok(dropped)
+                }
+            }
+        }
+
+        /// Close every direct carrier NOW (no-op on relay). Idempotent.
+        ///
+        /// A `DirectConn` is a refcounted handle and the detached PMTU/diag
+        /// monitors hold clones, so dropping the link halves alone never closes
+        /// the QUIC connection: without this call a path we stopped using stays
+        /// up forever, kept alive by keep-alives — the peer keeps sending into a
+        /// downlink nobody reads (one-way black hole) and every reconnect leaks
+        /// a connection plus its monitors (F-ZOMBIE). The close frame is also
+        /// what tells the peer to fall back at once instead of on idle timeout.
+        pub fn close_direct(&self) {
+            if let LinkSender::Direct { conns, .. } = self {
+                for c in conns {
+                    c.close();
                 }
             }
         }
@@ -8911,11 +9765,33 @@ pub mod link {
         }
     }
 
+    /// Non-blocking drain of the datagrams already queued on `conns`, starting
+    /// at carrier `start`, at most an equal share of [`BATCH_CAP`] per carrier.
+    fn drain_carriers(conns: &[DirectConn], start: usize, out: &mut Vec<Bytes>) -> Result<()> {
+        let n = conns.len();
+        let quota = (BATCH_CAP / n).max(1);
+        for k in 0..n {
+            let conn = &conns[(start + k) % n];
+            let mut taken = 0;
+            while taken < quota && out.len() < BATCH_CAP {
+                match conn.read_datagram().now_or_never() {
+                    Some(Ok(pkt)) => {
+                        out.push(pkt);
+                        taken += 1;
+                    }
+                    Some(Err(e)) => return Err(e).context("direct recv drain"),
+                    None => break,
+                }
+            }
+        }
+        Ok(())
+    }
+
     impl LinkRecver {
         /// Receive ≥1 IP packets (up to `BATCH_CAP`). Err on link close.
         pub async fn recv_batch(&mut self, out: &mut Vec<Bytes>) -> Result<()> {
             match self {
-                LinkRecver::Direct { conns } => {
+                LinkRecver::Direct { conns, next } => {
                     if conns.len() == 1 {
                         // Legacy single-connection fast path, byte-identical.
                         let first = conns[0]
@@ -8931,24 +9807,26 @@ pub mod link {
                         }
                         return Ok(());
                     }
-                    // Multi-carrier: wait on ALL carriers for the first datagram
-                    // (read_datagram is cancel-safe — the losers' queued datagrams
-                    // are not lost, just re-polled next call), then drain every
-                    // carrier's queued datagrams up to BATCH_CAP.
-                    let futs = conns
-                        .iter()
-                        .map(|c| Box::pin(c.read_datagram()))
-                        .collect::<Vec<_>>();
-                    let (res, _idx, _rest) = futures_util::future::select_all(futs).await;
-                    out.push(res.context("direct recv first datagram")?);
-                    for c in conns.iter() {
-                        while out.len() < BATCH_CAP {
-                            match c.read_datagram().now_or_never() {
-                                Some(Ok(pkt)) => out.push(pkt),
-                                Some(Err(e)) => return Err(e).context("direct recv drain"),
-                                None => break,
-                            }
-                        }
+                    // Multi-carrier (F-Z5): take what is ALREADY queued first,
+                    // fairly — the start carrier rotates per batch and each
+                    // carrier gets an equal share of the batch, so a busy carrier
+                    // cannot fill the batch while the others overflow their
+                    // datagram buffers. Only an idle link parks on all carriers
+                    // (read_datagram is cancel-safe: the losers' datagrams are
+                    // re-polled, not lost), so the per-wait allocation is off the
+                    // loaded path.
+                    let start = *next % conns.len();
+                    *next = next.wrapping_add(1);
+                    let before = out.len();
+                    drain_carriers(conns, start, out)?;
+                    if out.len() == before {
+                        let futs = conns
+                            .iter()
+                            .map(|c| Box::pin(c.read_datagram()))
+                            .collect::<Vec<_>>();
+                        let (res, _idx, _rest) = futures_util::future::select_all(futs).await;
+                        out.push(res.context("direct recv first datagram")?);
+                        drain_carriers(conns, start, out)?;
                     }
                     Ok(())
                 }
@@ -9023,8 +9901,9 @@ pub mod link {
             assert!(seen.iter().all(|&i| i < 4));
         }
 
-        /// A full relay queue must apply backpressure: send_batch completes as
-        /// soon as the consumer drains a slot, and no packet is lost.
+        /// A full relay queue must apply backpressure on the 1:1 uplink:
+        /// send_batch_wait completes as soon as the consumer drains a slot, and
+        /// no packet is lost.
         #[tokio::test]
         async fn relay_sender_backpressure_no_loss() {
             // Capacity 1 so the second packet must wait for the consumer.
@@ -9034,12 +9913,14 @@ pub mod link {
                 txs: vec![tx],
                 key,
                 counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                rr: 0,
             };
 
             let pkt = Bytes::from(vec![0xAB; 64]);
             // First send fills the channel.
-            sender.send_batch(std::slice::from_ref(&pkt)).await.unwrap();
+            sender
+                .send_batch_wait(std::slice::from_ref(&pkt))
+                .await
+                .unwrap();
             // Consumer drains with a delay; the second send must wait, then succeed.
             let consumer = tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -9049,7 +9930,10 @@ pub mod link {
                 }
                 frames
             });
-            sender.send_batch(std::slice::from_ref(&pkt)).await.unwrap();
+            sender
+                .send_batch_wait(std::slice::from_ref(&pkt))
+                .await
+                .unwrap();
             match &sender {
                 LinkSender::Relay { counter, .. } => {
                     assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 2)
@@ -9059,6 +9943,173 @@ pub mod link {
             drop(sender);
             let frames = consumer.await.unwrap();
             assert_eq!(frames.len(), 2, "both sealed frames must reach the writer");
+        }
+
+        /// F-HUB-HOL — the hub router's `send_batch` never parks on a full relay
+        /// queue (one stalled spoke held the router, and with it every other
+        /// spoke): the packet is dropped for that peer, counted, and no nonce is
+        /// spent on it. A dead writer is still a link error.
+        #[tokio::test]
+        async fn relay_send_batch_drops_instead_of_waiting_on_a_full_queue() {
+            let (tx, mut rx) = mpsc::channel::<Bytes>(2);
+            let key = std::sync::Arc::new(crate::vpn::crypto::SealKey::new(&[0u8; 32]).unwrap());
+            let mut sender = LinkSender::Relay {
+                txs: vec![tx],
+                key,
+                counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            };
+            let pkts = vec![Bytes::from(vec![0xAB; 64]); 5];
+            // Nobody drains: 2 fit, 3 are dropped — and the call returns.
+            let dropped =
+                tokio::time::timeout(std::time::Duration::from_secs(2), sender.send_batch(&pkts))
+                    .await
+                    .expect("send_batch must not wait for a stalled peer")
+                    .unwrap();
+            assert_eq!(dropped, 3);
+            match &sender {
+                LinkSender::Relay { counter, .. } => assert_eq!(
+                    counter.load(std::sync::atomic::Ordering::Relaxed),
+                    2,
+                    "a dropped packet must not consume a nonce"
+                ),
+                _ => panic!("expected Relay"),
+            }
+            // RED CHECK: the backpressure variant does wait on the same queue.
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                sender.send_batch_wait(&pkts[..1])
+            )
+            .await
+            .is_err());
+            // Room again → delivered again.
+            rx.recv().await.unwrap();
+            // (the timed-out reserve above left no frame behind)
+            assert_eq!(sender.send_batch(&pkts[..1]).await.unwrap(), 0);
+            // Writer gone → genuine link death.
+            drop(rx);
+            assert!(sender.send_batch(&pkts[..1]).await.is_err());
+        }
+
+        /// F-Z2 — relay carriers are flow-pinned like direct ones: every packet
+        /// of one inner flow rides one carrier (in order), distinct flows spread.
+        #[tokio::test]
+        async fn relay_carriers_are_flow_pinned() {
+            let (mut txs, mut rxs) = (Vec::new(), Vec::new());
+            for _ in 0..4 {
+                let (tx, rx) = mpsc::channel::<Bytes>(1024);
+                txs.push(tx);
+                rxs.push(rx);
+            }
+            let key = std::sync::Arc::new(crate::vpn::crypto::SealKey::new(&[0u8; 32]).unwrap());
+            let mut sender = LinkSender::Relay {
+                txs,
+                key,
+                counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            };
+            let flow = Bytes::from(ipv4_tcp([10, 0, 0, 1], [10, 0, 0, 2], 40000, 443));
+            for _ in 0..50 {
+                sender
+                    .send_batch(std::slice::from_ref(&flow))
+                    .await
+                    .unwrap();
+            }
+            let per_carrier: Vec<usize> = rxs
+                .iter_mut()
+                .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).count())
+                .collect();
+            assert_eq!(
+                per_carrier.iter().filter(|&&c| c > 0).count(),
+                1,
+                "one flow must stay on one carrier, got {per_carrier:?}"
+            );
+            assert_eq!(per_carrier.iter().sum::<usize>(), 50);
+            assert_eq!(per_carrier[flow_carrier(&flow, 4)], 50);
+
+            // Many flows use more than one carrier.
+            for sport in 0..64u16 {
+                let pkt = Bytes::from(ipv4_tcp([10, 0, 0, 1], [10, 0, 0, 2], 41000 + sport, 443));
+                sender.send_batch(std::slice::from_ref(&pkt)).await.unwrap();
+            }
+            let used = rxs
+                .iter_mut()
+                .map(|rx| rx.try_recv().is_ok())
+                .filter(|got| *got)
+                .count();
+            assert!(
+                used >= 2,
+                "distinct flows must spread, used {used} carriers"
+            );
+        }
+
+        /// F-Z5 — with several direct carriers one batch serves them all: the
+        /// drain used to start at carrier 0 every time and could fill the whole
+        /// batch from it while the others overflowed their datagram buffers.
+        #[cfg(all(feature = "udp", target_os = "linux"))]
+        #[tokio::test]
+        async fn multi_carrier_recv_serves_every_carrier_in_one_batch() {
+            let (cli_a, srv_a) = crate::holepunch::test_loopback_direct_pair().await;
+            let (cli_b, srv_b) = crate::holepunch::test_loopback_direct_pair().await;
+            let (_sender, mut recver) = make_direct_multi(vec![cli_a.clone(), cli_b.clone()]);
+            for i in 0..100u8 {
+                srv_a.send_datagram(Bytes::from(vec![0xA0, i])).unwrap();
+                srv_b.send_datagram(Bytes::from(vec![0xB0, i])).unwrap();
+            }
+            // Let both carriers queue well over a batch each.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+            let mut first = Vec::new();
+            recver.recv_batch(&mut first).await.unwrap();
+            let from_a = first.iter().filter(|p| p[0] == 0xA0).count();
+            let from_b = first.iter().filter(|p| p[0] == 0xB0).count();
+            assert_eq!(first.len(), BATCH_CAP);
+            assert_eq!(
+                (from_a, from_b),
+                (BATCH_CAP / 2, BATCH_CAP / 2),
+                "each carrier gets an equal share of a full batch"
+            );
+            assert_eq!(first[0][0], 0xA0, "first batch starts at carrier 0");
+
+            let mut second = Vec::new();
+            recver.recv_batch(&mut second).await.unwrap();
+            assert_eq!(second[0][0], 0xB0, "the start carrier rotates per batch");
+
+            // Per-carrier order is preserved across batches.
+            let seq = |tag: u8| -> Vec<u8> {
+                first
+                    .iter()
+                    .chain(second.iter())
+                    .filter(|p| p[0] == tag)
+                    .map(|p| p[1])
+                    .collect()
+            };
+            assert!(seq(0xA0).windows(2).all(|w| w[0] < w[1]));
+            assert!(seq(0xB0).windows(2).all(|w| w[0] < w[1]));
+
+            // An idle link parks until a datagram shows up on ANY carrier.
+            let mut rest = 0;
+            loop {
+                let mut batch = Vec::new();
+                let got = tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    recver.recv_batch(&mut batch),
+                )
+                .await;
+                if got.is_err() {
+                    break;
+                }
+                rest += batch.len();
+            }
+            assert_eq!(first.len() + second.len() + rest, 200);
+            srv_b.send_datagram(Bytes::from(vec![0xB0, 200])).unwrap();
+            let mut late = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                recver.recv_batch(&mut late),
+            )
+            .await
+            .expect("idle recv must wake on the second carrier")
+            .unwrap();
+            assert_eq!(late, vec![Bytes::from(vec![0xB0, 200])]);
         }
 
         /// A writer that records every write SEPARATELY. Counting writes is
@@ -9199,7 +10250,6 @@ pub mod link {
                 txs: vec![tx],
                 key,
                 counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                rr: 0,
             };
 
             let pkt = Bytes::from(vec![0xCD; 32]);
@@ -9316,15 +10366,7 @@ pub mod link {
                     txs.push(tx);
                     rxs.push(rx);
                 }
-                (
-                    LinkSender::Relay {
-                        txs,
-                        key,
-                        counter,
-                        rr: 0,
-                    },
-                    rxs,
-                )
+                (LinkSender::Relay { txs, key, counter }, rxs)
             }
 
             let mut pairs: HashSet<([u8; 32], u64)> = HashSet::new();
@@ -9431,6 +10473,8 @@ pub mod bridge {
         pub rx_bytes: AtomicU64,
         /// Dropped (TooLarge) packets.
         pub tx_drops: AtomicU64,
+        /// Packets lost to a TUN read/write error (F-TUNERR).
+        pub tun_errors: AtomicU64,
     }
 
     impl BridgeCounters {
@@ -9442,16 +10486,10 @@ pub mod bridge {
                 rx_pkts: AtomicU64::new(0),
                 rx_bytes: AtomicU64::new(0),
                 tx_drops: AtomicU64::new(0),
+                tun_errors: AtomicU64::new(0),
             })
         }
     }
-
-    /// Grace window after a relay pump dies while an upgrade may be in flight:
-    /// when the PEER switches to direct first, it drops its relay substreams and
-    /// our relay pumps fail — but our own direct upgrade completes within
-    /// moments. Waiting briefly for the upgrade channel turns that race into a
-    /// clean path switch instead of a dead link.
-    const UPGRADE_GRACE: Duration = Duration::from_secs(5);
 
     /// Bridge state machine (warm-relay seamless fallback).
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -9532,6 +10570,34 @@ pub mod bridge {
         }
     }
 
+    /// Owns the direct path the bridge currently rides and closes it whenever
+    /// the bridge stops using it: fallback to relay, a newer upgrade, the
+    /// orderly tail, or an unorderly drop of `run` (F-ZOMBIE). See
+    /// [`LinkSender::close_direct`] for why dropping the halves is not enough.
+    #[derive(Default)]
+    struct DirectCloser(Option<LinkSender>);
+
+    impl DirectCloser {
+        /// Adopt a new direct path, closing the previous one (if any).
+        fn adopt(&mut self, sender: &LinkSender) {
+            self.close();
+            self.0 = Some(sender.clone());
+        }
+
+        /// Close the adopted path, if any.
+        fn close(&mut self) {
+            if let Some(sender) = self.0.take() {
+                sender.close_direct();
+            }
+        }
+    }
+
+    impl Drop for DirectCloser {
+        fn drop(&mut self) {
+            self.close();
+        }
+    }
+
     /// Run the VPN data-plane bridge until the link dies or the tun closes.
     ///
     /// Spawns one uplink pump per TUN queue (the kernel hashes flows across
@@ -9569,6 +10635,9 @@ pub mod bridge {
     ) -> Result<()> {
         assert!(!devs.is_empty(), "bridge needs at least one TUN queue");
         let mut guard = PumpGuard::default();
+        // Declared before the pumps are spawned and dropped after them: the
+        // direct path is closed on EVERY way out of this function.
+        let mut direct_closer = DirectCloser::default();
         let mut stats_task = tokio::spawn({
             let c = Arc::clone(&counters);
             async move {
@@ -9592,6 +10661,7 @@ pub mod bridge {
                         tx_bytes = c.tx_bytes.load(Ordering::Relaxed),
                         rx_bytes = c.rx_bytes.load(Ordering::Relaxed),
                         tx_drops,
+                        tun_errors = c.tun_errors.load(Ordering::Relaxed),
                         "vpn bridge stats",
                     );
                 }
@@ -9709,6 +10779,7 @@ pub mod bridge {
                     direct_dl = None;
                     match bridge_next_action(mode, BridgeEvent::DirectDownlinkDied, !relay_dead) {
                         BridgeAction::FallBackToRelay => {
+                            direct_closer.close();
                             let _ = downgrade_tx.try_send(());
                             abort_await!(uplinks);
                             uplinks = spawn_uplinks(&devs, relay_sender.clone(), &counters, mtu, offload);
@@ -9730,10 +10801,14 @@ pub mod bridge {
                             break 'outer outcome;
                         }
                         BridgeAction::FallBackToRelay => {
+                            // Tell the peer first: it must stop sending on a
+                            // path whose downlink we are about to abort.
+                            direct_closer.close();
                             let _ = downgrade_tx.try_send(());
                             abort_await!(uplinks);
-                            if let Some(d) = direct_dl.take() {
+                            if let Some(mut d) = direct_dl.take() {
                                 d.abort();
+                                let _ = (&mut d).await;
                             }
                             uplinks = spawn_uplinks(&devs, relay_sender.clone(), &counters, mtu, offload);
                             uplinks.iter().for_each(|h| guard.track(h));
@@ -9754,6 +10829,7 @@ pub mod bridge {
                         BridgeAction::GoDirect => {
                             abort_await!(uplinks);
                             let (direct_sender, direct_recver) = pair;
+                            direct_closer.adopt(&direct_sender);
                             uplinks = spawn_uplinks(&devs, direct_sender, &counters, mtu, offload);
                             uplinks.iter().for_each(|h| guard.track(h));
                             let dl = spawn_direct_downlink(&devs, direct_recver, &counters, offload);
@@ -9762,8 +10838,10 @@ pub mod bridge {
                             mode = BridgeMode::Direct;
                             tracing::info!(path = "direct", "bridge switched to direct path");
                         }
-                        // Already on direct: drop the spurious upgrade.
-                        BridgeAction::Ignore => {}
+                        // Already on direct: the spurious upgrade is not
+                        // adopted, so it must be closed here (its monitors
+                        // would keep it alive otherwise).
+                        BridgeAction::Ignore => pair.0.close_direct(),
                         _ => unreachable!("upgrade yields GoDirect/Ignore only"),
                     }
                 }
@@ -9785,6 +10863,7 @@ pub mod bridge {
             let _ = (&mut d).await;
         }
         abort_await!(uplinks);
+        direct_closer.close();
         drop(guard);
         result
     }
@@ -9794,6 +10873,104 @@ pub mod bridge {
     /// MTU-discovery drops at startup are normal), and we have not warned yet.
     fn should_warn_drops(drops: u64, elapsed: Duration, warned: bool) -> bool {
         drops > 0 && elapsed > Duration::from_secs(10) && !warned
+    }
+
+    /// F-TUNERR — failures needed, with no success in between, before a TUN
+    /// pump gives up.
+    const TUN_FAULT_MIN_RUN: u32 = 16;
+    /// F-TUNERR — and the time that failure run must span. A run also restarts
+    /// after a quiet gap this long.
+    const TUN_FAULT_WINDOW: Duration = Duration::from_secs(3);
+    /// Pause after a failed TUN READ, so a device that fails instantly cannot
+    /// spin a core while the run is being judged.
+    const TUN_READ_FAULT_PAUSE: Duration = Duration::from_millis(20);
+
+    /// Tolerance for TUN I/O errors (F-TUNERR).
+    ///
+    /// A TUN read/write error is a per-packet event — `EINVAL` on a malformed
+    /// packet, `EIO` while the interface is down, a transient `ENOBUFS`, a GSO
+    /// frame that cannot be split: the packet is dropped and counted, the pump
+    /// keeps running. Treating the first one as fatal tore the whole link down
+    /// (TUN and routes recreated) for a single bad packet. Only a failure RUN —
+    /// [`TUN_FAULT_MIN_RUN`] consecutive failures spanning [`TUN_FAULT_WINDOW`],
+    /// no success and no quiet gap in between — means the device is gone and
+    /// ends the pump, so the link is rebuilt.
+    pub(super) struct TunFaults {
+        op: &'static str,
+        run: u32,
+        since: Option<tokio::time::Instant>,
+        last: Option<tokio::time::Instant>,
+    }
+
+    impl TunFaults {
+        pub(super) fn new(op: &'static str) -> Self {
+            Self {
+                op,
+                run: 0,
+                since: None,
+                last: None,
+            }
+        }
+
+        /// A TUN operation succeeded: the failure run is over.
+        pub(super) fn ok(&mut self) {
+            if self.run != 0 {
+                self.run = 0;
+                self.since = None;
+                self.last = None;
+            }
+        }
+
+        /// Account one failure at `now`; `true` when the run is persistent.
+        fn note(&mut self, now: tokio::time::Instant) -> bool {
+            if self
+                .last
+                .is_some_and(|last| now.duration_since(last) > TUN_FAULT_WINDOW)
+            {
+                self.run = 0;
+                self.since = None;
+            }
+            let since = *self.since.get_or_insert(now);
+            self.last = Some(now);
+            self.run += 1;
+            self.run >= TUN_FAULT_MIN_RUN && now.duration_since(since) >= TUN_FAULT_WINDOW
+        }
+
+        /// A TUN operation failed and lost `pkts` packets. `Ok` = dropped, keep
+        /// going; `Err` = the failure is persistent, stop the pump.
+        pub(super) fn fail(
+            &mut self,
+            err: std::io::Error,
+            pkts: u64,
+            counters: &BridgeCounters,
+        ) -> Result<()> {
+            counters
+                .tun_errors
+                .fetch_add(pkts.max(1), Ordering::Relaxed);
+            if self.note(tokio::time::Instant::now()) {
+                return Err(anyhow::Error::new(err).context(format!(
+                    "TUN {} failing persistently ({} consecutive errors)",
+                    self.op, self.run
+                )));
+            }
+            if self.run == 1 {
+                tracing::warn!(op = self.op, error = %err, "TUN I/O error; packet dropped");
+            } else {
+                debug!(op = self.op, error = %err, run = self.run, "TUN I/O error; packet dropped");
+            }
+            Ok(())
+        }
+
+        /// [`Self::fail`] for a READ: also pauses before the caller retries.
+        pub(super) async fn read_failed(
+            &mut self,
+            err: std::io::Error,
+            counters: &BridgeCounters,
+        ) -> Result<()> {
+            self.fail(err, 1, counters)?;
+            tokio::time::sleep(TUN_READ_FAULT_PAUSE).await;
+            Ok(())
+        }
     }
 
     async fn run_uplink(
@@ -9822,8 +10999,16 @@ pub mod bridge {
         // reads. 64 KiB per uplink task is negligible.
         let _ = mtu;
         let mut buf = vec![0u8; u16::MAX as usize + 4];
+        let mut faults = TunFaults::new("read");
         loop {
-            let n = dev.recv(&mut buf).await?;
+            let n = match dev.recv(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    faults.read_failed(e, &counters).await?;
+                    continue;
+                }
+            };
+            faults.ok();
             if n == 0 {
                 continue;
             }
@@ -9874,10 +11059,19 @@ pub mod bridge {
         // and tun_rs's gso_split panics on a segment larger than its buffer.
         let mut bufs = vec![vec![0u8; u16::MAX as usize]; tun_rs::IDEAL_BATCH_SIZE];
         let mut sizes = vec![0usize; tun_rs::IDEAL_BATCH_SIZE];
+        let mut faults = TunFaults::new("read");
         loop {
-            let num = dev
+            let num = match dev
                 .recv_multiple(&mut original_buffer, &mut bufs, &mut sizes, 0)
-                .await?;
+                .await
+            {
+                Ok(num) => num,
+                Err(e) => {
+                    faults.read_failed(e, &counters).await?;
+                    continue;
+                }
+            };
+            faults.ok();
             if num == 0 {
                 continue;
             }
@@ -9925,15 +11119,21 @@ pub mod bridge {
         counters: Arc<BridgeCounters>,
     ) -> Result<()> {
         let mut batch = Vec::with_capacity(64);
+        let mut faults = TunFaults::new("write");
         loop {
             batch.clear();
             recver.recv_batch(&mut batch).await?;
             for pkt in &batch {
-                counters.rx_pkts.fetch_add(1, Ordering::Relaxed);
-                counters
-                    .rx_bytes
-                    .fetch_add(pkt.len() as u64, Ordering::Relaxed);
-                dev.send(pkt).await?;
+                match dev.send(pkt).await {
+                    Ok(_) => {
+                        faults.ok();
+                        counters.rx_pkts.fetch_add(1, Ordering::Relaxed);
+                        counters
+                            .rx_bytes
+                            .fetch_add(pkt.len() as u64, Ordering::Relaxed);
+                    }
+                    Err(e) => faults.fail(e, 1, &counters)?,
+                }
             }
         }
     }
@@ -9960,6 +11160,7 @@ pub mod bridge {
     ) -> Result<()> {
         let mut batch = Vec::with_capacity(tun_rs::IDEAL_BATCH_SIZE);
         let mut gro_table = tun_rs::GROTable::default();
+        let mut faults = TunFaults::new("write");
         loop {
             batch.clear();
             recver.recv_batch(&mut batch).await?;
@@ -9977,10 +11178,18 @@ pub mod bridge {
                 })
                 .collect();
             let mut slices: Vec<&mut bytes::BytesMut> = bufs.iter_mut().collect();
-            dev.send_multiple(&mut gro_table, &mut slices, tun_rs::VIRTIO_NET_HDR_LEN)
-                .await?;
-            counters.rx_pkts.fetch_add(total_pkts, Ordering::Relaxed);
-            counters.rx_bytes.fetch_add(total_bytes, Ordering::Relaxed);
+            match dev
+                .send_multiple(&mut gro_table, &mut slices, tun_rs::VIRTIO_NET_HDR_LEN)
+                .await
+            {
+                Ok(_) => {
+                    faults.ok();
+                    counters.rx_pkts.fetch_add(total_pkts, Ordering::Relaxed);
+                    counters.rx_bytes.fetch_add(total_bytes, Ordering::Relaxed);
+                }
+                // The whole coalesced batch is lost with the failed write.
+                Err(e) => faults.fail(e, total_pkts, &counters)?,
+            }
         }
     }
 
@@ -10019,6 +11228,121 @@ pub mod bridge {
                 1,
                 "a dropped guard must abort every pump it tracks"
             );
+        }
+
+        /// F-TUNERR — isolated TUN errors are per-packet drops; only a failure
+        /// run with no success in between, long enough to mean the device is
+        /// gone, stops the pump.
+        #[tokio::test(start_paused = true)]
+        async fn tun_faults_tolerate_isolated_errors_and_trip_on_a_persistent_run() {
+            use std::sync::atomic::Ordering;
+            let counters = super::BridgeCounters::new();
+            let boom = || std::io::Error::from_raw_os_error(5); // EIO
+            let mut faults = super::TunFaults::new("write");
+
+            // One bad packet, then traffic flows again: never fatal.
+            for _ in 0..1000 {
+                faults.fail(boom(), 1, &counters).unwrap();
+                faults.ok();
+                tokio::time::advance(Duration::from_millis(10)).await;
+            }
+            assert_eq!(counters.tun_errors.load(Ordering::Relaxed), 1000);
+
+            // A burst far above the run length, but too short to judge: tolerated.
+            for _ in 0..(super::TUN_FAULT_MIN_RUN * 4) {
+                faults.fail(boom(), 1, &counters).unwrap();
+            }
+            // Sparse failures (a quiet gap between them) never add up to a run.
+            for _ in 0..(super::TUN_FAULT_MIN_RUN * 4) {
+                tokio::time::advance(super::TUN_FAULT_WINDOW + Duration::from_millis(1)).await;
+                faults.fail(boom(), 1, &counters).unwrap();
+            }
+            faults.ok();
+
+            // Continuous failure for the whole window: the device is gone.
+            let start = tokio::time::Instant::now();
+            let err = loop {
+                match faults.read_failed(boom(), &counters).await {
+                    Ok(()) => assert!(
+                        start.elapsed() <= super::TUN_FAULT_WINDOW,
+                        "a persistent failure must end the pump"
+                    ),
+                    Err(e) => break e,
+                }
+            };
+            assert!(start.elapsed() >= super::TUN_FAULT_WINDOW);
+            assert!(
+                format!("{err:#}").contains("failing persistently"),
+                "{err:#}"
+            );
+
+            // A lost batch counts every packet it carried.
+            let before = counters.tun_errors.load(Ordering::Relaxed);
+            let mut batch_faults = super::TunFaults::new("write");
+            batch_faults.fail(boom(), 64, &counters).unwrap();
+            assert_eq!(counters.tun_errors.load(Ordering::Relaxed), before + 64);
+        }
+
+        /// F-ZOMBIE — a direct connection outlives its link halves as long as
+        /// any clone is alive (the detached PMTU/diag monitors hold one each):
+        /// only an explicit close ends it. The bridge's `DirectCloser` does that
+        /// on every way out, drop included.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn direct_closer_closes_what_dropping_the_halves_leaves_open() {
+            let (cli, srv) = crate::holepunch::test_loopback_direct_pair().await;
+            // Stands for the detached monitors' clones.
+            let monitor = cli.clone();
+            let (sender, recver) = super::super::link::make_direct(cli);
+
+            let mut closer = super::DirectCloser::default();
+            closer.adopt(&sender);
+            drop(sender);
+            drop(recver);
+            // RED CHECK: halves gone, connection still up on both ends.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), srv.closed())
+                    .await
+                    .is_err(),
+                "dropping the link halves must not be what closes the path (a monitor clone is alive)"
+            );
+
+            drop(closer);
+            tokio::time::timeout(Duration::from_secs(5), srv.closed())
+                .await
+                .expect("peer must see the close at once, not on idle timeout");
+            tokio::time::timeout(Duration::from_secs(5), monitor.closed())
+                .await
+                .expect("the monitors' clone must observe the close and let them exit");
+        }
+
+        /// F-ZOMBIE — adopting a newer path closes the one it replaces, and an
+        /// explicit close is idempotent.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn direct_closer_closes_the_replaced_path() {
+            let (cli_a, srv_a) = crate::holepunch::test_loopback_direct_pair().await;
+            let (cli_b, srv_b) = crate::holepunch::test_loopback_direct_pair().await;
+            let (sender_a, _ra) = super::super::link::make_direct(cli_a);
+            let (sender_b, _rb) = super::super::link::make_direct(cli_b);
+
+            let mut closer = super::DirectCloser::default();
+            closer.adopt(&sender_a);
+            closer.adopt(&sender_b);
+            tokio::time::timeout(Duration::from_secs(5), srv_a.closed())
+                .await
+                .expect("replaced path must be closed");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), srv_b.closed())
+                    .await
+                    .is_err(),
+                "the adopted path stays up"
+            );
+            closer.close();
+            closer.close();
+            tokio::time::timeout(Duration::from_secs(5), srv_b.closed())
+                .await
+                .expect("explicit close must close the adopted path");
         }
 
         /// O-1 — a link that switches path many times respawns its uplinks each
@@ -10695,6 +12019,24 @@ mod tests {
     /// dropped (they would loop the QUIC handshake back through the relay and
     /// the "direct" link would die at the switch — `read_datagram: timed out`).
     #[test]
+    fn overlay_addresses_count_as_tunneled() {
+        let net = |s: &str| s.parse::<crate::shared::Ipv4Net>().unwrap();
+        let tunneled =
+            tunneled_with_overlay(&[net("192.168.50.0/24")], "10.99.0.1".parse().unwrap(), 30);
+        let peers: Vec<std::net::SocketAddr> = vec![
+            "10.99.0.2:40000".parse().unwrap(), // the peer's overlay address
+            "192.168.50.7:40000".parse().unwrap(), // inside a peer route
+            "203.0.113.9:40000".parse().unwrap(), // genuinely off-tunnel
+        ];
+        let (kept, dropped) = filter_tunneled_candidates(&peers, &tunneled);
+        assert_eq!(kept, vec![peers[2]]);
+        assert_eq!(dropped, vec![peers[0], peers[1]]);
+        // A neighbouring /30 of the pool is somebody else's link: untouched.
+        let other: Vec<std::net::SocketAddr> = vec!["10.99.0.6:40000".parse().unwrap()];
+        assert_eq!(filter_tunneled_candidates(&other, &tunneled).0, other);
+    }
+
+    #[test]
     fn filter_tunneled_candidates_drops_looping_addrs() {
         let parse = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
         let net = |s: &str| s.parse::<crate::shared::Ipv4Net>().unwrap();
@@ -10739,6 +12081,146 @@ mod tests {
         assert!(!should_retry_direct(false, false, false));
     }
 
+    fn stale_punch() -> CtrlEvent {
+        CtrlEvent::Punch {
+            nonce: [0u8; crate::shared::UDP_NONCE_LEN],
+            peer: vec!["192.0.2.1:4000".parse().unwrap()],
+            tuning: UdpDirectTuning::default(),
+            v2: None,
+        }
+    }
+
+    /// F-B6 — a fallback to the relay is reported, so the admin page stops
+    /// showing `direct` for a link that is back on the relay.
+    #[tokio::test]
+    async fn park_on_direct_reports_the_relay_on_fallback() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let on_direct = Arc::new(AtomicBool::new(false));
+        let (downgrade_tx, mut downgrade_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (_ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<CtrlEvent>(4);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(4);
+
+        let flag = Arc::clone(&on_direct);
+        let parked = tokio::spawn(async move {
+            park_on_direct(&mut downgrade_rx, &mut ev_rx, &flag, &out_tx, true).await
+        });
+        while !on_direct.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        assert!(out_rx.try_recv().is_err(), "nothing to report while direct");
+
+        downgrade_tx.send(()).await.unwrap();
+        assert!(parked.await.unwrap(), "a fallback re-arms the retry loop");
+        assert!(!on_direct.load(Ordering::SeqCst));
+        assert!(matches!(
+            out_rx.try_recv(),
+            Ok(crate::shared::ClientMessage::VpnPathReport { path }) if path == "relay"
+        ));
+    }
+
+    /// F-B6 — no report to a server that cannot decode it, and none when the
+    /// link is closing rather than falling back.
+    #[tokio::test]
+    async fn park_on_direct_stays_silent_without_admin_v2_or_on_teardown() {
+        use std::sync::atomic::AtomicBool;
+        let on_direct = AtomicBool::new(false);
+
+        // Old server: the fallback is still a fallback, but nothing is sent.
+        let (downgrade_tx, mut downgrade_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (_ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<CtrlEvent>(4);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(4);
+        downgrade_tx.send(()).await.unwrap();
+        assert!(park_on_direct(&mut downgrade_rx, &mut ev_rx, &on_direct, &out_tx, false).await);
+        assert!(out_rx.try_recv().is_err());
+
+        // Bridge gone (its downgrade sender dropped): the link is closing.
+        let (downgrade_tx, mut downgrade_rx) = tokio::sync::mpsc::channel::<()>(1);
+        drop(downgrade_tx);
+        assert!(!park_on_direct(&mut downgrade_rx, &mut ev_rx, &on_direct, &out_tx, true).await);
+        assert!(out_rx.try_recv().is_err());
+
+        // Control actor gone (event channel closed): closing as well.
+        let (_downgrade_tx, mut downgrade_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<CtrlEvent>(4);
+        drop(ev_tx);
+        assert!(!park_on_direct(&mut downgrade_rx, &mut ev_rx, &on_direct, &out_tx, true).await);
+        assert!(out_rx.try_recv().is_err());
+    }
+
+    /// F-D — whatever sits in the control channel before our offer answers an
+    /// EARLIER offer. Left there, `try_direct_upgrade` took it for this round's
+    /// punch and every later round ran one punch behind, forever.
+    #[tokio::test]
+    async fn stale_ctrl_events_are_drained_before_the_offer() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CtrlEvent>(8);
+        tx.send(stale_punch()).await.unwrap();
+        tx.send(CtrlEvent::Unavailable).await.unwrap();
+        assert_eq!(drain_stale_ctrl_events(&mut rx), 2);
+        assert_eq!(drain_stale_ctrl_events(&mut rx), 0);
+        // The answer to the offer that follows is the first thing read.
+        tx.send(CtrlEvent::Unavailable).await.unwrap();
+        assert!(matches!(rx.recv().await, Some(CtrlEvent::Unavailable)));
+    }
+
+    /// F-D — a punch arriving between rounds dates the peer's round: the next
+    /// round is re-anchored on it instead of staying on a drifted grid.
+    #[tokio::test(start_paused = true)]
+    async fn idle_punch_realigns_the_direct_retry_grid() {
+        let start = tokio::time::Instant::now();
+        let mut ticker = tokio::time::interval(DIRECT_RETRY_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CtrlEvent>(8);
+
+        // First round is immediate.
+        assert!(wait_next_direct_round(&mut ticker, &mut rx).await);
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+
+        // No signal: the next round sits on the fixed grid.
+        assert!(wait_next_direct_round(&mut ticker, &mut rx).await);
+        assert_eq!(start.elapsed(), DIRECT_RETRY_INTERVAL);
+
+        // The peer offers 10 s into our idle time (stale punch reaches us).
+        let sender = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            sender.send(stale_punch()).await.unwrap();
+        });
+        assert!(wait_next_direct_round(&mut ticker, &mut rx).await);
+        let resynced =
+            DIRECT_RETRY_INTERVAL + std::time::Duration::from_secs(10) + DIRECT_RETRY_INTERVAL
+                - DIRECT_RESYNC_LEAD;
+        assert_eq!(
+            start.elapsed(),
+            resynced,
+            "round must follow the peer's, not the old grid"
+        );
+        // Nothing lingers for the round to mistake for its own answer.
+        assert_eq!(drain_stale_ctrl_events(&mut rx), 0);
+
+        // The grid stays anchored there.
+        assert!(wait_next_direct_round(&mut ticker, &mut rx).await);
+        assert_eq!(start.elapsed(), resynced + DIRECT_RETRY_INTERVAL);
+
+        // `Unavailable` between rounds is consumed and moves nothing.
+        tx.send(CtrlEvent::Unavailable).await.unwrap();
+        assert!(wait_next_direct_round(&mut ticker, &mut rx).await);
+        assert_eq!(start.elapsed(), resynced + 2 * DIRECT_RETRY_INTERVAL);
+
+        // Control actor gone → stop.
+        drop(tx);
+        assert!(!wait_next_direct_round(&mut ticker, &mut rx).await);
+    }
+
+    /// F-H — the configured MTU comes back when the direct path closes.
+    #[test]
+    fn pmtu_restore_target_cases() {
+        assert_eq!(pmtu_restore_target(1280, 1350, false), Some(1350));
+        assert_eq!(pmtu_restore_target(1400, 1350, false), Some(1350));
+        assert_eq!(pmtu_restore_target(1350, 1350, false), None);
+        // Pinned: the monitor never resized, nothing to undo.
+        assert_eq!(pmtu_restore_target(1280, 1350, true), None);
+    }
+
     /// §4.3 — urgent one-sample shrink (fast recovery after a direct switch).
     #[test]
     fn pmtu_shrink_now_cases() {
@@ -10781,12 +12263,16 @@ mod tests {
         assert!(!is_fatal(&classify_vpn_error(
             "vpn listener 'x' not found".into()
         )));
-        assert!(is_fatal(&classify_vpn_error("vpn pool exhausted".into())));
+        // F-CAP: capacity frees up when another link leaves — retry, never give up.
+        assert!(!is_fatal(&classify_vpn_error("vpn pool exhausted".into())));
+        assert!(is_fatal(&classify_vpn_error(
+            "overlapping subnets: a and b".into()
+        )));
     }
 
     /// B1 (bug-hunt) — pin EVERY server-emitted `VpnError` string to its expected
-    /// class. `vpn_error_is_retryable` is a bare substring match (`"already in
-    /// use" || "not found"`); that is the exact bug class that hid the NAT
+    /// class. `vpn_error_is_retryable` is a bare substring match; that is the
+    /// exact bug class that hid the NAT
     /// `prefix` bug, so this table is a regression tripwire. If a server message
     /// is reworded into (or out of) one of those substrings, classification
     /// flips silently — an infinite reconnect on a fatal config error, or a lost
@@ -10795,23 +12281,26 @@ mod tests {
     /// `vpn_server.rs`.
     #[test]
     fn vpn_error_classification_pinned() {
-        // Transient reconnect-race conditions → RETRYABLE.
+        // Transient reconnect-race and capacity conditions → RETRYABLE (F-CAP:
+        // a slot frees when another link leaves, often this client's own
+        // previous session).
         let retryable = [
             "vpn id 'mylink' already in use",
             "vpn listener 'mylink' not found",
-        ];
-        // Configuration / capacity errors → FATAL (retrying cannot fix them).
-        let fatal = [
             "server vpn-max-links reached",
             "server connection limit reached",
+            "hub 'mylink' is at capacity (--max-clients reached)",
+            "hub subnet full",
+            "vpn hub pool exhausted",
+            "vpn pool exhausted (all /30 blocks in 10.99.0.0/16 in use)",
+        ];
+        // Configuration errors → FATAL (retrying cannot fix them).
+        let fatal = [
             "server has no vpn pool; use --vpn-addr/--vpn-peer-addr",
             "hub mode (--max-clients > 1) requires server pool addressing (D6)",
             "hub mode requires a server pool (--vpn-pool)",
             "hub mode requires pool addressing on the connector",
             "connector --advertise is not allowed in hub mode (hub-and-spoke only, D4)",
-            "hub subnet full",
-            "vpn hub pool exhausted",
-            "vpn pool exhausted",
             "overlapping subnets: 10.0.0.0/24 and 10.0.0.0/16",
             "addressing mode mismatch: listener=pool connector=static",
         ];
@@ -10986,17 +12475,109 @@ pub mod hub {
         stream: crate::mux::Stream,
     }
 
-    /// Live peer entry: (downlink_task, peer_handle, punch_tx for direct upgrade).
+    /// Live peer entry: (downlink_task, peer_handle, punch_tx for direct
+    /// upgrade, direct-upgrade task unless `--relay-only`).
     ///
-    /// The downlink is held in an [`AbortOnDrop`]: it owns an `Arc<TunDevice>`,
+    /// Both tasks are held in an [`AbortOnDrop`]: each owns an `Arc<TunDevice>`,
     /// and when the hub link dies the coordinator is aborted and this map is
     /// dropped with it. A bare `JoinHandle` here left every peer's downlink
-    /// running — and the hub's `boreN` open — after the link was gone (O-1).
+    /// running — and the hub's `boreN` open — after the link was gone (O-1);
+    /// a detached direct-upgrade task did the same for as long as its round
+    /// (STUN, punch wait, QUIC accept) took.
     type LivePeerEntry = (
         AbortOnDrop<()>,
         Arc<PeerHandle>,
         tokio::sync::mpsc::Sender<HubEvent>,
+        Option<AbortOnDrop<()>>,
     );
+
+    /// Relay substreams of a multi-carrier peer, handed back to the coordinator
+    /// once their carrier-index bytes have been consumed off it (F-HUBDEAD).
+    struct PreparedPeer {
+        peer_id: u32,
+        up: Vec<crate::mux::Stream>,
+        down: Vec<crate::mux::Stream>,
+        /// `false`: an index byte never arrived; the peer is dropped.
+        ok: bool,
+    }
+
+    /// `(carriers, nonce, overlay)` from a peer's `Join`.
+    type PeerMeta = (u16, [u8; crate::shared::UDP_NONCE_LEN], Ipv4Addr);
+
+    /// Put `peer` in the table under its overlay. Returns the peer it REPLACED,
+    /// if a different one still held that overlay (F-OVL): the server hands a
+    /// freed overlay to the next spoke at once, while the previous owner's
+    /// `Leave` may still be in flight or lost; the caller must tear it down.
+    fn register_peer(table: &PeerTable, peer: &Arc<PeerHandle>) -> Option<Arc<PeerHandle>> {
+        table
+            .insert(peer.overlay, Arc::clone(peer))
+            .filter(|old| old.peer_id != peer.peer_id)
+    }
+
+    /// Drop `peer_id`'s table entry — only if the overlay is still ITS entry
+    /// (F-OVL). An unconditional remove let a late `Leave` of the previous
+    /// owner delete the entry of the spoke that had since been given the same
+    /// overlay: hub→spoke traffic black-holed for the newcomer.
+    fn unregister_peer(table: &PeerTable, overlay: Ipv4Addr, peer_id: u32) -> bool {
+        table
+            .remove_if(&overlay, |_, held| held.peer_id == peer_id)
+            .is_some()
+    }
+
+    /// Consume the 1-byte carrier index heading each multi-carrier substream.
+    /// `false` if any stream fails to deliver it within `budget` overall.
+    async fn consume_carrier_indexes<S: tokio::io::AsyncRead + Unpin>(
+        streams: &mut [S],
+        budget: std::time::Duration,
+    ) -> bool {
+        use tokio::io::AsyncReadExt;
+        tokio::time::timeout(budget, async {
+            for s in streams.iter_mut() {
+                let mut idx = [0u8; 1];
+                if s.read_exact(&mut idx).await.is_err() {
+                    return false;
+                }
+            }
+            true
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Park while a peer rides its direct path. Returns `true` when the peer was
+    /// removed (punch channel closed), `false` when the connection closed.
+    ///
+    /// Punch events are CONSUMED for the whole stay (F-HUBDEAD): the server
+    /// keeps prodding for a peer whose spoke still offers, and a task that
+    /// stopped reading after the first one let them pile up in its channel.
+    async fn hold_direct(
+        closed: impl std::future::Future<Output = ()>,
+        punch_rx: &mut tokio::sync::mpsc::Receiver<HubEvent>,
+    ) -> bool {
+        tokio::pin!(closed);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut closed => return false,
+                ev = punch_rx.recv() => {
+                    if ev.is_none() {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Closes the wrapped direct connection when dropped, so every way out of
+    /// a hub direct attempt — fallback, peer removal, task abort — tells the
+    /// spoke at once instead of leaving it to an idle timeout (F-ZOMBIE).
+    struct CloseOnDrop(crate::holepunch::DirectConn);
+
+    impl Drop for CloseOnDrop {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
 
     /// Event from the server-facing control stream (hub ctrl actor output).
     #[derive(Debug, Clone)]
@@ -11113,6 +12694,32 @@ pub mod hub {
         })
     }
 
+    /// Lets one log line through per [`WarnGate::EVERY`] (M-2): a dead peer
+    /// fails every packet routed to it until its `Leave` lands, and a WARN per
+    /// packet floods the log at line rate.
+    #[derive(Default)]
+    struct WarnGate {
+        last: Option<tokio::time::Instant>,
+        suppressed: u64,
+    }
+
+    impl WarnGate {
+        const EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+        /// `Some(n)` = log now (`n` lines were suppressed since the last one).
+        fn allow(&mut self, now: tokio::time::Instant) -> Option<u64> {
+            if self
+                .last
+                .is_some_and(|last| now.duration_since(last) < Self::EVERY)
+            {
+                self.suppressed += 1;
+                return None;
+            }
+            self.last = Some(now);
+            Some(std::mem::take(&mut self.suppressed))
+        }
+    }
+
     /// Router uplink: read packets from TUN, parse destination IPv4, route to per-peer sender.
     /// Spawned once per TUN queue. Adapted from `bridge::run_uplink_single`/`_offload`.
     pub async fn run_router_uplink(
@@ -11136,8 +12743,17 @@ pub mod hub {
     ) -> Result<()> {
         let mut buf = vec![0u8; u16::MAX as usize + 4];
         let mut _dropped_no_peer = 0u64;
+        let mut faults = super::bridge::TunFaults::new("read");
+        let mut send_warn = WarnGate::default();
         loop {
-            let n = dev.recv(&mut buf).await?;
+            let n = match dev.recv(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    faults.read_failed(e, &counters).await?;
+                    continue;
+                }
+            };
+            faults.ok();
             if n == 0 {
                 continue;
             }
@@ -11155,12 +12771,15 @@ pub mod hub {
                             counters.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
                         }
                         Ok(_dropped) => {
-                            // Oversized (direct path only, shouldn't happen on relay).
+                            // Oversized (direct) or the peer's relay queue is
+                            // full (F-HUB-HOL): dropped for this peer only.
                             counters.tx_drops.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(e) => {
-                            warn!(peer_id = peer.peer_id, error = %e, "peer send failed; dropping packet");
                             // Per-packet error: drop and continue (downlink will also fail).
+                            if let Some(suppressed) = send_warn.allow(tokio::time::Instant::now()) {
+                                warn!(peer_id = peer.peer_id, error = %e, suppressed, "peer send failed; dropping packet");
+                            }
                         }
                     }
                 } else {
@@ -11192,6 +12811,8 @@ pub mod hub {
         let mut original_buffer = vec![0u8; tun_rs::VIRTIO_NET_HDR_LEN + 65535];
         let mut bufs = vec![vec![0u8; u16::MAX as usize]; tun_rs::IDEAL_BATCH_SIZE];
         let mut sizes = vec![0usize; tun_rs::IDEAL_BATCH_SIZE];
+        let mut faults = super::bridge::TunFaults::new("read");
+        let mut send_warn = WarnGate::default();
 
         loop {
             // Offset 0: each segment buffer holds the pure IP packet at [0..size]
@@ -11199,7 +12820,15 @@ pub mod hub {
             // the payload and make parse_ipv4_dst read the wrong bytes.
             let num = dev
                 .recv_multiple(&mut original_buffer, &mut bufs, &mut sizes, 0)
-                .await?;
+                .await;
+            let num = match num {
+                Ok(num) => num,
+                Err(e) => {
+                    faults.read_failed(e, &counters).await?;
+                    continue;
+                }
+            };
+            faults.ok();
             if num == 0 {
                 continue;
             }
@@ -11237,7 +12866,9 @@ pub mod hub {
                                 .fetch_add(dropped as u64, Ordering::Relaxed);
                         }
                         Err(e) => {
-                            warn!(peer_id = peer.peer_id, error = %e, "peer send failed; dropping group");
+                            if let Some(suppressed) = send_warn.allow(tokio::time::Instant::now()) {
+                                warn!(peer_id = peer.peer_id, error = %e, suppressed, "peer send failed; dropping group");
+                            }
                         }
                     }
                 } else {
@@ -11280,6 +12911,22 @@ pub mod hub {
             std::collections::HashMap::new();
         let mut live_peers: std::collections::HashMap<u32, LivePeerEntry> =
             std::collections::HashMap::new();
+        // Multi-carrier peers whose substreams are being prepared off this task.
+        let mut building: std::collections::HashMap<u32, PeerMeta> =
+            std::collections::HashMap::new();
+        let (prep_tx, mut prep_rx) = mpsc::channel::<PreparedPeer>(64);
+        let path = HubPathGauge::new(admin_v2, out_tx.clone());
+        let ctx = BuildCtx {
+            devs: &devs,
+            secret: &secret,
+            counters: &counters,
+            offload,
+            peer_table: &peer_table,
+            event_tx: &event_tx,
+            args: &args,
+            path: &path,
+            out_tx: &out_tx,
+        };
 
         loop {
             tokio::select! {
@@ -11314,7 +12961,19 @@ pub mod hub {
                         }
                     }
 
-                    try_build_peer(&mut pending, &mut live_peers, &devs, &secret, &counters, offload, peer_id, &peer_table, &event_tx, &args, admin_v2, out_tx.clone()).await;
+                    start_build(&ctx, &mut pending, &mut building, &mut live_peers, &prep_tx, peer_id);
+                }
+
+                // A multi-carrier peer's substreams are ready (or failed).
+                Some(prep) = prep_rx.recv() => {
+                    // A `Leave` while preparing removed the entry: drop the streams.
+                    if let Some(meta) = building.remove(&prep.peer_id) {
+                        if prep.ok {
+                            finish_build(&ctx, &mut live_peers, prep.peer_id, meta, prep.up, prep.down);
+                        } else {
+                            warn!(peer_id = prep.peer_id, "failed to read carrier idx byte; dropping peer");
+                        }
+                    }
                 }
 
                 // Join/Leave/Punch event from server
@@ -11332,18 +12991,20 @@ pub mod hub {
                                 down: Vec::new(),
                             });
                             entry.meta = Some((carriers, nonce, overlay));
-                            try_build_peer(&mut pending, &mut live_peers, &devs, &secret, &counters, offload, peer_id, &peer_table, &event_tx, &args, admin_v2, out_tx.clone()).await;
+                            start_build(&ctx, &mut pending, &mut building, &mut live_peers, &prep_tx, peer_id);
                         }
                         HubEvent::Leave { peer_id } => {
                             // Remove from live peers and tear down. Idempotent:
                             // a downlink-death self-report and a server
                             // VpnPeerLeave can both fire for the same peer.
-                            if let Some((dl_task, peer, _punch_tx)) = live_peers.remove(&peer_id) {
-                                peer_table.remove(&peer.overlay);
+                            if let Some((dl_task, peer, _punch_tx, direct_task)) = live_peers.remove(&peer_id) {
+                                unregister_peer(&peer_table, peer.overlay, peer_id);
                                 peer.shutdown.notify_waiters();
                                 drop(dl_task);
+                                drop(direct_task);
                             }
                             pending.remove(&peer_id);
+                            building.remove(&peer_id);
                         }
                         HubEvent::Punch {
                             peer_id,
@@ -11353,14 +13014,22 @@ pub mod hub {
                             v2,
                         } => {
                             // Phase 4.2c: route to peer's direct task (when added).
-                            if let Some((_dl_task, _peer_handle, punch_tx)) = live_peers.get(&peer_id) {
-                                let _ = punch_tx.send(HubEvent::Punch {
+                            if let Some((_dl_task, _peer_handle, punch_tx, _direct)) = live_peers.get(&peer_id) {
+                                // NEVER await a peer's direct task from here
+                                // (F-HUBDEAD): this loop is the only handler of
+                                // Join/Leave for EVERY spoke, and one full punch
+                                // queue would park it — and then the control
+                                // actor behind it. A punch that does not fit is
+                                // stale by definition; the next round re-offers.
+                                if punch_tx.try_send(HubEvent::Punch {
                                     peer_id,
                                     nonce,
                                     peer,
                                     tuning,
                                     v2,
-                                }).await;
+                                }).is_err() {
+                                    debug!(?peer_id, "hub coordinator: peer punch queue full or closed; punch dropped");
+                                }
                             } else {
                                 debug!(?peer_id, "hub coordinator: punch event for unknown peer; peer may be removed");
                             }
@@ -11376,33 +13045,111 @@ pub mod hub {
         }
     }
 
-    /// Attempt to build a peer link when it has carriers + nonce + up/down substreams.
-    #[allow(clippy::too_many_arguments)]
-    async fn try_build_peer(
-        pending: &mut std::collections::HashMap<u32, PendingPeer>,
-        live_peers: &mut std::collections::HashMap<u32, LivePeerEntry>,
-        devs: &[Arc<TunDevice>],
-        secret: &str,
-        counters: &Arc<BridgeCounters>,
+    /// What building a peer link needs from the coordinator.
+    struct BuildCtx<'a> {
+        devs: &'a [Arc<TunDevice>],
+        secret: &'a str,
+        counters: &'a Arc<BridgeCounters>,
         offload: bool,
-        peer_id: u32,
-        peer_table: &PeerTable,
-        event_tx: &mpsc::Sender<HubEvent>,
-        args: &super::VpnListenArgs,
+        peer_table: &'a PeerTable,
+        event_tx: &'a mpsc::Sender<HubEvent>,
+        args: &'a super::VpnListenArgs,
+        path: &'a Arc<HubPathGauge>,
+        out_tx: &'a tokio::sync::mpsc::Sender<crate::shared::ClientMessage>,
+    }
+
+    /// A hub's data path as the admin page sees it (F-B6).
+    ///
+    /// `VpnPathReport` names no peer, so per-spoke reports overwrote one
+    /// another and the row showed whichever spoke changed last — and stayed
+    /// `direct` forever when that spoke left while direct. The hub reports
+    /// `direct` while at least one spoke is on a direct path, `relay` when
+    /// none is.
+    pub(super) struct HubPathGauge {
         admin_v2: bool,
         out_tx: tokio::sync::mpsc::Sender<crate::shared::ClientMessage>,
+        direct_peers: std::sync::Mutex<usize>,
+    }
+
+    impl HubPathGauge {
+        pub(super) fn new(
+            admin_v2: bool,
+            out_tx: tokio::sync::mpsc::Sender<crate::shared::ClientMessage>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                admin_v2,
+                out_tx,
+                direct_peers: std::sync::Mutex::new(0),
+            })
+        }
+
+        /// Count one spoke as direct until the returned mark is dropped — on
+        /// a fallback, on the peer's removal, or on an abort of its task.
+        fn enter(self: &Arc<Self>) -> DirectMark {
+            self.shift(true);
+            DirectMark(Arc::clone(self))
+        }
+
+        fn shift(&self, up: bool) {
+            // Count and report under ONE lock: two spokes changing path at the
+            // same moment must not queue their reports in the opposite order.
+            // `try_send` never blocks, so the lock is never held across a wait.
+            let mut direct = self
+                .direct_peers
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let was = *direct;
+            *direct = if up { was + 1 } else { was.saturating_sub(1) };
+            let path = match (was, *direct) {
+                (0, 1) => "direct",
+                (1, 0) => "relay",
+                _ => return,
+            };
+            if !self.admin_v2 {
+                return;
+            }
+            let report = crate::shared::ClientMessage::VpnPathReport { path: path.into() };
+            if let Err(e) = self.out_tx.try_send(report) {
+                debug!(%path, error = %e, "hub path report not sent");
+            }
+        }
+    }
+
+    /// One spoke on a direct path; dropping it takes the spoke off the count.
+    struct DirectMark(Arc<HubPathGauge>);
+
+    impl Drop for DirectMark {
+        fn drop(&mut self) {
+            self.0.shift(false);
+        }
+    }
+
+    /// Start building a peer link once it has carriers + nonce + up/down
+    /// substreams. NOT `async`: the coordinator never waits on a peer here.
+    /// A single-carrier peer is built in place; a multi-carrier one first has
+    /// its carrier-index bytes read by a short-lived task, which hands the
+    /// streams back as a [`PreparedPeer`] (F-HUBDEAD — that read used to block
+    /// the coordinator, hence every spoke's Join/Leave, for up to 10 s per
+    /// stream of a peer that opened its substreams and went quiet).
+    fn start_build(
+        ctx: &BuildCtx<'_>,
+        pending: &mut std::collections::HashMap<u32, PendingPeer>,
+        building: &mut std::collections::HashMap<u32, PeerMeta>,
+        live_peers: &mut std::collections::HashMap<u32, LivePeerEntry>,
+        prep_tx: &mpsc::Sender<PreparedPeer>,
+        peer_id: u32,
     ) {
         let entry = match pending.get_mut(&peer_id) {
             Some(e) => e,
             None => return,
         };
 
-        let (carriers, nonce, overlay) = match entry.meta {
+        let meta = match entry.meta {
             Some(m) => m,
             None => return,
         };
 
-        let carriers = carriers as usize;
+        let carriers = meta.0 as usize;
         if entry.up.len() < carriers || entry.down.len() < carriers {
             return;
         }
@@ -11418,39 +13165,49 @@ pub mod hub {
                 down_streams.push(s);
             }
         }
+        pending.remove(&peer_id);
 
         // For multi-carrier peers the connector wrote a 3-byte header
         // `[STREAM_READY, tag, idx]`; the server forwards `[tag, idx, payload]`
         // and the accept task already consumed `[STREAM_READY, peer_id, tag]`,
-        // leaving `[idx, payload]`. Consume the 1-byte carrier index here (its
-        // value is unused — make_relay_multi round-robins). carriers==1 has no
+        // leaving `[idx, payload]`. Consume the 1-byte carrier index (its
+        // value is unused — carriers are interchangeable to the fan-in). carriers==1 has no
         // idx byte (byte-identical to the single-carrier path).
         if carriers > 1 {
-            use tokio::io::AsyncReadExt;
-            for s in up_streams.iter_mut().chain(down_streams.iter_mut()) {
-                let mut idx = [0u8; 1];
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    s.read_exact(&mut idx),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {}
-                    _ => {
-                        warn!(%peer_id, "failed to read carrier idx byte; dropping peer");
-                        pending.remove(&peer_id);
-                        return;
-                    }
-                }
-            }
+            building.insert(peer_id, meta);
+            let prep_tx = prep_tx.clone();
+            tokio::spawn(async move {
+                let budget = std::time::Duration::from_secs(10);
+                let ok = consume_carrier_indexes(&mut up_streams, budget).await
+                    && consume_carrier_indexes(&mut down_streams, budget).await;
+                let _ = prep_tx
+                    .send(PreparedPeer {
+                        peer_id,
+                        up: up_streams,
+                        down: down_streams,
+                        ok,
+                    })
+                    .await;
+            });
+            return;
         }
+        finish_build(ctx, live_peers, peer_id, meta, up_streams, down_streams);
+    }
 
+    /// Build the peer link from its ready substreams and register it.
+    fn finish_build(
+        ctx: &BuildCtx<'_>,
+        live_peers: &mut std::collections::HashMap<u32, LivePeerEntry>,
+        peer_id: u32,
+        (carriers, nonce, overlay): PeerMeta,
+        up_streams: Vec<crate::mux::Stream>,
+        down_streams: Vec<crate::mux::Stream>,
+    ) {
         // Derive keys and build the link.
-        let keys = match super::crypto::derive_keys_listener(secret, &nonce) {
+        let keys = match super::crypto::derive_keys_listener(ctx.secret, &nonce) {
             Ok(k) => k,
             Err(e) => {
                 warn!(%peer_id, error = %e, "failed to derive keys");
-                pending.remove(&peer_id);
                 return;
             }
         };
@@ -11463,16 +13220,27 @@ pub mod hub {
             shutdown: Notify::new(),
         });
 
-        // Register in peer table.
-        peer_table.insert(overlay, Arc::clone(&peer));
+        // Register in peer table; a stale previous owner of the overlay is
+        // torn down here, not left to a `Leave` that may never come (F-OVL).
+        if let Some(stale) = register_peer(ctx.peer_table, &peer) {
+            warn!(
+                %peer_id,
+                stale_peer_id = stale.peer_id,
+                %overlay,
+                "overlay reassigned while its previous peer was still registered; evicting the stale peer"
+            );
+            stale.shutdown.notify_waiters();
+            live_peers.remove(&stale.peer_id);
+        }
 
         // Spawn downlink. On death it self-reports Leave so the coordinator
         // removes it from the PeerTable even without a server VpnPeerLeave
         // (otherwise the router would keep sending to a dead relay link).
         let peer_clone = Arc::clone(&peer);
-        let dev0 = Arc::clone(&devs[0]);
-        let counters_clone = Arc::clone(counters);
-        let dl_event_tx = event_tx.clone();
+        let dev0 = Arc::clone(&ctx.devs[0]);
+        let counters_clone = Arc::clone(ctx.counters);
+        let dl_event_tx = ctx.event_tx.clone();
+        let offload = ctx.offload;
         let dl_task = tokio::spawn(async move {
             if let Err(e) = super::bridge::run_downlink(dev0, recver, counters_clone, offload).await
             {
@@ -11484,30 +13252,30 @@ pub mod hub {
 
         // Phase 4.2d: Spawn per-peer direct task (unless relay_only).
         let (punch_tx, punch_rx) = tokio::sync::mpsc::channel(16);
-        if !args.relay_only {
+        let direct_task = (!ctx.args.relay_only).then(|| {
             let peer_clone = Arc::clone(&peer);
-            let out_tx_clone = out_tx.clone();
-            let args_clone = args.clone();
-            let dev0 = Arc::clone(&devs[0]);
-            let counters_clone = Arc::clone(counters);
-            tokio::spawn(async move {
+            let out_tx_clone = ctx.out_tx.clone();
+            let args_clone = ctx.args.clone();
+            let dev0 = Arc::clone(&ctx.devs[0]);
+            let counters_clone = Arc::clone(ctx.counters);
+            let path = Arc::clone(ctx.path);
+            AbortOnDrop(tokio::spawn(async move {
                 per_peer_direct_upgrade_task(
                     peer_id,
                     peer_clone,
                     punch_rx,
                     args_clone,
-                    admin_v2,
+                    path,
                     out_tx_clone,
                     dev0,
                     counters_clone,
                     offload,
                 )
                 .await;
-            });
-        }
+            }))
+        });
 
-        live_peers.insert(peer_id, (AbortOnDrop(dl_task), peer, punch_tx));
-        pending.remove(&peer_id);
+        live_peers.insert(peer_id, (AbortOnDrop(dl_task), peer, punch_tx, direct_task));
         info!(%peer_id, %overlay, %carriers, "hub peer link built");
     }
 
@@ -11530,7 +13298,7 @@ pub mod hub {
         peer: Arc<PeerHandle>,
         mut punch_rx: tokio::sync::mpsc::Receiver<HubEvent>,
         args: super::VpnListenArgs,
-        admin_v2: bool,
+        path: Arc<HubPathGauge>,
         out_tx: tokio::sync::mpsc::Sender<crate::shared::ClientMessage>,
         dev0: Arc<TunDevice>,
         counters: Arc<BridgeCounters>,
@@ -11543,7 +13311,12 @@ pub mod hub {
         let endpoint = crate::transport::Endpoint::parse(&args.to);
         // Candidate-loop guard uses the locally-present REAL subnets (the virtual
         // has no local route, N7); plain entries are real==exposed (unchanged).
-        let tunneled = super::routes::advertised_reals(&args.advertise_entries);
+        let mut tunneled = super::routes::advertised_reals(&args.advertise_entries);
+        // The spoke's own overlay address is reached through the TUN as well.
+        tunneled.push(crate::shared::Ipv4Net {
+            addr: peer.overlay,
+            prefix: 32,
+        });
 
         let mut ticker = tokio::time::interval(super::DIRECT_RETRY_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -11568,7 +13341,7 @@ pub mod hub {
                 &counters,
                 offload,
                 &out_tx,
-                admin_v2,
+                &path,
                 &relay_sender,
             )
             .await
@@ -11615,7 +13388,7 @@ pub mod hub {
         counters: &Arc<BridgeCounters>,
         offload: bool,
         out_tx: &tokio::sync::mpsc::Sender<crate::shared::ClientMessage>,
-        admin_v2: bool,
+        path: &Arc<HubPathGauge>,
         relay_sender: &LinkSender,
     ) -> HubDirectOutcome {
         // 1. Socket + STUN candidate gathering (single-owner traversal socket:
@@ -11800,7 +13573,11 @@ pub mod hub {
         //    v1 limitation: no per-peer PMTU monitor (the TUN MTU is shared across
         //    peers); oversized direct packets are dropped per-packet (TooLarge),
         //    never link death.
-        let (dsender, drecver) = super::link::make_direct(conn.clone());
+        // Both guards cover every way out, an abort of this task included: the
+        // QUIC connection is closed explicitly and the direct downlink (which
+        // owns an `Arc<TunDevice>`) is aborted (F-ZOMBIE, O-1).
+        let conn = CloseOnDrop(conn);
+        let (dsender, drecver) = super::link::make_direct(conn.0.clone());
         {
             let mut s = peer.sender.lock().await;
             *s = dsender;
@@ -11808,51 +13585,29 @@ pub mod hub {
         let direct_dl = {
             let dev0 = Arc::clone(dev0);
             let counters = Arc::clone(counters);
-            tokio::spawn(async move {
+            AbortOnDrop(tokio::spawn(async move {
                 let _ = super::bridge::run_downlink(dev0, drecver, counters, offload).await;
-            })
+            }))
         };
-        if admin_v2 {
-            let _ = out_tx
-                .send(crate::shared::ClientMessage::VpnPathReport {
-                    path: "direct".into(),
-                })
-                .await;
-        }
+        let direct_mark = path.enter();
         info!(%peer_id, path = "direct", "hub peer upgraded to direct path");
 
         // 7. Stay direct until the QUIC connection dies OR the peer is removed.
-        tokio::select! {
-            _ = conn.closed() => {}
-            ev = punch_rx.recv() => {
-                if ev.is_none() {
-                    // Peer removed: swap back, stop direct downlink, exit.
-                    {
-                        let mut s = peer.sender.lock().await;
-                        *s = relay_sender.clone();
-                    }
-                    direct_dl.abort();
-                    return HubDirectOutcome::PeerGone;
-                }
-                // A stray punch while direct is up: ignore, keep waiting on close.
-                conn.closed().await;
-            }
-        }
+        //    Stray punches are consumed throughout (F-HUBDEAD).
+        let peer_gone = hold_direct(conn.0.closed(), punch_rx).await;
 
-        // 8. Direct died: swap back to the warm relay sender IN PLACE (seamless,
-        //    no reconnect, TUN preserved, relay nonce counter preserved). Stop the
-        //    direct downlink (its recver already errored on close).
+        // 8. Swap back to the warm relay sender IN PLACE (seamless, no
+        //    reconnect, TUN preserved, relay nonce counter preserved), close
+        //    the direct path and stop its downlink.
         {
             let mut s = peer.sender.lock().await;
             *s = relay_sender.clone();
         }
-        direct_dl.abort();
-        if admin_v2 {
-            let _ = out_tx
-                .send(crate::shared::ClientMessage::VpnPathReport {
-                    path: "relay".into(),
-                })
-                .await;
+        drop(conn);
+        drop(direct_dl);
+        drop(direct_mark);
+        if peer_gone {
+            return HubDirectOutcome::PeerGone;
         }
         info!(%peer_id, path = "relay", "hub peer direct path lost; fell back to warm relay");
         HubDirectOutcome::FellBack
@@ -12149,6 +13904,159 @@ pub mod hub {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn test_peer(peer_id: u32, overlay: Ipv4Addr) -> Arc<PeerHandle> {
+            let (tx, _rx) = mpsc::channel::<Bytes>(1);
+            Arc::new(PeerHandle {
+                overlay,
+                peer_id,
+                sender: Mutex::new(LinkSender::Relay {
+                    txs: vec![tx],
+                    key: Arc::new(crate::vpn::crypto::SealKey::new(&[0u8; 32]).unwrap()),
+                    counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                }),
+                shutdown: Notify::new(),
+            })
+        }
+
+        fn punch(peer_id: u32) -> HubEvent {
+            HubEvent::Punch {
+                peer_id,
+                nonce: [0u8; crate::shared::UDP_NONCE_LEN],
+                peer: Vec::new(),
+                tuning: crate::shared::UdpDirectTuning::default(),
+                v2: None,
+            }
+        }
+
+        /// F-OVL — the server reuses a freed overlay at once. A late `Leave` of
+        /// the previous owner must not delete the newcomer's entry, and the
+        /// newcomer's registration reports the stale owner for teardown.
+        #[test]
+        fn a_late_leave_never_removes_the_overlays_new_owner() {
+            let table: PeerTable = Arc::new(DashMap::new());
+            let overlay = Ipv4Addr::new(10, 99, 0, 2);
+            let old = test_peer(7, overlay);
+            let new = test_peer(8, overlay);
+
+            assert!(register_peer(&table, &old).is_none());
+            // Same peer registered again: nothing to evict.
+            assert!(register_peer(&table, &old).is_none());
+            let evicted = register_peer(&table, &new).expect("stale owner must be reported");
+            assert_eq!(evicted.peer_id, 7);
+
+            // RED CHECK: the old unconditional `remove(&overlay)` deleted peer 8 here.
+            assert!(!unregister_peer(&table, overlay, 7));
+            assert_eq!(table.get(&overlay).unwrap().peer_id, 8);
+
+            assert!(unregister_peer(&table, overlay, 8));
+            assert!(table.get(&overlay).is_none());
+            assert!(!unregister_peer(&table, overlay, 8), "idempotent");
+        }
+
+        /// F-HUBDEAD — on the direct path the per-peer task keeps consuming its
+        /// punch queue: the server's prods no longer pile up in it.
+        #[tokio::test]
+        async fn hold_direct_consumes_punches_until_the_peer_or_the_path_goes() {
+            let (tx, mut rx) = mpsc::channel::<HubEvent>(16);
+            let hold =
+                tokio::spawn(
+                    async move { hold_direct(std::future::pending::<()>(), &mut rx).await },
+                );
+            // Far more than the queue holds: every send must find room.
+            for _ in 0..200 {
+                tokio::time::timeout(std::time::Duration::from_secs(2), tx.send(punch(1)))
+                    .await
+                    .expect("punch queue must keep draining while the peer is direct")
+                    .unwrap();
+            }
+            drop(tx);
+            assert!(hold.await.unwrap(), "closed punch channel = peer removed");
+
+            // Path closed first: reported as a fallback, not a removal.
+            let (_tx, mut rx) = mpsc::channel::<HubEvent>(16);
+            assert!(!hold_direct(std::future::ready(()), &mut rx).await);
+        }
+
+        /// F-HUBDEAD — a peer that never sends its carrier-index bytes costs a
+        /// bounded wait in a side task, and is reported as failed.
+        #[tokio::test(start_paused = true)]
+        async fn carrier_indexes_are_consumed_within_one_budget() {
+            use tokio::io::AsyncWriteExt;
+            let budget = std::time::Duration::from_secs(10);
+
+            let (mut a_w, a_r) = tokio::io::duplex(64);
+            let (mut b_w, b_r) = tokio::io::duplex(64);
+            a_w.write_all(&[0, 0xAA]).await.unwrap();
+            b_w.write_all(&[1, 0xBB]).await.unwrap();
+            let mut streams = vec![a_r, b_r];
+            assert!(consume_carrier_indexes(&mut streams, budget).await);
+            // Exactly one byte was taken from each: the payload is intact.
+            use tokio::io::AsyncReadExt;
+            assert_eq!(streams[0].read_u8().await.unwrap(), 0xAA);
+            assert_eq!(streams[1].read_u8().await.unwrap(), 0xBB);
+
+            // Second stream silent: one budget for the whole set, not per stream.
+            let (mut c_w, c_r) = tokio::io::duplex(64);
+            let (_d_w, d_r) = tokio::io::duplex(64);
+            let (_e_w, e_r) = tokio::io::duplex(64);
+            c_w.write_all(&[0]).await.unwrap();
+            let mut streams = vec![c_r, d_r, e_r];
+            let start = tokio::time::Instant::now();
+            assert!(!consume_carrier_indexes(&mut streams, budget).await);
+            assert_eq!(start.elapsed(), budget);
+
+            // Stream closed before the byte: failed at once.
+            let (f_w, f_r) = tokio::io::duplex(64);
+            drop(f_w);
+            assert!(!consume_carrier_indexes(&mut [f_r], budget).await);
+        }
+
+        /// F-B6 — the hub reports `direct` on its first direct spoke and
+        /// `relay` when the last one leaves, however it leaves.
+        #[tokio::test]
+        async fn hub_path_gauge_reports_only_the_aggregate_transitions() {
+            fn path(rx: &mut mpsc::Receiver<crate::shared::ClientMessage>) -> Option<String> {
+                match rx.try_recv() {
+                    Ok(crate::shared::ClientMessage::VpnPathReport { path }) => Some(path),
+                    _ => None,
+                }
+            }
+            let (out_tx, mut out_rx) = mpsc::channel(8);
+            let gauge = HubPathGauge::new(true, out_tx);
+
+            let first = gauge.enter();
+            assert_eq!(path(&mut out_rx).as_deref(), Some("direct"));
+            let second = gauge.enter();
+            assert_eq!(path(&mut out_rx), None, "already direct");
+            drop(first);
+            assert_eq!(path(&mut out_rx), None, "one spoke is still direct");
+            drop(second);
+            assert_eq!(path(&mut out_rx).as_deref(), Some("relay"));
+
+            // A spoke coming back flips the hub again.
+            let _third = gauge.enter();
+            assert_eq!(path(&mut out_rx).as_deref(), Some("direct"));
+
+            // Old server: counted, never reported.
+            let (out_tx, mut out_rx) = mpsc::channel(8);
+            let silent = HubPathGauge::new(false, out_tx);
+            drop(silent.enter());
+            assert_eq!(path(&mut out_rx), None);
+        }
+
+        /// M-2 — one line per window, with the count of what was held back.
+        #[tokio::test(start_paused = true)]
+        async fn warn_gate_lets_one_line_through_per_window() {
+            let mut gate = WarnGate::default();
+            assert_eq!(gate.allow(tokio::time::Instant::now()), Some(0));
+            for _ in 0..1000 {
+                assert_eq!(gate.allow(tokio::time::Instant::now()), None);
+            }
+            tokio::time::advance(WarnGate::EVERY).await;
+            assert_eq!(gate.allow(tokio::time::Instant::now()), Some(1000));
+            assert_eq!(gate.allow(tokio::time::Instant::now()), None);
+        }
 
         /// The hub trips on server silence like the 1:1 link — regardless of
         /// path, because a hub that lost the server cannot admit anyone.

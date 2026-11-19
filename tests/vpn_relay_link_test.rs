@@ -86,10 +86,13 @@ fn check_packet(pkt: &Bytes, expected_seq: u64) {
 async fn pump_out(mut sender: link::LinkSender) {
     for seq in 0..PKT_COUNT {
         let pkt = test_packet(seq);
-        sender
-            .send_batch(std::slice::from_ref(&pkt))
+        // The 1:1 uplink's call: it awaits a full relay queue. Plain
+        // `send_batch` is the hub router's and drops instead (F-HUB-HOL).
+        let dropped = sender
+            .send_batch_wait(std::slice::from_ref(&pkt))
             .await
-            .expect("send_batch failed");
+            .expect("send_batch_wait failed");
+        assert_eq!(dropped, 0, "the backpressured uplink never drops");
     }
     // Keep the sender alive until the test ends so the writer task does not
     // shut the substream down before the peer drains it.

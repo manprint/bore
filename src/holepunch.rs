@@ -5657,6 +5657,34 @@ pub async fn probe_filtering(socket: &UdpSocket, stun: SocketAddr) -> FilterProb
     FilterProbe::AddressAndPortDependent
 }
 
+/// Test-only: a connected loopback QUIC pair as `(client, server)` handles,
+/// for tests outside this module that need a real direct path. Gated like its
+/// only callers (the Linux VPN link/bridge tests), else it is dead code on the
+/// other targets' `-D warnings` builds.
+#[cfg(all(test, feature = "udp", feature = "vpn", target_os = "linux"))]
+pub(crate) async fn test_loopback_direct_pair() -> (DirectConn, DirectConn) {
+    let tuning = UdpDirectTuning::default();
+    let srv_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let srv_addr = srv_sock.local_addr().unwrap();
+    let srv_ep = server_endpoint(srv_sock, &tuning).unwrap();
+    let cli_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let cli_ep = client_endpoint(cli_sock, &tuning).unwrap();
+    let connecting = cli_ep.connect(srv_addr, "bore").unwrap();
+    let (cli, srv) = tokio::join!(connecting, async {
+        srv_ep.accept().await.unwrap().await.unwrap()
+    });
+    (
+        DirectConn {
+            conn: cli.unwrap(),
+            endpoint: cli_ep,
+        },
+        DirectConn {
+            conn: srv,
+            endpoint: srv_ep,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

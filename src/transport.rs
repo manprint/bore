@@ -66,6 +66,17 @@ pub enum ControlStream {
     Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
 }
 
+impl ControlStream {
+    /// Remote address of the underlying TCP socket (the bore server, or the
+    /// proxy in front of it).
+    pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
+        match self {
+            ControlStream::Plain(s) => s.peer_addr(),
+            ControlStream::Tls(s) => s.get_ref().0.peer_addr(),
+        }
+    }
+}
+
 impl AsyncRead for ControlStream {
     fn poll_read(
         self: Pin<&mut Self>,

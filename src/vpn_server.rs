@@ -386,6 +386,21 @@ impl Drop for VpnHubLeaseGuard {
     }
 }
 
+/// Allocate a hub subnet and arm its lease guard in one step (F-HUBLEAK).
+///
+/// The guard exists before any check that can still reject the hub (subnet
+/// overlap, duplicate id, a failed control write): each of those early returns
+/// drops it and frees the subnet. Arming it later leaked one subnet per
+/// rejected registration, until the pool ran dry.
+pub fn lease_hub_subnet(pool: &VpnPoolHandle, prefix: u8) -> Result<(Ipv4Net, VpnHubLeaseGuard)> {
+    let subnet = pool
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .alloc_hub_subnet(prefix)?;
+    let guard = VpnHubLeaseGuard::new(Arc::clone(pool), u32::from(subnet.network()));
+    Ok((subnet, guard))
+}
+
 /// RAII guard for a hub spoke: on drop it releases the peer's overlay address
 /// back to the [`HubState`] and best-effort notifies the hub listener with a
 /// `Leave` event. Armed right after `alloc_peer`, so the address is freed on
@@ -670,10 +685,18 @@ pub async fn serve_vpn_listener(
                 return Ok(());
             }
         };
-        let subnet = {
-            let mut p = pool_arc.lock().unwrap_or_else(|poison| poison.into_inner());
-            p.alloc_hub_subnet(vpn_hub_prefix)
-                .context("vpn hub subnet allocation failed")?
+        let subnet = match lease_hub_subnet(&pool_arc, vpn_hub_prefix) {
+            Ok((subnet, lease)) => {
+                _hub_lease = Some(lease);
+                subnet
+            }
+            Err(e) => {
+                // Tell the listener why (it retries on exhaustion, F-CAP)
+                // instead of just closing the connection on it.
+                warn!(%id, %e, "vpn hub subnet allocation failed");
+                control.send(ServerMessage::VpnError(e.to_string())).await?;
+                return Ok(());
+            }
         };
         if let Some(msg) = check_overlap(&advertised, &[], subnet) {
             control.send(ServerMessage::VpnError(msg)).await?;
@@ -688,7 +711,6 @@ pub async fn serve_vpn_listener(
             cancel: CancellationToken::new(),
         };
         _hub_teardown = Some(hub_shared.cancel.clone().drop_guard());
-        _hub_lease = Some(VpnHubLeaseGuard::new(pool_arc, u32::from(subnet.network())));
         hub_opt = Some(hub_shared);
         event_rx_opt = Some(event_rx);
         pair_rx = None;
@@ -1367,7 +1389,6 @@ pub async fn serve_vpn_connector(
         let mut heartbeat = interval(Duration::from_millis(500));
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let hub_clone = hub.clone();
-        let punch_timeout = Duration::from_secs(10);
 
         let mut spoke_offer: Option<crate::shared::UdpCandidateOffer> = None;
         let mut offer_deadline: Option<tokio::time::Instant> = None;

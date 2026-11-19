@@ -1003,6 +1003,55 @@ async fn vpn_broker_timeout_sends_unavailable() {
     c_ctrl.send(offer("203.0.113.2:2000")).await.unwrap();
     recv_until_unavailable(&mut c_ctrl, "connector").await;
 }
+/// M-1: the hub spoke broker honours the configured punch timeout. It used a
+/// hard-coded 10 s, so a spoke whose hub never offered waited ten seconds for
+/// `UdpUnavailable` whatever the server was told.
+#[tokio::test]
+async fn vpn_hub_broker_timeout_honours_the_configured_punch_timeout() {
+    let _guard = SERIAL_GUARD.lock().await;
+    spawn_vpn_server_with_punch_timeout("10.94.0.0/16", Duration::from_millis(500)).await;
+
+    let mut hub_ctrl = vpn_ctrl_connect().await;
+    hub_ctrl
+        .send(ClientMessage::HelloVpn {
+            max_clients: 4,
+            id: "hubto".into(),
+            advertised: vec![],
+            addr: VpnAddrRequest::Pool,
+            notes: None,
+            carriers: 1,
+            relay_only: false,
+            pin_mtu: false,
+            mtu: None,
+            forward_accept: false,
+            nat_masquerade: false,
+            route_policy: None,
+            nat_udp_preferred_port: 0,
+            ctrl_heartbeat_ms: 0,
+        })
+        .await
+        .unwrap();
+    let _ = hub_ctrl.recv::<ServerMessage>().await.unwrap(); // VpnReady
+
+    let mut c_ctrl = vpn_ctrl_connect().await;
+    c_ctrl.send(pool_connect_vpn("hubto")).await.unwrap();
+    let _ = c_ctrl.recv::<ServerMessage>().await.unwrap(); // VpnReady
+
+    // Only the spoke offers; the hub never does.
+    c_ctrl.send(offer("203.0.113.2:2000")).await.unwrap();
+    let deadline = time::Instant::now() + Duration::from_secs(4);
+    loop {
+        let msg = time::timeout_at(deadline, c_ctrl.recv::<ServerMessage>())
+            .await
+            .expect("no UdpUnavailable within 4 s of a 500 ms punch timeout")
+            .unwrap();
+        match msg {
+            Some(ServerMessage::UdpUnavailable) => break,
+            Some(_) => continue,
+            None => panic!("control stream closed before UdpUnavailable"),
+        }
+    }
+}
 
 /// The broker must re-broker on a REPEATED offer: a client that stays on relay
 /// keeps retrying the direct upgrade, re-offering fresh candidates each round.
@@ -1545,6 +1594,30 @@ async fn vpn_pool_hub_subnet_allocation() {
     // Allocate another /24 hub in a different block
     let subnet2 = pool.alloc_hub_subnet(24).unwrap();
     assert_eq!(subnet2.addr, Ipv4Addr::from([10, 99, 1, 0]));
+}
+
+/// F-HUBLEAK: the lease guard is armed with the allocation, so a hub
+/// registration rejected afterwards (subnet overlap, duplicate id) gives the
+/// subnet back instead of leaking it until the pool runs dry.
+#[test]
+fn hub_subnet_lease_is_released_when_the_registration_is_rejected() {
+    use bore_cli::vpn_server::{lease_hub_subnet, VpnPool};
+    use std::sync::{Arc, Mutex};
+    let parent: Ipv4Net = "10.99.0.0/16".parse().unwrap();
+    let pool = Arc::new(Mutex::new(VpnPool::new(parent).unwrap()));
+
+    // Far more rejected registrations than the pool has /24 blocks.
+    for round in 0..1000 {
+        let (subnet, lease) = lease_hub_subnet(&pool, 24)
+            .unwrap_or_else(|e| panic!("round {round}: pool leaked a subnet: {e}"));
+        assert_eq!(subnet.addr, Ipv4Addr::from([10, 99, 0, 0]));
+        drop(lease); // the early `return` of a rejected registration
+    }
+
+    // A held lease keeps its subnet: the next hub gets a different block.
+    let (first, _held) = lease_hub_subnet(&pool, 24).unwrap();
+    let (second, _held2) = lease_hub_subnet(&pool, 24).unwrap();
+    assert_ne!(first.addr, second.addr);
 }
 
 /// Phase 2.1: Hub and /30 don't overlap.

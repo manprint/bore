@@ -1639,6 +1639,29 @@ struct VpnListenArgs {
         env = "BORE_VPN_MAX_CLIENTS"
     )]
     max_clients: u16,
+
+    /// Install only the connector-advertised routes these CIDRs cover
+    /// (exact-or-subset). Comma-separated CIDRs. Default: every advertised route.
+    #[clap(
+        long,
+        value_name = "CIDR[,CIDR...]",
+        env = "BORE_VPN_ACCEPT_ROUTES",
+        value_delimiter = ','
+    )]
+    accept_routes: Vec<String>,
+
+    /// Subtract these routes from the installed set. Comma-separated CIDRs.
+    #[clap(
+        long,
+        value_name = "CIDR[,CIDR...]",
+        env = "BORE_VPN_REFUSE_ROUTES",
+        value_delimiter = ','
+    )]
+    refuse_routes: Vec<String>,
+
+    /// Install no connector-advertised route.
+    #[clap(long, env = "BORE_VPN_REFUSE_ALL_ROUTES")]
+    refuse_all_routes: bool,
 }
 
 #[cfg(all(
@@ -1839,7 +1862,7 @@ fn run(command: Command) -> Result<()> {
 }
 
 async fn run_async(command: Command) -> Result<()> {
-    // Race the command against a shutdown signal so Ctrl-C / SIGTERM (e.g.
+    // Race the command against a shutdown signal so Ctrl-C / SIGTERM / SIGHUP (e.g.
     // `docker stop`, systemd) exit cleanly with a log line instead of an abrupt
     // kill mid-transfer.
     // `bore transfer web` owns its own signal lifecycle: the first signal
@@ -1863,7 +1886,25 @@ async fn run_async(command: Command) -> Result<()> {
     }
 }
 
-/// Wait for Ctrl-C, or SIGTERM on Unix (what `docker stop` / systemd send).
+/// True when SIGHUP is ignored for this process, per the `SigIgn:` mask of
+/// `/proc/self/status` (bit 0 = signal 1). That is how `nohup` asks a program
+/// to survive a hangup, and installing a handler would silently undo it.
+#[cfg(any(target_os = "linux", test))]
+fn sighup_ignored(proc_status: &str) -> bool {
+    proc_status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigIgn:"))
+        .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        .is_some_and(|mask| mask & 1 != 0)
+}
+
+/// Wait for Ctrl-C, or SIGTERM on Unix (what `docker stop` / systemd send), or
+/// SIGHUP on Linux (a closed terminal or a dropped SSH session).
+///
+/// SIGHUP's default action kills the process without unwinding, so nothing
+/// reverted the host state a command had set up — `bore vpn` left its routes,
+/// nft table and `ip_forward` behind (F-SIG). It is handled only when not
+/// already ignored: under `nohup` the process must keep running.
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -1880,9 +1921,29 @@ async fn shutdown_signal() {
     };
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
+    #[cfg(target_os = "linux")]
+    let hangup = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        // Unreadable status: leave SIGHUP alone rather than risk undoing nohup.
+        let ignored = std::fs::read_to_string("/proc/self/status")
+            .map(|status| sighup_ignored(&status))
+            .unwrap_or(true);
+        if ignored {
+            return std::future::pending::<()>().await;
+        }
+        match signal(SignalKind::hangup()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let hangup = std::future::pending::<()>();
     tokio::select! {
         _ = ctrl_c => {}
         _ = terminate => {}
+        _ = hangup => {}
     }
 }
 
@@ -2555,6 +2616,18 @@ async fn dispatch(command: Command) -> Result<()> {
                     (None, Some(_)) => anyhow::bail!("--vpn-peer-addr requires --vpn-addr"),
                 };
 
+                let accept_routes = args
+                    .accept_routes
+                    .iter()
+                    .map(|s| s.parse::<Ipv4Net>())
+                    .collect::<Result<Vec<_>>>()
+                    .context("failed to parse --accept-routes CIDRs")?;
+                let refuse_routes = args
+                    .refuse_routes
+                    .iter()
+                    .map(|s| s.parse::<Ipv4Net>())
+                    .collect::<Result<Vec<_>>>()
+                    .context("failed to parse --refuse-routes CIDRs")?;
                 let vpn_args = vpn::VpnListenArgs {
                     to: args.to,
                     secret: args.secret,
@@ -2579,6 +2652,9 @@ async fn dispatch(command: Command) -> Result<()> {
                     tun_queues: args.tun_queues as usize,
                     notes: args.notes,
                     max_clients: args.max_clients,
+                    accept_routes,
+                    refuse_routes,
+                    refuse_all_routes: args.refuse_all_routes,
                 };
 
                 vpn::run_listen(vpn_args).await?;
@@ -3787,6 +3863,23 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// F-SIG: SIGHUP is handled unless `nohup` (or a parent) had it ignored.
+    #[test]
+    fn sighup_ignored_reads_the_sigign_mask() {
+        use super::sighup_ignored;
+        // `nohup`: bit 0 (signal 1) set, alongside others.
+        assert!(sighup_ignored("Name:\tbore\nSigIgn:\t0000000000001001\n"));
+        assert!(sighup_ignored("SigIgn:\t0000000000000001\n"));
+        // A plain shell child: SIGHUP keeps its default action.
+        assert!(!sighup_ignored(
+            "SigBlk:\t0000000000000001\nSigIgn:\t0000000000001000\n"
+        ));
+        assert!(!sighup_ignored("SigIgn:\t0000000000000000\n"));
+        // No mask to read: not reported as ignored (the caller decides).
+        assert!(!sighup_ignored("Name:\tbore\n"));
+        assert!(!sighup_ignored("SigIgn:\tnot-hex\n"));
+    }
+
     /// The advisory quotes MB/s, so the arithmetic behind those numbers is
     /// pinned rather than trusted. `window / RTT` is the same bound P-13
     /// applies to socket buffers: one window in flight, one RTT to get it

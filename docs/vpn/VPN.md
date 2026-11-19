@@ -232,7 +232,12 @@ sudo bore vpn connect --to bore.example.com --secret S3cret --id office
   `--relay-only`), with seamless warm-relay fallback — exactly like a 1:1 link.
 - **Spoke isolation:** spokes reach the hub and its advertised routes only;
   spoke↔spoke traffic is dropped at the hub (`bore0 → bore0` DROP rule). LAN↔spoke
-  forwarding (the gateway path) is unaffected.
+  forwarding (the gateway path) is unaffected. On Linux the rule is installed on
+  every hub, including one that advertises nothing (nft table `inet
+  bore_vpn_<id>`, or the iptables chain `bore_<id>_iso`); with
+  `--no-route-manage` the commands are printed instead.
+- **A stalled spoke costs only itself:** the hub router never waits on a spoke
+  whose relay queue is full, it drops that spoke's packets (`tx_drops_total`).
 
 **Route accept/refuse flags (`vpn connect`):**
 
@@ -604,9 +609,16 @@ Normal. `Ctrl-C` (SIGINT), a link error, or panic all trigger cleanup: routes de
 ## Performance — Carriers, Multi-Queue, Dynamic PMTU (Phase 2 plan, §4)
 
 **`--carriers <N>` (relay):** opens N relay substream pairs instead of one,
-breaking the single-TCP-stream RTT×window throughput ceiling on high-latency
-WANs. Frames are distributed round-robin **per datagram** (out-of-order
-delivery is fine: IP is best-effort; TCP inside the tunnel reorders). The
+all multiplexed on the link's ONE TCP connection to the server. Since the
+2026-11-19 review (F-Z2) frames are **flow-pinned**, as on the direct path: one
+inner connection always rides the same substream and stays in order. They used
+to be spread round-robin per datagram, which reordered a flow for no gain — the
+substreams share one TCP connection, so they add neither congestion-window nor
+head-of-line isolation, and yamux already grows a single stream's window on its
+own. Relay carriers therefore add no capacity; they only keep distinct flows
+from queueing behind each other in bore's own write queues. The flow-pinning
+change was made by analysis and is covered by unit tests; it has NOT been
+re-measured on a high-RTT path. The
 effective count is `min(listener, connector, server --max-carriers)`; old
 peers default to 1. The AEAD nonce counter is a single shared atomic across
 all carriers — never two seals with the same `(key, counter)`. If any carrier
@@ -688,7 +700,8 @@ re-record after any data-plane tuning change.
   UDP loss 0.0% → 0.2%). This is **expected on a ~0.4 ms-RTT link, not a defect**:
   a single relay TCP stream already saturates here (no RTT×window ceiling to
   break), so per-datagram round-robin across 4 substreams only adds reordering,
-  which the inner TCP reads as loss. Carriers are designed for **high-RTT WANs**
+  which the inner TCP reads as loss (this measurement predates flow-pinning on
+  the relay, F-Z2, which removes that reordering). Carriers are designed for **high-RTT WANs**
   where the single relay stream is window-bound; that benefit must be validated
   on a real WAN (out of scope for the netns harness). **Default is 1 carrier**, so
   this does not affect normal use.

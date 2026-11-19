@@ -2725,7 +2725,7 @@ wget --ca-certificate=/etc/bore/private-ca.pem -O archive-copy.tar \
 ```
 
 GET requests may be repeated and run concurrently until the publishing process receives
-`Ctrl+C` (or `SIGTERM`). `HEAD` returns metadata without consuming the source. A `Range`
+`Ctrl+C` (or `SIGTERM`; on Linux also `SIGHUP`, unless started under `nohup`). `HEAD` returns metadata without consuming the source. A `Range`
 request is deliberately served as a complete `200` response; use `curl -o` or `wget -O`
 for a complete copy. While each download is active, the sender emits timer-based progress
 records with the request id, active download count, path, bytes, elapsed time and rate. The
@@ -3852,9 +3852,10 @@ bore server \
 | `--insecure` | `BORE_INSECURE` | — | Skip TLS cert verification |
 | `--notes <TEXT>` | `BORE_NOTES` | — | Operator note (logged on link-up) |
 | `--max-clients <N>` | `BORE_VPN_MAX_CLIENTS` | `1` | Max concurrent connectors in hub mode (listener side); `1` = legacy 1:1 path |
-| `--accept-routes <CIDRs>` | `BORE_VPN_ACCEPT_ROUTES` | — | Explicit accept-list of peer-advertised routes |
-| `--accept-all-routes` | `BORE_VPN_ACCEPT_ALL_ROUTES` | — | Accept every peer-advertised route |
-| `--refuse-routes <CIDRs>` | `BORE_VPN_REFUSE_ROUTES` | — | Subtract routes from the accept-list (`connect` only) |
+| `--accept-routes <CIDRs>` | `BORE_VPN_ACCEPT_ROUTES` | — | Install only the peer-advertised routes these CIDRs cover (`connect`: default none; `listen`: default all) |
+| `--accept-all-routes` | `BORE_VPN_ACCEPT_ALL_ROUTES` | — | Accept every peer-advertised route (`connect` only; a 1:1 `listen` already does) |
+| `--refuse-routes <CIDRs>` | `BORE_VPN_REFUSE_ROUTES` | — | Subtract routes from the accepted set |
+| `--refuse-all-routes` | `BORE_VPN_REFUSE_ALL_ROUTES` | — | Install no peer-advertised route |
 | `--skip-split-tunneling` | — | — | Route ALL traffic through the tunnel, not just accept-listed routes (`connect` only) |
 | `--nat-masquerade` | — | — | Masquerade NAT'd (`real@exposed`) subnets toward the LAN |
 | `--forward-accept` | — | — | Punch an ACCEPT rule for the tun↔LAN pair into a default-deny FORWARD chain |
@@ -3869,6 +3870,36 @@ bore server \
 | `--nat-udp-preferred-port <PORT>` | `BORE_NAT_UDP_PREFERRED_PORT` | `0` | Fixed UDP hole-punch port |
 | `--nat-udp-release-timeout <SECS>` | `BORE_NAT_UDP_RELEASE_TIMEOUT` | `0` | Wait before retrying preferred port |
 
+### Which peer routes get installed
+
+A peer's `--advertise` list is a request, not an order. Each side decides what it installs:
+
+- **`connect` is default-deny.** Without `--accept-all-routes` or `--accept-routes` it
+  reaches the peer's overlay address only.
+- **A 1:1 `listen` installs every route the connector advertises**, unless told otherwise:
+
+  ```bash
+  # Listener that takes only one of the connector's subnets
+  sudo bore vpn listen --to bore.example.com --secret S3cret --id s2s \
+    --advertise 192.168.50.0/24 --accept-routes 192.168.60.0/24
+
+  # Listener that takes none (the connector still reaches 192.168.50.0/24)
+  sudo bore vpn listen --to bore.example.com --secret S3cret --id s2s \
+    --advertise 192.168.50.0/24 --refuse-all-routes
+  ```
+
+Two routes are never installed, whatever the flags say. Both are logged at `WARN` with the
+route and the reason, and the rest of the link comes up normally:
+
+- **A route that covers the bore server's address** (a `0.0.0.0/0`, a split default, or
+  simply the server's own subnet). It would send the control connection into the tunnel it
+  carries, and the link would flap forever.
+- **On Linux, a prefix this host already routes through another interface** — its own LAN,
+  a static route. bore installs routes with `ip route replace`, which would overwrite the
+  host's route, and removing the tunnel route afterwards does not bring the original back.
+  When both sites use the same subnet, remap one of them instead:
+  `--advertise 192.168.1.0/24@10.50.1.0/24` (next section).
+
 ### Overlapping-subnet NAT and multi-client hub
 
 - `--advertise real@exposed` (e.g. `192.168.1.0/24@10.50.1.0/24`) lets two sites with
@@ -3879,6 +3910,17 @@ bore server \
   connectors, each getting its own overlay address and (optionally) its own accepted routes.
   `--max-clients 1` (default) is byte-for-byte the legacy 1:1 path. See
   [docs/vpn/VPN_MULTI_CLIENT.md](docs/vpn/VPN_MULTI_CLIENT.md).
+- **Spokes never reach each other through the hub.** On Linux the hub always installs the
+  isolation rule, also when it advertises nothing: `nft` table `inet bore_vpn_<id>`, or
+  with iptables a chain `bore_<id>_iso` jumped from `FORWARD`. With `--no-route-manage` the
+  commands are printed for you to run. macOS and Windows hubs that advertise nothing are
+  not isolated yet: keep IP forwarding off there.
+- **One slow spoke does not slow the others.** The hub never waits for a spoke whose relay
+  queue is full; it drops that spoke's packets (counted in the periodic stats line) and
+  keeps serving the rest. A 1:1 link is different: it applies backpressure and does not
+  drop.
+- **The admin `current_path` of a hub is an aggregate:** `direct` while at least one spoke
+  is on the direct path, `relay` when none is.
 
 ### Performance
 
@@ -3901,8 +3943,9 @@ reach ~170 Mbit** (netns emulation, 250 Mbit cap). So:
   `rclone --transfers`, parallel `rsync`, multi-connection HTTP). Quick check: `iperf3 -c
   <overlay-ip> -P 8`.
 - **`--carriers` rarely helps a VPN — leave it at `1` (default).** bore flow-pins each inner
-  connection to one carrier (a single flow is never reordered), but a single bulk flow still
-  rides a single carrier. Raise only with **many concurrent heavy flows on a clean,
+  connection to one carrier (a single flow is never reordered) on the direct path and on the
+  relay, but a single bulk flow still rides a single carrier. On the relay the carriers
+  share one TCP connection, so they add no capacity there. Raise only with **many concurrent heavy flows on a clean,
   high-BDP path**, and measure.
 - **`--tun-queues N`** helps only when a single uplink task is CPU-bound at very high packet
   rates.
@@ -3919,6 +3962,14 @@ reach ~170 Mbit** (netns emulation, 250 Mbit cap). So:
   bore_vpn_<id>`.
 - **Works from gateway, not from LAN hosts:** the LAN's router needs a route to the peer's
   LAN via the bore gateway.
+- **`peer route … NOT installed` in the log:** the route covers the bore server or a prefix
+  this host already routes; see [Which peer routes get installed](#which-peer-routes-get-installed).
+- **`at capacity`, `pool exhausted`, `vpn-max-links reached`, `connection limit reached`:**
+  the server is full right now. With `--auto-reconnect` the client keeps retrying with
+  backoff (a slot frees up to 15 s after its previous holder went away); without it the
+  command exits.
+- **TUN read/write errors in the log:** a single failed packet is dropped and counted. Only
+  16 consecutive failures over 3 s end the link, which `--auto-reconnect` then rebuilds.
 
 ### Running multiple VPN instances on one host
 
@@ -3940,8 +3991,16 @@ The first instance gets `bore0`, the second `bore1`. To force a specific name, p
 ### Cleanup
 
 `Ctrl-C` triggers graceful cleanup: routes deleted, IP forwarding restored, nft table
-dropped, TUN interface removed. State after exit is identical to before the link started. A
-`SIGKILL` leaves stale state; the next `bore vpn --id <same>` reclaims it automatically.
+dropped, TUN interface removed. State after exit is identical to before the link started.
+`SIGTERM` does the same, and on Linux so does `SIGHUP` (a closed terminal, a dropped SSH
+session) — except under `nohup`, where the hangup stays ignored and the link keeps running.
+The same holds for every other `bore` command on Linux: a hangup now ends it with the same
+orderly shutdown as `SIGTERM` instead of killing it outright.
+A `SIGKILL` leaves stale state; the next `bore vpn --id <same>` reclaims it automatically.
+
+If setup fails halfway (a missing kernel module, a rejected rule), what was already
+installed is removed before the command exits. Each `ip`/`nft`/`iptables` command bore runs
+is given 30 s; one that hangs fails the setup with its command line in the error.
 
 When several gateway links run on the **same host**, `ip_forward` is reference-counted
 (`/run/bore-vpn-*.fwdref`): each link restores it only once the last gateway link exits, so

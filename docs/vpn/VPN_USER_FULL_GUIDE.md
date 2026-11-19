@@ -453,6 +453,17 @@ Identical flag set to `bore vpn listen`, with additional route filtering flags:
 | `--refuse-routes` | — | `CIDR[,CIDR...]` | — | Exclude these routes from the accepted set (used with `--accept-all-routes`) |
 | `--refuse-all-routes` | — | flag | — | Accept nothing; reach only the listener's overlay IP (explicit for clarity) |
 
+A 1:1 `bore vpn listen` takes `--accept-routes`, `--refuse-routes` and
+`--refuse-all-routes` too (env `BORE_VPN_ACCEPT_ROUTES`, `BORE_VPN_REFUSE_ROUTES`,
+`BORE_VPN_REFUSE_ALL_ROUTES`). Its default is the opposite of the connector's: with no
+flag it installs every route the connector advertises.
+
+Whatever the flags, neither side installs a route that covers the bore server's
+address, and on Linux neither installs a prefix the host already routes through
+another interface (`ip route replace` would overwrite the host's own route for good).
+Both cases are logged at `WARN` as `peer route … NOT installed`; for two sites with
+the same subnet use the `real@exposed` remap.
+
 **Route filtering behavior:** When no flag is specified, the connector accepts **no advertised routes by default**—it reaches only the listener's overlay IP (host-only mode). Use `--accept-all-routes` to enable site-to-host gateway mode. Exact-or-subset matching: a refuse/accept rule removes/keeps any advertised CIDR that equals or contains the rule CIDR.
 
 **Role difference:** the connector role determines which address (`listener.1` vs `connector.2`) the server assigns in pool mode, and the connector triggers the pairing on the server.
@@ -1110,8 +1121,9 @@ A 1:1 link (`--id` = one listener + one connector) is the default. For three or
 more peers, run the listener as a hub with `--max-clients N` (hub-and-spoke: each
 spoke reaches the hub and, with the hub forwarding, the resources behind it — see
 `VPN_MULTI_CLIENT.md`). There is no full peer-to-peer mesh: spokes do not get
-direct spoke↔spoke paths, and a host-only hub relies on the host's `ip_forward`
-for spoke isolation (a documented v1 gap). For an arbitrary mesh, run multiple
+direct spoke↔spoke paths. Spoke isolation is installed on every Linux hub, also
+one that advertises nothing; a macOS or Windows hub that advertises nothing still
+relies on the host's IP forwarding being off. For an arbitrary mesh, run multiple
 independent links with different `--id` values and manage routing manually.
 
 ### Relay path has no replay window

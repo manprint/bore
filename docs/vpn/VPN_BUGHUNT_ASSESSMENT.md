@@ -30,7 +30,7 @@ caught on independent review.
 | B5 | low | **FIXED** | 1:1 ctrl actor had no app-level read timeout (hub did); added — catches a wedged server |
 | C1 | — | SAFE | per-peer sender swap is `Mutex`-serialized; router drops a per-peer send error, never dies |
 | C2 | — | SAFE | router never restarts on a path switch; swap is in-place |
-| C3 | netns | OPEN | spoke isolation `iifname/oifname bore0 drop`; host-only-hub gap is a known v1 doc item |
+| C3 | netns | FIXED 2026-11-19 (Linux) | spoke isolation `iifname/oifname bore0 drop` now installed on every Linux hub, host-only included (F-S); macOS/Windows host-only hub still open |
 | C4/C5/C6 | — | REFUTED | monotonic peer_id, bounded pending buffers, no unawaited-future |
 | D3/D4/D5 | — | CLEAN | candidate filter correct; PMTU is typed (no `contains("TooLarge")`); broker re-arms per round |
 | D-yamux | — | CLEAN | only a comment mentions `io::split`; relay uses two unidirectional substreams |
@@ -133,6 +133,10 @@ reconnect (fresh key) and asserts global `(key, counter)` uniqueness. Plus
   added in gateway mode. The host-only-hub (no `--advertise`) gap — relying on
   host `ip_forward=0` with no nft table — is the documented v1 limitation; left
   as-is, loudly documented.
+  **Update 2026-11-19 (F-S):** closed on Linux. `NetConfig::apply(.., hub=true)`
+  installs the rule on a host-only hub as well (nft, or the iptables chain
+  `bore_<id>_iso`). Unit-tested on the command sequence; the netns harness has
+  not been re-run. macOS/Windows host-only hubs are still not isolated.
 - **C4/C5/C6 (REFUTED).** `peer_id` is monotonic (never reused in a session),
   addresses freed by overlay; the 6-byte injected header is `read_exact`'d with
   pending buffers bounded; no `async fn` hub helper is left unawaited (the

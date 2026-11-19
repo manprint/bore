@@ -64,6 +64,10 @@ advertised) into one.
   `Arc` keeps state valid; the router's per-peer `Mutex<LinkSender>` critical section
   is tiny and `send_batch` is non-blocking on the hub path by design (a blocking peer
   would HOL every other peer). No data race, no deadlock.
+  **Correction 2026-11-19 (F-HUB-HOL):** that held on the direct path only. On the
+  relay path `send_batch` ignored the flag and awaited a full queue under the peer's
+  mutex, so one stalled spoke did block the router. Fixed: `try_reserve`, drop for
+  that spoke. See `VPN_DEEP_REVIEW_2026-11-19.md`.
 - **Holepunch/direct path** — full read: socket lifecycle (drop-before-bind, no
   `SO_REUSEADDR`), token-auth gate on `DirectListener::accept`, STUN parse bounds,
   `DatagramSend::TooLarge` typed handling, carrier-count abort-on-mismatch, PMTU edge
@@ -93,7 +97,7 @@ for marginal gain and were not pursued.
   a wedged server before first pairing is undetectable until a peer connects. Proper
   fix would be a pre-pairing heartbeat (protocol change) — out of scope for this pass.
 - Host-only hub isolation still relies on host `ip_forward=0` when no `--advertise`
-  (pre-existing v1 gap).
+  (pre-existing v1 gap). **Closed on Linux 2026-11-19 (F-S).**
 
 ## Gates
 

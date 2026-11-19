@@ -67,6 +67,19 @@ async function expectConnected(page) {
   await expect(page.locator("#room-status")).toContainText("Connesso", { timeout: 20_000 });
 }
 
+/** What each page recorded about its direct attempts, for a failure message. */
+async function pathEvidence(sourcePage, recipientPage) {
+  const read = (page) =>
+    page
+      .evaluate(() => ({
+        commits: window.__BORE_TEST__.pathCommits,
+        events: window.__BORE_TEST__.directEvents,
+        diagnostics: window.__BORE_TEST__.readDirectDiagnostics?.(),
+      }))
+      .catch((error) => ({ unreadable: String(error) }));
+  return `\nsource: ${JSON.stringify(await read(sourcePage))}\nrecipient: ${JSON.stringify(await read(recipientPage))}`;
+}
+
 /**
  * One transfer between two named engines, asserting the transport it took.
  *
@@ -113,7 +126,15 @@ async function transferBetween(source, recipient, { relay }) {
     ]) {
       const commits = await peer.page.evaluate(() => [...window.__BORE_TEST__.pathCommits]);
       expect(commits.length, `${who} committed no path`).toBeGreaterThan(0);
-      expect(commits.at(-1).path, `${who} committed the wrong path`).toBe(want);
+      // A wrong path used to fail with two words and no cause; the trace of
+      // BOTH pages goes into the message, because a fallback is decided by
+      // whichever side gave up first.
+      const evidence =
+        commits.at(-1).path === want ? "" : await pathEvidence(a.page, b.page);
+      expect(
+        commits.at(-1).path,
+        `${who} committed the wrong path${evidence}`,
+      ).toBe(want);
     }
 
     // And the bytes, because an interop claim that stops at "it connected"

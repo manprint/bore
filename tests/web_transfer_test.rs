@@ -5437,23 +5437,6 @@ async fn t_web_fairness() -> Result<()> {
 
     let host = format!("127.0.0.1:{port}");
     let origin = format!("http://127.0.0.1:{port}");
-    let (_lease_a, _src_a, _rcp_a, leg_src_a, leg_rcp_a, _id_a) = relay_pair_room(
-        &registry,
-        &host,
-        &origin,
-        0x41,
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    )
-    .await?;
-    let (_lease_b, _src_b, mut rcp_b, leg_src_b, leg_rcp_b, _id_b) = relay_pair_room(
-        &registry,
-        &host,
-        &origin,
-        0x42,
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    )
-    .await?;
-
     async fn pump(
         mut source: support::RelayLeg,
         mut recipient: support::RelayLeg,
@@ -5485,98 +5468,133 @@ async fn t_web_fairness() -> Result<()> {
         Ok(elapsed)
     }
 
-    // V-9's rule: an absolute millisecond budget describes the MACHINE, not
-    // the server. Sample this machine's own idle control round trip first, on
-    // the very socket the loaded probe will use — it is what tells the reader
-    // of a failure whether the loaded numbers below are the server's or the
-    // runner's.
-    let mut idle_rtt = Duration::ZERO;
-    for _ in 0..3 {
-        let started = std::time::Instant::now();
-        rcp_b
-            .send_text(r#"{"v":1,"type":"ping","body":{}}"#.to_string())
-            .await?;
-        let _ = expect_type(&mut rcp_b, "pong", Duration::from_secs(10)).await?;
-        idle_rtt = idle_rtt.max(started.elapsed());
-    }
+    // ONE-SIDED BY CONSTRUCTION. Both defects this test exists for are
+    // systematic: a shared budget cannot move 24 MiB in under 10 s, and a
+    // control plane that waits for the relay answers every ping at the relay's
+    // end. Neither can produce a clean round by luck. A SLOW round, on the
+    // other hand, has a second cause that is not the server at all — a shared
+    // runner that stops scheduling this process for a second or two (macOS
+    // aarch64, 2026-11-14: 7.3-9.0 s against the 7 s bound, on three commits
+    // that predate the code under test). So slowness is retried and speed is
+    // believed: the first clean round passes, and the test fails only when
+    // every round was slow, printing all of them.
+    const ROUNDS: u8 = 3;
+    let mut failures: Vec<String> = Vec::new();
+    for round in 0..ROUNDS {
+        let hex = |digit: u8| char::from(b'a' + digit).to_string().repeat(32);
+        let (_lease_a, _src_a, _rcp_a, leg_src_a, leg_rcp_a, _id_a) =
+            relay_pair_room(&registry, &host, &origin, 0x41 + 2 * round, &hex(2 * round)).await?;
+        let (_lease_b, _src_b, mut rcp_b, leg_src_b, leg_rcp_b, _id_b) = relay_pair_room(
+            &registry,
+            &host,
+            &origin,
+            0x42 + 2 * round,
+            &hex(2 * round + 1),
+        )
+        .await?;
 
-    // Both rooms pump at once, and room B's control plane is probed while
-    // they do: the question is whether either room waits for the other.
-    let pump_a = tokio::spawn(pump(leg_src_a, leg_rcp_a, PAYLOAD));
-    let pump_b = tokio::spawn(pump(leg_src_b, leg_rcp_b, PAYLOAD));
-    let mut rtts: Vec<Duration> = Vec::with_capacity(10);
-    for _ in 0..10 {
-        let started = std::time::Instant::now();
-        rcp_b
-            .send_text(r#"{"v":1,"type":"ping","body":{}}"#.to_string())
-            .await?;
-        let _ = expect_type(&mut rcp_b, "pong", Duration::from_secs(10)).await?;
-        rtts.push(started.elapsed());
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    let worst_rtt = rtts.iter().copied().max().unwrap_or_default();
-    let median_rtt = {
-        let mut sorted = rtts.clone();
-        sorted.sort_unstable();
-        sorted[sorted.len() / 2]
-    };
-    let elapsed_a = pump_a.await??;
-    let elapsed_b = pump_b.await??;
+        // V-9's rule: an absolute millisecond budget describes the MACHINE,
+        // not the server. Sample this machine's own idle control round trip
+        // first, on the very socket the loaded probe will use — it is what
+        // tells the reader of a failure whether the loaded numbers below are
+        // the server's or the runner's.
+        let mut idle_rtt = Duration::ZERO;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            rcp_b
+                .send_text(r#"{"v":1,"type":"ping","body":{}}"#.to_string())
+                .await?;
+            let _ = expect_type(&mut rcp_b, "pong", Duration::from_secs(10)).await?;
+            idle_rtt = idle_rtt.max(started.elapsed());
+        }
 
-    // V-11's rule: a harness that prints a summary statistic MUST also print
-    // the raw samples, or a failure is unreadable.
-    println!(
-        "FAIRNESS a={:.2}s b={:.2}s control-rtt median={:.0}ms worst={:.0}ms idle={:.1}ms samples={:?}",
-        elapsed_a.as_secs_f64(),
-        elapsed_b.as_secs_f64(),
-        median_rtt.as_secs_f64() * 1000.0,
-        worst_rtt.as_secs_f64() * 1000.0,
-        idle_rtt.as_secs_f64() * 1000.0,
-        rtts.iter().map(|r| r.as_millis()).collect::<Vec<_>>()
-    );
-    // The throttle must actually be in force, or the comparison below would
-    // pass on a server that never limited anything.
-    assert!(
-        elapsed_a >= Duration::from_millis(2500) && elapsed_b >= Duration::from_millis(2500),
-        "the per-room rate was not applied: a={elapsed_a:?} b={elapsed_b:?}"
-    );
-    // ... and neither room may pay for the other's bytes.
-    assert!(
-        elapsed_a < Duration::from_secs(7),
-        "room A paid for room B's budget: {elapsed_a:?}"
-    );
-    assert!(
-        elapsed_b < Duration::from_secs(7),
-        "room B paid for room A's budget: {elapsed_b:?}"
-    );
-    // What must be excluded is the control plane WAITING for the relay, and
-    // that defect has an arithmetic of its own: a ping issued at t is answered
-    // when the relay ends at T, so it costs T - t, and ten of them spaced
-    // 200 ms from t = 0 give a MEDIAN of about 0.55 * T and a worst of about
-    // T. A healthy plane answers in microseconds. Only the SCHEDULER of a
-    // loaded shared runner stretches a round trip, and it stretches SAMPLES,
-    // never the median of ten — so the median carries three orders of
-    // magnitude of margin while the worst stays as the literal defect shape.
-    //
-    // V-9, learned on this very assertion: the previous bound was
-    // `elapsed_b / 3`, which LOOKS like a ratio and is not one. The relay is
-    // throttle-bound, so `elapsed_b` is a configured constant and dividing it
-    // produced an absolute millisecond budget in disguise. macos-14 read
-    // 1.747 s against a 1.347 s budget while the SAME run's relay took
-    // 4.040 s — the control plane was 2.3x faster than the thing it stood
-    // accused of waiting for, and one stretched sample out of ten decided it.
-    assert!(
-        median_rtt < elapsed_b / 4,
-        "the control plane of a room relaying under a throttle answered at a median of \
-         {median_rtt:?} (bound {:?}, relay {elapsed_b:?}, idle {idle_rtt:?}, samples {rtts:?})",
-        elapsed_b / 4
-    );
-    assert!(
-        worst_rtt < elapsed_b,
-        "a single control round trip waited out the whole relay: {worst_rtt:?} \
-         (relay {elapsed_b:?}, idle {idle_rtt:?}, samples {rtts:?})"
-    );
-    Ok(())
+        // Both rooms pump at once, and room B's control plane is probed while
+        // they do: the question is whether either room waits for the other.
+        let pump_a = tokio::spawn(pump(leg_src_a, leg_rcp_a, PAYLOAD));
+        let pump_b = tokio::spawn(pump(leg_src_b, leg_rcp_b, PAYLOAD));
+        let mut rtts: Vec<Duration> = Vec::with_capacity(10);
+        for _ in 0..10 {
+            let started = std::time::Instant::now();
+            rcp_b
+                .send_text(r#"{"v":1,"type":"ping","body":{}}"#.to_string())
+                .await?;
+            let _ = expect_type(&mut rcp_b, "pong", Duration::from_secs(10)).await?;
+            rtts.push(started.elapsed());
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let worst_rtt = rtts.iter().copied().max().unwrap_or_default();
+        let median_rtt = {
+            let mut sorted = rtts.clone();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        };
+        let elapsed_a = pump_a.await??;
+        let elapsed_b = pump_b.await??;
+
+        // V-11's rule: a harness that prints a summary statistic MUST also
+        // print the raw samples, or a failure is unreadable.
+        println!(
+            "FAIRNESS round={round} a={:.2}s b={:.2}s control-rtt median={:.0}ms worst={:.0}ms idle={:.1}ms samples={:?}",
+            elapsed_a.as_secs_f64(),
+            elapsed_b.as_secs_f64(),
+            median_rtt.as_secs_f64() * 1000.0,
+            worst_rtt.as_secs_f64() * 1000.0,
+            idle_rtt.as_secs_f64() * 1000.0,
+            rtts.iter().map(|r| r.as_millis()).collect::<Vec<_>>()
+        );
+        // The throttle must actually be in force, or the comparison below
+        // would pass on a server that never limited anything. A stall only
+        // ever ADDS time, so this bound is hard in every round.
+        assert!(
+            elapsed_a >= Duration::from_millis(2500) && elapsed_b >= Duration::from_millis(2500),
+            "the per-room rate was not applied: a={elapsed_a:?} b={elapsed_b:?}"
+        );
+
+        let mut slow: Vec<String> = Vec::new();
+        // ... and neither room may pay for the other's bytes.
+        if elapsed_a >= Duration::from_secs(7) {
+            slow.push(format!("room A paid for room B's budget: {elapsed_a:?}"));
+        }
+        if elapsed_b >= Duration::from_secs(7) {
+            slow.push(format!("room B paid for room A's budget: {elapsed_b:?}"));
+        }
+        // What must be excluded is the control plane WAITING for the relay,
+        // and that defect has an arithmetic of its own: a ping issued at t is
+        // answered when the relay ends at T, so it costs T - t, and ten of
+        // them spaced 200 ms from t = 0 give a MEDIAN of about 0.55 * T and a
+        // worst of about T. A healthy plane answers in microseconds. Only the
+        // SCHEDULER of a loaded shared runner stretches a round trip, and it
+        // stretches SAMPLES, never the median of ten — so the median carries
+        // three orders of magnitude of margin while the worst stays as the
+        // literal defect shape.
+        //
+        // V-9, learned on this very assertion: the previous bound was
+        // `elapsed_b / 3`, which LOOKS like a ratio and is not one. The relay
+        // is throttle-bound, so `elapsed_b` is a configured constant and
+        // dividing it produced an absolute millisecond budget in disguise.
+        // macos-14 read 1.747 s against a 1.347 s budget while the SAME run's
+        // relay took 4.040 s — the control plane was 2.3x faster than the
+        // thing it stood accused of waiting for, and one stretched sample out
+        // of ten decided it.
+        if median_rtt >= elapsed_b / 4 {
+            slow.push(format!(
+                "the control plane of a room relaying under a throttle answered at a median of \
+                 {median_rtt:?} (bound {:?}, relay {elapsed_b:?}, idle {idle_rtt:?}, samples {rtts:?})",
+                elapsed_b / 4
+            ));
+        }
+        if worst_rtt >= elapsed_b {
+            slow.push(format!(
+                "a single control round trip waited out the whole relay: {worst_rtt:?} \
+                 (relay {elapsed_b:?}, idle {idle_rtt:?}, samples {rtts:?})"
+            ));
+        }
+        if slow.is_empty() {
+            return Ok(());
+        }
+        failures.push(format!("round {round}: {}", slow.join("; ")));
+    }
+    panic!("no clean round in {ROUNDS}: {}", failures.join(" | "));
 }
 
 /// One relay transfer, from the request to both legs attached, driven over

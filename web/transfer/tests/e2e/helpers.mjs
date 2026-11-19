@@ -330,6 +330,53 @@ export function canonicalize(value) {
 }
 
 /**
+ * Launch options that make an engine put its real host addresses in its ICE
+ * candidates instead of mDNS `.local` names.
+ *
+ * Every engine hides host candidates behind a random `.local` name until the
+ * page is trusted with a capture device. Two peers on one machine then pair
+ * only if something answers mDNS for the OTHER browser process, and on a CI
+ * runner nothing reliably does: the negotiation sat at `ice: new` until the
+ * server's ten-second deadline and the transfer finished on the relay, which
+ * is what "webkit committed the wrong path" was (measured: 15 of 15 in a
+ * container, about 2 runs in 5 on the hosted runners, where a reflexive
+ * candidate from the public STUN chain sometimes rescued it). A direct-path
+ * gate that depends on the runner's multicast reports the runner.
+ *
+ * These are the engines' own switches for the trusted case, so the ICE agent,
+ * the signalling and the product code are exactly the ones a user runs.
+ */
+const HOST_ADDRESS_LAUNCH = {
+  chromium: { args: ["--disable-features=WebRtcHideLocalIpsWithMdns"] },
+  firefox: {
+    firefoxUserPrefs: {
+      "media.peerconnection.ice.obfuscate_host_addresses": false,
+    },
+  },
+  // WebKit has no launch switch: see `exposeWebKitHostAddresses`.
+  webkit: {},
+};
+
+/**
+ * WebKit's version of the same thing. It stops filtering host candidates for
+ * a document that is capturing, so the page is granted the microphone and
+ * opens it (Playwright's WebKit serves a mock device) before the app boots.
+ * The stream is parked on `window` because a collected stream ends the
+ * capture, and the filtering comes back with it.
+ */
+async function exposeWebKitHostAddresses(context) {
+  await context.grantPermissions(["microphone"]);
+  await context.addInitScript(() => {
+    navigator.mediaDevices
+      ?.getUserMedia({ audio: true })
+      .then((stream) => {
+        window.__BORE_E2E_CAPTURE__ = stream;
+      })
+      .catch(() => {});
+  });
+}
+
+/**
  * A peer running in a browser context with a real on-disk profile.
  *
  * OPFS needs one. In Playwright's default (ephemeral) WebKit context
@@ -352,6 +399,7 @@ export async function openPersistentPeer(
     init,
     noWebRtc = false,
     iceRelayOnly = false,
+    hostAddresses = true,
     // Off by default, and it stays off for every gate: a suite that ignores
     // certificate errors cannot notice a broken one. The two-host perf leg
     // turns it on because it serves a self-signed certificate for a LAN
@@ -368,8 +416,12 @@ export async function openPersistentPeer(
     acceptDownloads: true,
     ...(ignoreHttpsErrors ? { ignoreHTTPSErrors: true } : {}),
     ...(channel === undefined ? {} : { channel }),
+    ...(hostAddresses ? HOST_ADDRESS_LAUNCH[browserName] : {}),
   });
   await installTestHooks(context);
+  if (hostAddresses && browserName === "webkit") {
+    await exposeWebKitHostAddresses(context);
+  }
   if (noWebRtc) {
     await disableWebRtc(context);
   }

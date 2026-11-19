@@ -7,6 +7,18 @@ on:
   pull_request:
   # Callable: this is the cross-architecture half of the release gate.
   workflow_call:
+    inputs:
+      # `all` (default, and what every push/PR gets because the input is then
+      # empty), `no-macos` or `macos-only`. Hosted arm64 macOS runners are
+      # routinely unavailable ("The job was not acquired by Runner of type
+      # hosted even after multiple attempts"), and a release that waits for
+      # them does not ship: `release.yml` runs everything EXCEPT the macOS legs,
+      # `release-macos.yml` runs ONLY those, later, and attaches the Darwin
+      # binaries to the release that already exists.
+      platforms:
+        description: "all | no-macos | macos-only"
+        type: string
+        default: all
 
 jobs:
   # BOTH Darwin targets, because `mean_bean_deploy.yml` SHIPS both and a target
@@ -18,6 +30,7 @@ jobs:
   # documented guarantee of the hosted arm64 image, so a green leg would be
   # attesting to the runner image rather than to the code.
   macos:
+    if: inputs.platforms != 'no-macos'
     runs-on: macos-latest
     strategy:
       fail-fast: true
@@ -43,6 +56,7 @@ jobs:
         run: cargo build --target ${{ matrix.target }}
 
   linux:
+    if: inputs.platforms != 'macos-only'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -79,6 +93,7 @@ jobs:
           - x86_64-unknown-linux-musl
 
   windows:
+    if: inputs.platforms != 'macos-only'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7

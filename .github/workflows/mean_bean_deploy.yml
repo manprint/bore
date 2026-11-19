@@ -9,11 +9,28 @@ on:
       - "**" # every branch
   workflow_dispatch:
   workflow_call:
+    inputs:
+      # `all` (default, and what every push/PR gets because the input is then
+      # empty), `no-macos` or `macos-only`. Hosted arm64 macOS runners are
+      # routinely unavailable ("The job was not acquired by Runner of type
+      # hosted even after multiple attempts"), and a release that waits for
+      # them does not ship: `release.yml` runs everything EXCEPT the macOS legs,
+      # `release-macos.yml` runs ONLY those, later, and attaches the Darwin
+      # binaries to the release that already exists.
+      platforms:
+        description: "all | no-macos | macos-only"
+        type: string
+        default: all
 
 name: Mean Bean Deploy
 env:
   BIN: bore
 
+# On a vX.Y.Z tag the Darwin binaries are NOT built by the release run: it calls
+# this workflow with `platforms: no-macos`, and `release-macos.yml` attaches them
+# later with `platforms: macos-only` (see the input above). `create-release`
+# runs in both: on an existing release it is an update that keeps the body.
+#
 # Every push (any branch) and every vX.Y.Z tag produces a GitHub Release named
 # after the ref ("<branch>-<sha7>" for branches, the tag for tags), with all
 # target binaries attached as release assets: compressed archives (.tar.gz/.zip)
@@ -61,6 +78,7 @@ jobs:
           draft: false
 
   macos:
+    if: inputs.platforms != 'no-macos'
     runs-on: macos-latest
     needs: create-release
     strategy:
@@ -114,6 +132,7 @@ jobs:
             ${{ env.BIN }}-${{ matrix.target }}
 
   linux:
+    if: inputs.platforms != 'macos-only'
     runs-on: ubuntu-latest
     needs: create-release
     strategy:
@@ -160,6 +179,7 @@ jobs:
             ${{ env.BIN }}-${{ matrix.target }}
 
   windows:
+    if: inputs.platforms != 'macos-only'
     runs-on: windows-latest
     needs: create-release
     strategy:
@@ -218,6 +238,7 @@ jobs:
   # Android is built with the NDK (zig/cross cannot build `ring` for Android).
   android:
     name: android (aarch64-linux-android)
+    if: inputs.platforms != 'macos-only'
     runs-on: ubuntu-latest
     needs: create-release
     steps:

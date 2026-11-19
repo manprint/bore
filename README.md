@@ -249,7 +249,34 @@ to a tag, and it runs the gates FIRST:
 | netns e2e | the nine root network-namespace correctness suites — admin dashboard, local/proxy, secret, vhost (+ hard), SSH gateway, the `--udp` connection-window regression, VPN (+ hard) — **blocking** for a release, unlike on a branch push |
 
 Only then do the three publishing workflows run, as called workflows: the GHCR images, the
-`bore-ssh-client` image, and the GitHub Release with every target binary attached.
+`bore-ssh-client` image, and the GitHub Release with every Linux, Windows and Android binary
+attached.
+
+**The macOS legs run separately, in `.github/workflows/release-macos.yml`.** Hosted arm64
+macOS runners are routinely unavailable (jobs cancelled with zero steps: "The job was not
+acquired by Runner of type hosted even after multiple attempts"), and a release that waits for
+them ships nothing on any platform. So `release.yml` calls every gate and the binary
+publication with `platforms: no-macos`, and `release-macos.yml` runs ONLY the macOS legs of
+the same gates (transfer paths, the apple-darwin VPN cross check, the utun/PF device e2e, the
+`aarch64-apple-darwin` build + test and the `x86_64-apple-darwin` build) and then attaches
+`bore-x86_64-apple-darwin` / `bore-aarch64-apple-darwin` (raw + `.tar.gz`) to the release that
+already exists. No Darwin binary is published before its own gates.
+
+It runs three times a night (23:17, 01:17, 03:17 UTC): it looks at the newest version-tag
+release, does nothing if the four Darwin assets are there, and otherwise starts itself on that
+tag — or re-runs only the failed jobs of the previous attempt, so a night that obtained some
+of the runners does not have to win all of them again. **Until it has gone green the release
+has no `bore-*-apple-darwin` asset** and `/releases/latest/download/bore-aarch64-apple-darwin`
+answers 404. To run it by hand:
+
+```shell
+gh workflow run release-macos.yml --ref v1.2.0   # gate + publish the Darwin binaries of that tag now
+gh workflow run release-macos.yml                # what the nightly does: find the release, start or resume
+gh workflow run release-macos.yml --ref dev -f rehearse=true   # macOS gates on a branch, nothing published
+```
+
+The build half runs on the tag ref, so it uses the workflow files as they are at that tag: a
+tag older than `release-macos.yml` cannot be completed by it.
 
 Before any of that, a preflight refuses the release unless the tag is `vMAJOR.MINOR.PATCH`,
 **`Cargo.toml`'s version equals the tag without the `v`**, `Cargo.lock` is already in sync,
@@ -273,6 +300,7 @@ cargo metadata --format-version 1 >/dev/null
 # 3. tag the exact commit CI validated, and push the tag
 git tag -a v1.2.0 -m "bore v1.2.0"
 git push origin v1.2.0
+# 4. the Darwin binaries follow from release-macos.yml (nightly, or by hand as above)
 ```
 
 **Prereleases (`v1.2.0-rc.1`) are the one exception, and they may be cut from any branch.**

@@ -44,6 +44,21 @@
 #
 # Everything the release publishes is therefore compiled, and almost all of it
 # executed, on the architecture it is published for.
+#
+# macOS IS NOT IN THIS RUN
+# ------------------------
+# Every gate and the binary publication are called with `platforms: no-macos`.
+# Hosted arm64 macOS runners are routinely unavailable -- MEASURED on 1.4.0
+# (runs 44540921110 and 44540920864): five macOS jobs cancelled with zero steps,
+# "The job was not acquired by Runner of type hosted even after multiple
+# attempts", attempt after attempt, with no incident declared -- and a release
+# that `needs:` them does not ship on any platform. So the macOS legs listed
+# above (transfer paths, apple-darwin cross check, utun/PF device e2e, both
+# Darwin build/test legs) are gated, and the two Darwin binaries published, by
+# `release-macos.yml`: it runs ONLY those, on the same tag, at night and on
+# demand, and attaches the binaries to the release this workflow created.
+# Until it has gone green the release has no `bore-*-apple-darwin` asset; a
+# Darwin binary is still never published without its own gates.
 name: Release
 
 on:
@@ -208,6 +223,8 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/ci.yml
+    with:
+      platforms: no-macos
 
   gate-cross:
     name: Gate / cross-architecture
@@ -216,6 +233,8 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/mean_bean_ci.yml
+    with:
+      platforms: no-macos
 
   gate-e2e:
     name: Gate / netns e2e (blocking)
@@ -255,6 +274,8 @@ jobs:
     # a called workflow receives no secrets unless they are passed.
     secrets: inherit
     uses: ./.github/workflows/mean_bean_deploy.yml
+    with:
+      platforms: no-macos
 
   # ── The coordinates that CANNOT be re-pointed.
   #

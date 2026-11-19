@@ -132,6 +132,10 @@ Stock OpenSSH `-R`/`-L` → public/vhost/secret tunnels; SSH leg = TCP relay onl
 
 `bore <semver> - <branch> - <sha8>` — embedded at compile time via `build.rs` (`BORE_GIT_BRANCH`/`BORE_GIT_SHA` → `GITHUB_REF_NAME`/`GITHUB_SHA` → `git` CLI). Run `cargo build` to regenerate.
 
+## Release
+
+Tag `vX.Y.Z` (annotated, crate version = tag, stable ⇒ commit on `main`) → `release.yml`: gates (`ci.yml`, `mean_bean_ci.yml`, `e2e_netns.yml`) then publish, all with `platforms: no-macos`. macOS legs + Darwin binaries = `release-macos.yml` (nightly 23:17/01:17/03:17 UTC, or `gh workflow run release-macos.yml --ref <tag>`); it self-dispatches on the tag and re-runs only failed jobs. Reusable workflows take `platforms: all|no-macos|macos-only` (empty on push = all). Tags are immutable (ruleset): rehearse a changed release path with `publish: false` first. README "Releases" = full procedure.
+
 ## Deployment / perf review (2026-11)
 
 Staging server: `network_mode: host` + systemd `bore-443-redirect.service` (kernel `REDIRECT` tcp/443 → control port 7835, `--dst-type LOCAL`); rfw removed from the data path. Staging runs 1.4.0-rc.1 (image tag only; rollback `compose.yml.bak-20261114-pre-1.4.0`). Replication guide, measurements, what 1.4.0 implemented and what stays open (§15, open list §15.8): `OPTIMIZATION_NOVEMBER_2026.md`. Known CI flakes, rerun: webkit direct-path (`T-WEB-README-DIRECT`, `T-WEB-CROSS direct webkit`), macOS `t_web_fairness` (§15.6). Netns NAT harness needs a fast-failing resolver inside the namespaces (see that file, §8.5).

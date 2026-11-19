@@ -9,6 +9,18 @@ on:
   # it. A release gate that duplicated these jobs would drift from them, and the
   # drift would only ever be discovered by shipping something CI had not run.
   workflow_call:
+    inputs:
+      # `all` (default, and what every push/PR gets because the input is then
+      # empty), `no-macos` or `macos-only`. Hosted arm64 macOS runners are
+      # routinely unavailable ("The job was not acquired by Runner of type
+      # hosted even after multiple attempts"), and a release that waits for
+      # them does not ship: `release.yml` runs everything EXCEPT the macOS legs,
+      # `release-macos.yml` runs ONLY those, later, and attaches the Darwin
+      # binaries to the release that already exists.
+      platforms:
+        description: "all | no-macos | macos-only"
+        type: string
+        default: all
   # The branded-channel smoke below is opt-in: Chrome, Edge and Brave are not on
   # every runner image, and a job that quietly skips them is worse than one
   # that never ran.
@@ -30,7 +42,7 @@ on:
 jobs:
   test:
     name: Build, test & lint
-    if: inputs.only != 'web-transfer'
+    if: inputs.only != 'web-transfer' && inputs.platforms != 'macos-only'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -84,7 +96,7 @@ jobs:
 
   transfer-link:
     name: Transfer link (Rust + HTTPS smoke)
-    if: inputs.only != 'web-transfer'
+    if: inputs.only != 'web-transfer' && inputs.platforms != 'macos-only'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -107,7 +119,7 @@ jobs:
 
   transfer-link-docker:
     name: Transfer link (Docker client)
-    if: inputs.only != 'web-transfer'
+    if: inputs.only != 'web-transfer' && inputs.platforms != 'macos-only'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -122,7 +134,7 @@ jobs:
 
   fast-link:
     name: Fast link transfer (curl/wget e2e + bandwidth)
-    if: inputs.only != 'web-transfer'
+    if: inputs.only != 'web-transfer' && inputs.platforms != 'macos-only'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -145,9 +157,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - macos-latest
-          - windows-latest
+        # A job-level `if` cannot see `matrix`, so the macOS leg is dropped (or
+        # kept alone) by computing the list. An empty `inputs.platforms` (push,
+        # PR) falls through to the full list.
+        os: >-
+          ${{ fromJSON(
+            inputs.platforms == 'no-macos' && '["windows-latest"]'
+            || inputs.platforms == 'macos-only' && '["macos-latest"]'
+            || '["macos-latest","windows-latest"]'
+          ) }}
     steps:
       - uses: actions/checkout@v7
 
@@ -172,6 +190,7 @@ jobs:
 
   web-transfer:
     name: Web transfer (browser slice)
+    if: inputs.platforms != 'macos-only'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -254,6 +273,7 @@ jobs:
 
   web-transfer-e2e:
     name: Web transfer e2e (${{ matrix.project }})
+    if: inputs.platforms != 'macos-only'
     runs-on: ubuntu-latest
     strategy:
       # Never cancel a sibling: an engine-specific failure is exactly the
@@ -410,15 +430,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: aarch64-linux-android
-            os: ubuntu-latest
-          - target: x86_64-linux-android
-            os: ubuntu-latest
+        # Computed for the same reason as `transfer-paths` above: the Darwin
+        # leg is dropped for `no-macos` and is the only one for `macos-only`.
+        include: >-
+          ${{ fromJSON(
+            inputs.platforms == 'macos-only'
+              && '[{"target":"aarch64-apple-darwin","os":"macos-latest"}]'
+            || inputs.platforms == 'no-macos'
+              && '[{"target":"x86_64-pc-windows-msvc","os":"windows-latest"},{"target":"aarch64-linux-android","os":"ubuntu-latest"},{"target":"x86_64-linux-android","os":"ubuntu-latest"}]'
+            || '[{"target":"x86_64-pc-windows-msvc","os":"windows-latest"},{"target":"aarch64-apple-darwin","os":"macos-latest"},{"target":"aarch64-linux-android","os":"ubuntu-latest"},{"target":"x86_64-linux-android","os":"ubuntu-latest"}]'
+          ) }}
     steps:
       - uses: actions/checkout@v7
 
@@ -468,7 +489,7 @@ jobs:
   # `windows-vpn-e2e` job below, not assumed here.
   windows-vpn-build:
     name: Windows VPN build + non-VPN parity e2e (windows-latest)
-    if: inputs.only != 'web-transfer'
+    if: inputs.only != 'web-transfer' && inputs.platforms != 'macos-only'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -500,7 +521,7 @@ jobs:
   # what this job's first real run determines (see diagnostic step).
   windows-vpn-e2e:
     name: Windows VPN device e2e (windows-latest)
-    if: inputs.only != 'web-transfer'
+    if: inputs.only != 'web-transfer' && inputs.platforms != 'macos-only'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -558,7 +579,7 @@ jobs:
   # all present on every arm64 image since.
   macos-vpn-build:
     name: macOS VPN build (macos-latest)
-    if: inputs.only != 'web-transfer'
+    if: inputs.only != 'web-transfer' && inputs.platforms != 'no-macos'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -586,7 +607,7 @@ jobs:
   # docs/vpn/VPN_MACOS_ACCEPTANCE.md remains the two-host acceptance.
   macos-vpn-e2e:
     name: macOS VPN device e2e (macos-latest)
-    if: inputs.only != 'web-transfer'
+    if: inputs.only != 'web-transfer' && inputs.platforms != 'no-macos'
     runs-on: macos-latest
     # Independent of macos-vpn-build: the real device tests (utun/PF) are the
     # point and should run even while unrelated test-corpus clippy is cleaned up.
@@ -631,7 +652,7 @@ jobs:
   # placement/style. Phase 2 of docs/plans/plan_AndroidSupport.
   android-emu-e2e:
     name: Android emulator e2e (api 30, x86_64)
-    if: inputs.only != 'web-transfer'
+    if: inputs.only != 'web-transfer' && inputs.platforms != 'macos-only'
     runs-on: ubuntu-latest
     env:
       ANDROID_API: "24" # must match Justfile's android_api
@@ -678,7 +699,7 @@ jobs:
   # Phase 4 of docs/plans/plan_AndroidSupport.
   android-vpn-e2e:
     name: Android VPN e2e (api 30, x86_64)
-    if: inputs.only != 'web-transfer'
+    if: inputs.only != 'web-transfer' && inputs.platforms != 'macos-only'
     runs-on: ubuntu-latest
     env:
       ANDROID_API: "24" # must match Justfile's android_api
@@ -739,7 +760,7 @@ jobs:
   # it is given, so a called workflow stays as honest as its own tests.
   workflows:
     name: Workflow lint (actionlint)
-    if: inputs.only != 'web-transfer'
+    if: inputs.only != 'web-transfer' && inputs.platforms != 'macos-only'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -762,7 +783,7 @@ jobs:
 
   audit:
     name: Security audit
-    if: inputs.only != 'web-transfer'
+    if: inputs.only != 'web-transfer' && inputs.platforms != 'macos-only'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

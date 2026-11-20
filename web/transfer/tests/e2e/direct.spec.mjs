@@ -926,8 +926,25 @@ test.describe.serial("direct", () => {
   test("a host-only negotiation delivers the peer's end-of-candidates marker", async () => {
     const hostOnly = await spawnRoomEnv({ noStun: true });
     try {
-      const a = await openPeer(hostOnly.roomUrl);
-      const b = await openPeer(hostOnly.roomUrl);
+      // The marker can only be applied to an agent that is still there. A
+      // pair that forms quickly delivers this small file before the peer has
+      // finished gathering, the attempt ends, and the marker arrives to
+      // nothing: chromium 2 runs in 20 here, chromium and webkit in CI on
+      // 2026-11-20, and never where mDNS names kept the pair from forming.
+      // So the pair is kept from forming on EVERY engine: each agent is
+      // denied the peer's candidates and handed only the marker. Gathering,
+      // signalling and the product's ordering all run as shipped; the
+      // negotiation then stays open until the deadline, with the marker in.
+      const markerOnly = () => {
+        const add = RTCPeerConnection.prototype.addIceCandidate;
+        RTCPeerConnection.prototype.addIceCandidate = function (candidate, ...rest) {
+          const end =
+            candidate === null || candidate === undefined || candidate.candidate === "";
+          return end ? add.call(this, candidate, ...rest) : Promise.resolve();
+        };
+      };
+      const a = await openPeer(hostOnly.roomUrl, { init: markerOnly });
+      const b = await openPeer(hostOnly.roomUrl, { init: markerOnly });
       await expectConnected(a.page);
       await expectConnected(b.page);
       expect(await opfsWorks(b.page)).toBe(true);

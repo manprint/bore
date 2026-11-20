@@ -30,7 +30,11 @@ let fileBytes = null;
 let fileHashHex = null;
 
 test.beforeAll(async () => {
-  env = await spawnRoomEnv();
+  // Host candidates only: both peers are on this machine and expose their
+  // real addresses (`openPersistentPeer`), so a reflexive candidate buys
+  // nothing and the public STUN chain would be a network dependency inside
+  // an interop gate.
+  env = await spawnRoomEnv({ noStun: true });
   roomDir = mkdtempSync(join(tmpdir(), "bore-cross-"));
   // Small on purpose: this gate asks whether a pair can agree at all, and
   // ten transfers of a large file would measure the runner instead.

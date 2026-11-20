@@ -42,7 +42,7 @@ async function readmeRoom() {
   server.on("error", (error) => {
     throw new Error(`cannot spawn ${boreBin}: ${error.message} (run cargo build --all-features first)`);
   });
-  await waitPort(port);
+  await waitPort(port, undefined, server);
   const asset = await fetch(`http://127.0.0.1:${port}/transfer/assets/app.js`).then((r) => r.text());
   if (!asset.includes("peer-list")) {
     server.kill("SIGKILL");

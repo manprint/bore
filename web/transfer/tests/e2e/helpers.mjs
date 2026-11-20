@@ -97,8 +97,29 @@ export function freePort() {
   });
 }
 
-export async function waitPort(target, retries = 100) {
+/**
+ * Waits for `target` to accept a connection.
+ *
+ * With `child`, a process that EXITS ends the wait at once with its exit code
+ * and the last of its stderr; a timeout carries the same stderr. The wait used
+ * to be five seconds and blind: "port never opened" on a loaded runner said
+ * neither whether the server was slow or dead nor why (CI, 2026-11-19). A
+ * live server that is slow to bind is not a defect, so the budget is thirty
+ * seconds, which costs nothing when the port opens in the first poll.
+ */
+export async function waitPort(target, retries = 600, child = null) {
+  let stderr = "";
+  let exit = null;
+  child?.stderr?.on("data", (chunk) => {
+    stderr = (stderr + String(chunk)).slice(-2000);
+  });
+  child?.once("exit", (code, signal) => {
+    exit = `exited (code ${code}, signal ${signal})`;
+  });
   for (let i = 0; i < retries; i += 1) {
+    if (exit !== null) {
+      throw new Error(`port ${target} never opened: process ${exit}\n${stderr}`);
+    }
     const open = await new Promise((resolve) => {
       const socket = net.connect(target, "127.0.0.1");
       socket.once("connect", () => {
@@ -112,7 +133,9 @@ export async function waitPort(target, retries = 100) {
     }
     await new Promise((r) => setTimeout(r, 50));
   }
-  throw new Error(`port ${target} never opened`);
+  throw new Error(
+    `port ${target} never opened in ${(retries * 50) / 1000} s${child ? `\n${stderr}` : ""}`,
+  );
 }
 
 /**
@@ -234,7 +257,7 @@ export async function spawnRoomEnv({
       process.stderr.write(`[server] ${chunk}`),
     );
   }
-  await waitPort(port);
+  await waitPort(port, undefined, server);
   // Freshness: the server embeds dist at COMPILE time, so `npm run build`
   // alone changes nothing the suite can see. This used to look for one
   // string inside `app.js`, which answers "is there a bundle at all" and not

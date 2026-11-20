@@ -104,7 +104,7 @@ test("a browser downloads a fast link once", async ({ page }) => {
       stdio: "ignore",
     },
   );
-  await waitPort(sp);
+  await waitPort(sp, undefined, server);
 
   uploader = spawn(
     "curl",

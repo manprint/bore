@@ -36,7 +36,9 @@ function freePort() {
   });
 }
 
-async function waitPort(target, retries = 100) {
+// Thirty seconds: a live server that is slow to bind on a loaded runner is
+// not a defect, and the wait returns on the first poll that connects.
+async function waitPort(target, retries = 600) {
   for (let i = 0; i < retries; i += 1) {
     const open = await new Promise((resolve) => {
       const socket = net.connect(target, "127.0.0.1");
